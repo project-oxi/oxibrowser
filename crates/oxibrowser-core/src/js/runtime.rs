@@ -1544,6 +1544,33 @@ fn create_context(
     };
     let _ = context.register_global_callable(js_string!("Event"), 1, event_ctor);
 
+    // --- queueMicrotask ---
+    let queue_microtask_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            if let Some(callback) = args.first() {
+                // Schedule callback as a microtask via Promise.resolve().then()
+                let cb_js = callback.clone();
+                // Use a temp global to hold the callback
+                let _ = ctx.register_global_property(
+                    js_string!("__microtask_cb"),
+                    cb_js.clone(),
+                    Attribute::all(),
+                );
+                let microtask_code = r#"
+                    Promise.resolve().then(function() {
+                        if (typeof globalThis.__microtask_cb === 'function') {
+                            globalThis.__microtask_cb();
+                        }
+                        delete globalThis.__microtask_cb;
+                    });
+                "#;
+                let _ = ctx.eval(Source::from_bytes(microtask_code));
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let _ = context.register_global_callable(js_string!("queueMicrotask"), 1, queue_microtask_fn);
+
     // --- Document object ---
 
     register_document_object(&mut context, dom_snapshot, mutations);
@@ -1928,7 +1955,7 @@ fn create_context(
     };
     let _ = context.register_global_callable(js_string!("URL"), 1, url_ctor);
 
-    // --- crypto.getRandomValues ---
+    // --- crypto (getRandomValues + randomUUID) ---
     let get_random_values_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let arr = args.first().cloned().unwrap_or(JsValue::undefined());
@@ -1945,8 +1972,15 @@ fn create_context(
             Ok(arr)
         })
     };
+    let random_uuid_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, _ctx| {
+            let uuid_str = uuid::Uuid::new_v4().to_string();
+            Ok(JsValue::from(js_string!(uuid_str.as_str())))
+        })
+    };
     let crypto_obj = boa_engine::object::ObjectInitializer::new(&mut context)
         .function(get_random_values_fn, js_string!("getRandomValues"), 1)
+        .function(random_uuid_fn, js_string!("randomUUID"), 0)
         .build();
     let _ = context.register_global_property(
         js_string!("crypto"),
