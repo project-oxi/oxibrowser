@@ -139,8 +139,25 @@ enum JsCommand {
     SetFetchChannel { tx: std::sync::mpsc::Sender<FetchRequestMsg> },
     /// Set the localStorage sync channel so JS operations propagate to Session.
     SetLocalStorageChannel { tx: std::sync::mpsc::Sender<LocalStorageMsg> },
+    /// Set the history command channel so JS history API calls propagate to Session.
+    SetHistoryChannel { tx: std::sync::mpsc::Sender<HistoryCommandType> },
     /// Shut down the JS thread.
     Shutdown,
+}
+
+/// Commands sent from JS history API to Session for navigation.
+#[derive(Debug, Clone)]
+pub enum HistoryCommandType {
+    /// history.pushState(state, title, url)
+    PushState { url: String },
+    /// history.replaceState(state, title, url)
+    ReplaceState { url: String },
+    /// history.back()
+    Back,
+    /// history.forward()
+    Forward,
+    /// history.go(delta)
+    Go { delta: i32 },
 }
 
 /// Responses sent from the JS thread back to the main thread.
@@ -359,6 +376,26 @@ impl JsRuntime {
         }
     }
 
+    /// Set the channel for History API commands.
+    ///
+    /// When JS calls history.pushState/back/forward/go, the command
+    /// is forwarded to Session via this channel.
+    pub fn set_history_channel(&mut self, tx: std::sync::mpsc::Sender<HistoryCommandType>) {
+        self.cmd_tx
+            .send(JsCommand::SetHistoryChannel { tx })
+            .expect("JS thread has died");
+        let resp = self
+            .resp_rx
+            .lock()
+            .expect("resp_rx lock poisoned")
+            .recv()
+            .expect("JS thread has died");
+        match resp {
+            JsResponse::Done => {}
+            _ => panic!("unexpected response"),
+        }
+    }
+
     /// Evaluate a JavaScript expression and return the result.
     ///
     /// JS state persists across calls — variables, functions, closures
@@ -552,6 +589,8 @@ fn js_thread_loop(
         Arc::new(RwLock::new(None));
     let local_storage_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<LocalStorageMsg>>>> =
         Arc::new(RwLock::new(None));
+    let history_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<HistoryCommandType>>>> =
+        Arc::new(RwLock::new(None));
     let dom_snapshot: Arc<RwLock<Option<DomSnapshot>>> = Arc::new(RwLock::new(None));
     let (mut ctx, mut job_queue) = create_context(
         &console_output,
@@ -561,6 +600,7 @@ fn js_thread_loop(
         "",
         "OxiBrowser/0.2",
         &fetch_tx_arc,
+        &history_tx_arc,
     );
 
     while let Ok(cmd) = cmd_rx.recv() {
@@ -615,6 +655,7 @@ fn js_thread_loop(
                         "",
                         "OxiBrowser/0.2",
                         &fetch_tx_arc,
+                        &history_tx_arc,
                     );
                     ctx = new_ctx;
                     job_queue = new_queue;
@@ -703,6 +744,7 @@ fn js_thread_loop(
                     &url,
                     "OxiBrowser/0.2",
                     &fetch_tx_arc,
+                    &history_tx_arc,
                 );
                 // Also re-register localStorage on URL change (clears JS-side storage)
                 let empty = std::collections::HashMap::new();
@@ -715,6 +757,10 @@ fn js_thread_loop(
             }
             JsCommand::SetFetchChannel { tx } => {
                 *fetch_tx_arc.write() = Some(tx);
+                let _ = resp_tx.send(JsResponse::Done);
+            }
+            JsCommand::SetHistoryChannel { tx } => {
+                *history_tx_arc.write() = Some(tx);
                 let _ = resp_tx.send(JsResponse::Done);
             }
             JsCommand::Shutdown => {
@@ -780,6 +826,7 @@ fn create_context(
     page_url: &str,
     user_agent: &str,
     fetch_tx_arc: &Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>>,
+    history_tx_arc: &Arc<RwLock<Option<std::sync::mpsc::Sender<HistoryCommandType>>>>,
 ) -> (Context, Rc<TokioJobQueue>) {
     let job_queue = Rc::new(TokioJobQueue::new());
     let mut context = Context::builder()
@@ -1447,6 +1494,7 @@ fn create_context(
         page_url,
         user_agent,
         fetch_tx_arc,
+        history_tx_arc,
     );
 
     // --- atob / btoa (Base64) ---
@@ -3491,6 +3539,7 @@ fn register_window_globals(
     page_url: &str,
     user_agent: &str,
     fetch_tx_arc: &Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>>,
+    history_tx_arc: &Arc<RwLock<Option<std::sync::mpsc::Sender<HistoryCommandType>>>>,
 ) {
     let _ = fetch_tx_arc; // suppress unused warning
     let url_owned = page_url.to_string();
@@ -3625,6 +3674,77 @@ fn register_window_globals(
         )
         .build();
 
+    // --- window.history ---
+    // Clone Arc into each closure to avoid borrowing issues with 'static lifetime
+    let history_tx_arc_clone = history_tx_arc.clone();
+    let history_push_state_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, _ctx| {
+            let url = args
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            if let Some(tx) = history_tx_arc_clone.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::PushState { url });
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let history_tx_arc_clone2 = history_tx_arc.clone();
+    let history_replace_state_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, _ctx| {
+            let url = args
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            if let Some(tx) = history_tx_arc_clone2.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::ReplaceState { url });
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let history_tx_arc_clone3 = history_tx_arc.clone();
+    let history_back_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, _ctx| {
+            if let Some(tx) = history_tx_arc_clone3.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::Back);
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let history_tx_arc_clone4 = history_tx_arc.clone();
+    let history_forward_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, _ctx| {
+            if let Some(tx) = history_tx_arc_clone4.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::Forward);
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let history_tx_arc_clone5 = history_tx_arc.clone();
+    let history_go_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, _ctx| {
+            let delta = args
+                .get(0)
+                .and_then(|v| v.as_number())
+                .unwrap_or(0.0) as i32;
+            if let Some(tx) = history_tx_arc_clone5.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::Go { delta });
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+
+    let history_obj = boa_engine::object::ObjectInitializer::new(ctx)
+        .property(js_string!("length"), JsValue::from(1.0), Attribute::all())
+        .function(history_push_state_fn, js_string!("pushState"), 3)
+        .function(history_replace_state_fn, js_string!("replaceState"), 3)
+        .function(history_back_fn, js_string!("back"), 0)
+        .function(history_forward_fn, js_string!("forward"), 0)
+        .function(history_go_fn, js_string!("go"), 1)
+        .build();
+
     // window.location
     let parsed_url = url::Url::parse(&url_owned);
     let loc_href = url_owned.clone();
@@ -3751,6 +3871,11 @@ fn register_window_globals(
         .property(
             js_string!("performance"),
             JsValue::from(perf_obj),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("history"),
+            JsValue::from(history_obj),
             Attribute::all(),
         )
         // DOM shortcuts (as functions since boa 0.20 doesn't support
