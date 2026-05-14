@@ -6,8 +6,11 @@
 //! Each CDP session creates a corresponding Browser `Session` for page
 //! interaction (navigation, DOM access, JS evaluation).
 
+use std::collections::HashMap;
+
+use parking_lot::RwLock as SyncRwLock;
+
 use crate::domains;
-use crate::domains::DispatchContext;
 use crate::event::{event_channel, EventReceiver, EventSender};
 use crate::protocol::{CdpEvent, CdpRequest, CdpResponse};
 use crate::server::MAX_CDP_MESSAGE_SIZE;
@@ -201,10 +204,12 @@ impl CdpSession {
             "dispatching CDP command"
         );
 
-        // Create dispatch context with session + event sender
-        let ctx = DispatchContext {
+        // Create dispatch context with session + event sender + paused requests
+        let ctx = crate::domains::DispatchContext {
             session: self.session.clone(),
             events: self.event_sender.clone(),
+            paused_requests: Arc::new(SyncRwLock::new(HashMap::new())),
+            mock_responses: Arc::new(SyncRwLock::new(HashMap::new())),
         };
 
         // Dispatch to domain handler

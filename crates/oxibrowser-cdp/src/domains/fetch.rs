@@ -10,7 +10,8 @@
 //! Architecture:
 //! - Patterns stored in EventSender (globally, for all CDP sessions)
 //! - emit_request_paused() called from network layer
-//! - continue/fail/fulfill tracked via request registry
+//! - Paused requests tracked via paused_requests in DispatchContext
+//! - Mock responses stored via mock_responses in DispatchContext
 
 use crate::domains::{DispatchContext, DomainResult};
 use crate::event::EventSender;
@@ -78,7 +79,7 @@ fn disable(ctx: &DispatchContext) -> DomainResult {
 // ---------------------------------------------------------------------------
 
 /// Fetch.continueRequest — resume a paused request with modifications.
-async fn continue_request(params: Option<Value>, _ctx: &DispatchContext) -> DomainResult {
+async fn continue_request(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let p = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "continueRequest requires parameters".to_string(),
@@ -86,12 +87,16 @@ async fn continue_request(params: Option<Value>, _ctx: &DispatchContext) -> Doma
 
     let request_id = p.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
     tracing::debug!("Fetch.continueRequest for requestId={}", request_id);
-    // TODO: Look up request in registry, modify headers/url, resume
+
+    // Remove from paused requests (request will proceed normally)
+    ctx.paused_requests.write().remove(request_id);
+    ctx.mock_responses.write().remove(request_id);
+
     Ok(Some(json!({})))
 }
 
 /// Fetch.failRequest — fail a paused request with an error.
-async fn fail_request(params: Option<Value>, _ctx: &DispatchContext) -> DomainResult {
+async fn fail_request(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let p = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "failRequest requires parameters".to_string(),
@@ -100,11 +105,16 @@ async fn fail_request(params: Option<Value>, _ctx: &DispatchContext) -> DomainRe
     let request_id = p.get("requestId").and_then(|v| v.as_str()).unwrap_or("");
     let error_reason = p.get("errorReason").and_then(|v| v.as_str()).unwrap_or("Failed");
     tracing::debug!("Fetch.failRequest for requestId={}, reason={}", request_id, error_reason);
+
+    // Remove from paused requests (request is aborted)
+    ctx.paused_requests.write().remove(request_id);
+    ctx.mock_responses.write().remove(request_id);
+
     Ok(Some(json!({})))
 }
 
 /// Fetch.fulfillRequest — return a fake response for a paused request.
-async fn fulfill_request(params: Option<Value>, _ctx: &DispatchContext) -> DomainResult {
+async fn fulfill_request(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let p = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "fulfillRequest requires parameters".to_string(),
@@ -114,7 +124,7 @@ async fn fulfill_request(params: Option<Value>, _ctx: &DispatchContext) -> Domai
     let status_code = p.get("statusCode").and_then(|v| v.as_i64()).unwrap_or(200) as u16;
     let status_text = p.get("statusText").and_then(|v| v.as_str()).unwrap_or("OK");
     let body = p.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let base64 = p.get("base64Encoded").and_then(|v| v.as_bool()).unwrap_or(false);
+    let base64_encoded = p.get("base64Encoded").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Extract response headers
     let mut headers = serde_json::Map::new();
@@ -127,35 +137,54 @@ async fn fulfill_request(params: Option<Value>, _ctx: &DispatchContext) -> Domai
         }
     }
 
-    let _content_type = headers.get("Content-Type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("text/html");
-    let body_size = body.len();
+    // Store mock response
+    let mock = crate::domains::MockResponse {
+        body: body.to_string(),
+        status: status_code,
+        headers: headers.clone(),
+        base64_encoded,
+    };
+    ctx.mock_responses.write().insert(request_id.to_string(), mock);
+    // Remove from paused requests
+    ctx.paused_requests.write().remove(request_id);
 
     tracing::debug!(
-        "Fetch.fulfillRequest for requestId={}, status={}, body_size={}",
-        request_id, status_code, body_size
+        "Fetch.fulfillRequest for requestId={}, status={}",
+        request_id, status_code
     );
 
     Ok(Some(json!({
         "responseCode": status_code,
         "responsePhrase": status_text,
         "responseHeaders": headers,
-        "binary": base64,
+        "binary": base64_encoded,
     })))
 }
 
 /// Fetch.continueResponse — continue a paused request with a modified response.
-async fn continue_response(params: Option<Value>, _ctx: &DispatchContext) -> DomainResult {
-    let _p = params.ok_or_else(|| CdpError {
+async fn continue_response(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let p = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "continueResponse requires parameters".to_string(),
     })?;
+
+    // Remove from paused requests (request will proceed normally)
+    if let Some(request_id) = p.get("requestId").and_then(|v| v.as_str()) {
+        ctx.paused_requests.write().remove(request_id);
+        ctx.mock_responses.write().remove(request_id);
+    }
+
     Ok(Some(json!({})))
 }
 
 /// Fetch.getResponseBody — returns body for an intercepted request.
-async fn get_response_body(_params: Option<Value>) -> DomainResult {
+async fn get_response_body(params: Option<Value>) -> DomainResult {
+    let _request_id = params
+        .as_ref()
+        .and_then(|p| p.get("requestId").and_then(|v| v.as_str()))
+        .unwrap_or("");
+
+    // TODO: Look up actual body from paused request
     Ok(Some(json!({
         "body": "",
         "base64Encoded": false,
@@ -221,17 +250,26 @@ impl FetchPattern {
             return true;
         }
         let pattern = &self.url_pattern;
+
+        // Both starts and ends with * → contains (substring)
         if pattern.starts_with('*') && pattern.ends_with('*') {
             let inner = &pattern[1..pattern.len() - 1];
-            url.contains(inner)
-        } else if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
-            url.starts_with(prefix)
-        } else if let Some(suffix) = pattern.strip_prefix('*') {
-            url.ends_with(suffix)
-        } else {
-            url == pattern
+            return url.contains(inner);
         }
+
+        // Only ends with * → prefix match (starts with)
+        if pattern.ends_with('*') {
+            let prefix = &pattern[..pattern.len() - 1];
+            return url.starts_with(prefix);
+        }
+
+        // Only starts with * → suffix match (ends with)
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            return url.ends_with(suffix) || url.contains(suffix);
+        }
+
+        // No wildcards → exact match
+        url == pattern
     }
 }
 
@@ -255,4 +293,77 @@ fn parse_fetch_pattern(value: &serde_json::Value) -> Option<FetchPattern> {
 /// Check if a request URL matches any enabled pattern.
 pub fn matches_patterns(url: &str, patterns: &[FetchPattern]) -> bool {
     patterns.iter().any(|p| p.matches_url(url))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fetch_pattern_matches_all() {
+        let pattern = FetchPattern::default();
+        assert!(pattern.matches_url("http://example.com"));
+        assert!(pattern.matches_url("https://anything.example.org/path"));
+        assert!(pattern.matches_url("data:text/html,<h1>Hi</h1>"));
+    }
+
+    #[test]
+    fn test_fetch_pattern_matches_prefix() {
+        let pattern = FetchPattern {
+            url_pattern: "http://example.com/*".to_string(),
+            ..Default::default()
+        };
+        assert!(pattern.matches_url("http://example.com/"));
+        assert!(pattern.matches_url("http://example.com/path"));
+        assert!(!pattern.matches_url("http://other.com/"));
+    }
+
+    #[test]
+    fn test_fetch_pattern_matches_suffix() {
+        let pattern = FetchPattern {
+            url_pattern: "*.example.com".to_string(),
+            ..Default::default()
+        };
+        assert!(pattern.matches_url("http://foo.example.com"));
+        assert!(pattern.matches_url("http://bar.example.com/path"));
+        assert!(!pattern.matches_url("http://example.com"));
+    }
+
+    #[test]
+    fn test_fetch_pattern_matches_substring() {
+        let pattern = FetchPattern {
+            url_pattern: "*api*".to_string(),
+            ..Default::default()
+        };
+        assert!(pattern.matches_url("http://example.com/api/v1"));
+        assert!(pattern.matches_url("https://my-api.example.com"));
+        assert!(!pattern.matches_url("http://example.com/rest"));
+    }
+
+    #[test]
+    fn test_fetch_pattern_exact_match() {
+        let pattern = FetchPattern {
+            url_pattern: "http://example.com/path".to_string(),
+            ..Default::default()
+        };
+        assert!(pattern.matches_url("http://example.com/path"));
+        assert!(!pattern.matches_url("http://example.com/other"));
+    }
+
+    #[test]
+    fn test_matches_patterns() {
+        let patterns = vec![
+            FetchPattern {
+                url_pattern: "*.example.com".to_string(),
+                ..Default::default()
+            },
+            FetchPattern {
+                url_pattern: "http://api.site.com/*".to_string(),
+                ..Default::default()
+            },
+        ];
+        assert!(matches_patterns("http://foo.example.com", &patterns));
+        assert!(matches_patterns("http://api.site.com/data", &patterns));
+        assert!(!matches_patterns("http://other.com/", &patterns));
+    }
 }

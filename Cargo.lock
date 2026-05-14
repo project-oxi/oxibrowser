@@ -1854,6 +1854,7 @@ dependencies = [
  "hyper-util",
  "oxibrowser-core",
  "oxibrowser-webapi",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

@@ -18,9 +18,27 @@ pub mod target;
 use crate::event::EventSender;
 use crate::protocol::CdpError;
 use oxibrowser_core::session::Session;
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// A paused Fetch request awaiting client decision.
+#[derive(Debug, Clone)]
+pub struct PausedRequest {
+    /// Unique request ID.
+    pub request_id: String,
+    /// Request URL.
+    pub url: String,
+    /// HTTP method.
+    pub method: String,
+    /// Resource type (Document, Script, Image, ...).
+    pub resource_type: String,
+    /// Frame ID.
+    pub frame_id: String,
+    /// Request headers as JSON map.
+    pub headers: Map<String, Value>,
+}
 
 /// Context passed to all domain handlers.
 ///
@@ -31,6 +49,19 @@ pub struct DispatchContext {
     pub session: Arc<RwLock<Session>>,
     /// Event sender for emitting CDP events to the client.
     pub events: EventSender,
+    /// Paused requests awaiting client decision.
+    pub paused_requests: Arc<parking_lot::RwLock<HashMap<String, PausedRequest>>>,
+    /// Mock responses for fulfilled requests.
+    pub mock_responses: Arc<parking_lot::RwLock<HashMap<String, MockResponse>>>,
+}
+
+/// A mock response stored by Fetch.fulfillRequest.
+#[derive(Debug, Clone)]
+pub struct MockResponse {
+    pub body: String,
+    pub status: u16,
+    pub headers: Map<String, Value>,
+    pub base64_encoded: bool,
 }
 
 /// Result of handling a CDP domain method.

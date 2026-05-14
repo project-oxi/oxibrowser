@@ -78,3 +78,16 @@ base64 = "0.22"
 oxibrowser-core = { version = "0.2.0", path = "crates/oxibrowser-core" }
 oxibrowser-cdp = { version = "0.2.0", path = "crates/oxibrowser-cdp" }
 oxibrowser-webapi = { version = "0.2.0", path = "crates/oxibrowser-webapi" }
+
+# Binary size optimization for release builds
+[profile.release]
+opt-level = "z"       # Size optimization over speed
+lto = true            # Link-time optimization for smaller binaries
+codegen-units = 1     # Better optimization (slower compile)
+strip = true          # Strip debug symbols
+panic = "abort"       # Smaller unwinding tables
+
+# JS engine needs speed, not size
+[profile.release.package.boa_engine]
+opt-level = 3
+
