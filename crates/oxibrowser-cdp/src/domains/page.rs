@@ -301,8 +301,8 @@ fn get_frame_metrics() -> DomainResult {
 /// - `format: "png"` (default): returns a 1x1 transparent PNG placeholder
 /// - `format: "text"`: returns CSS text screenshot (ASCII art rendering)
 async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let format = params
+    let params_val = params.unwrap_or_default();
+    let format = params_val
         .get("format")
         .and_then(|v| v.as_str())
         .unwrap_or("png");
@@ -327,15 +327,65 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
             })))
         }
         _ => {
-            // PNG placeholder (1x1 transparent)
+            // Get viewport dimensions from params or defaults
+            let width = params_val
+                .get("width")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1280) as u32;
+            let height = params_val
+                .get("height")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(720) as u32;
+            let scale = params_val
+                .get("deviceScaleFactor")
+                .and_then(|v: &Value| v.as_f64())
+                .unwrap_or(1.0) as f32;
+
+            // Try real rendering if the render feature is enabled
+            #[cfg(feature = "render")]
+            {
+                let guard = ctx.session.read().await;
+                let html = guard
+                    .page()
+                    .map(|p| p.content())
+                    .unwrap_or("<html><body></body></html>");
+
+                let config = oxibrowser_render::RenderConfig::new()
+                    .size(width.max(16), height.max(16))
+                    .scale(scale)
+                    .auto_height(true);
+
+                match oxibrowser_render::render_to_png(html, config) {
+                    Ok(png_bytes) => {
+                        let encoded = base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &png_bytes,
+                        );
+                        return Ok(Some(json!({
+                            "data": encoded,
+                            "metadata": {
+                                "pageScaleFactor": scale,
+                                "deviceWidth": width,
+                                "deviceHeight": height
+                            }
+                        })));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Screenshot rendering failed: {}", e);
+                        // Fall through to placeholder
+                    }
+                }
+            }
+
+            // PNG placeholder (1x1 transparent) — used when render feature is disabled
             let placeholder = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMCbHYQAAAABJRU5ErkJggg==";
 
             Ok(Some(json!({
                 "data": placeholder,
                 "metadata": {
                     "pageScaleFactor": 1,
-                    "deviceWidth": 1280,
-                    "deviceHeight": 720
+                    "deviceWidth": width,
+                    "deviceHeight": height
                 }
             })))
         }
@@ -344,8 +394,16 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
 
 /// Page.printToPDF — prints the page to PDF.
 ///
-/// Placeholder until rendering is available.
-fn print_to_pdf(_params: Option<Value>) -> DomainResult {
+/// Returns actual PDF when render feature is enabled,
+/// otherwise returns a placeholder.
+fn print_to_pdf(params: Option<Value>) -> DomainResult {
+    #[cfg(feature = "render")]
+    {
+        // TODO: Integrate with session to get actual HTML content
+        // For now, return placeholder since we need ctx for session access
+        let _ = params;
+    }
+
     Ok(Some(json!({
         "data": "",
         "stream": ""

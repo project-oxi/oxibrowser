@@ -4,6 +4,7 @@ members = [
     "crates/oxibrowser",
     "crates/oxibrowser-cdp",
     "crates/oxibrowser-core",
+    "crates/oxibrowser-render",
     "crates/oxibrowser-webapi",
 ]
 
@@ -78,6 +79,7 @@ base64 = "0.22"
 oxibrowser-core = { version = "0.2.0", path = "crates/oxibrowser-core" }
 oxibrowser-cdp = { version = "0.2.0", path = "crates/oxibrowser-cdp" }
 oxibrowser-webapi = { version = "0.2.0", path = "crates/oxibrowser-webapi" }
+oxibrowser-render = { version = "0.2.0", path = "crates/oxibrowser-render" }
 
 # Binary size optimization for release builds
 [profile.release]

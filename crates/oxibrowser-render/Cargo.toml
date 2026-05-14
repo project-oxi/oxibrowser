@@ -1,0 +1,39 @@
+[package]
+name = "oxibrowser-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "HTML rendering engine for OxiBrowser — PNG and PDF output via Blitz"
+
+[features]
+default = ["png", "pdf"]
+png = ["dep:anyrender", "dep:anyrender_vello_cpu", "dep:png"]
+pdf = ["dep:krilla", "dep:stylo", "dep:parley", "dep:linebender_resource_handle"]
+
+[dependencies]
+# Core HTML/CSS parsing and layout (always required)
+blitz-dom = "0.2"
+blitz-html = "0.2"
+blitz-traits = "0.2"
+blitz-paint = "0.2"
+
+# PNG rendering (optional)
+anyrender = { version = "0.6", optional = true }
+anyrender_vello_cpu = { version = "0.7", optional = true }
+png = { version = "0.17", optional = true }
+
+# PDF rendering (optional)
+krilla = { version = "0.6", optional = true }
+stylo = { version = "0.8", optional = true }
+parley = { version = "0.6", optional = true }
+linebender_resource_handle = { version = "0.1", optional = true }
+
+# Common
+thiserror = { workspace = true }
