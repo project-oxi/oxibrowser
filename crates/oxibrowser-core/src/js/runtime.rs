@@ -749,6 +749,27 @@ fn js_thread_loop(
                 // Also re-register localStorage on URL change (clears JS-side storage)
                 let empty = std::collections::HashMap::new();
                 register_local_storage(&mut ctx, empty, &dom_snapshot_ref, local_storage_tx_arc.clone());
+                // Fire DOMContentLoaded and load events on document
+                let fire_events_code = r#"
+(function() {
+    function fireEvent(type) {
+        var listeners = document.__listeners && document.__listeners[type];
+        if (listeners && Array.isArray(listeners)) {
+            for (var i = 0; i < listeners.length; i++) {
+                try {
+                    var evt = new Event(type);
+                    evt.target = document;
+                    evt.currentTarget = document;
+                    listeners[i].call(document, evt);
+                } catch(e) {}
+            }
+        }
+    }
+    fireEvent("DOMContentLoaded");
+})();
+"#;
+                let _ = ctx.eval(Source::from_bytes(fire_events_code));
+                ctx.run_jobs();
                 let _ = resp_tx.send(JsResponse::Done);
             }
             JsCommand::SetLocalStorageChannel { tx } => {
@@ -1479,6 +1500,49 @@ fn create_context(
         })
     };
     let _ = context.register_global_callable(js_string!("MutationObserver"), 1, mo_ctor);
+
+    // --- Event constructor ---
+    // new Event(type, options)
+    let event_ctor = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            let event_type = args
+                .get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+
+            let bubbles = args
+                .get(1)
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get(js_string!("bubbles"), ctx).ok())
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(false);
+
+            let cancelable = args
+                .get(1)
+                .and_then(|v| v.as_object())
+                .and_then(|o| o.get(js_string!("cancelable"), ctx).ok())
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(false);
+
+            let event_obj = boa_engine::object::ObjectInitializer::new(ctx)
+                .property(js_string!("type"), JsValue::from(js_string!(event_type.as_str())), Attribute::all())
+                .property(js_string!("target"), JsValue::null(), Attribute::all())
+                .property(js_string!("currentTarget"), JsValue::null(), Attribute::all())
+                .property(js_string!("bubbles"), JsValue::from(bubbles), Attribute::all())
+                .property(js_string!("cancelable"), JsValue::from(cancelable), Attribute::all())
+                .property(js_string!("defaultPrevented"), JsValue::from(false), Attribute::all())
+                .property(js_string!("timeStamp"), JsValue::from(js_sys_helpers::now_ms()), Attribute::all())
+                .property(js_string!("isTrusted"), JsValue::from(false), Attribute::all())
+                .property(js_string!("eventPhase"), JsValue::from(0), Attribute::all())
+                .property(js_string!("bubbles"), JsValue::from(bubbles), Attribute::all())
+                .property(js_string!("cancelable"), JsValue::from(cancelable), Attribute::all())
+                .build();
+
+            Ok(JsValue::from(event_obj))
+        })
+    };
+    let _ = context.register_global_callable(js_string!("Event"), 1, event_ctor);
 
     // --- Document object ---
 
@@ -2829,6 +2893,13 @@ fn create_element_object(
                 Some(o) => o,
                 None => return Ok(JsValue::from(true)),
             };
+
+            // Set event.target and event.currentTarget to this element
+            if let Some(evt_obj) = event.as_object() {
+                let _ = evt_obj.set(js_string!("target"), JsValue::from(this_obj.clone()), true, ctx);
+                let _ = evt_obj.set(js_string!("currentTarget"), JsValue::from(this_obj.clone()), true, ctx);
+            }
+
             let listeners = this_obj.get(js_string!("__listeners"), ctx);
             if let Ok(l_val) = listeners {
                 if let Some(l_obj) = l_val.as_object() {
