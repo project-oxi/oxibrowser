@@ -1,105 +1,104 @@
-# CDP Code Patterns Summary
+# CDP Page Domain Handler Context Analysis
 
-## 1. DispatchContext Struct (domains/mod.rs)
+## Dispatch Signature Pattern
+
+The `page::handle()` function is declared as `async fn`:
 
 ```rust
-pub struct DispatchContext {
-    /// Browser session (read/write for navigation, DOM access, JS eval).
-    pub session: Arc<RwLock<Session>>,
-    /// Event sender for emitting CDP events to the client.
-    pub events: EventSender,
-}
-
-pub type DomainResult = std::result::Result<Option<Value>, CdpError>;
+// Line 18-19 in page.rs
+pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
 ```
 
-**Pattern**: Async domain handlers receive `&DispatchContext`, sync handlers don't need async.
+All individual handler functions receive `ctx: &DispatchContext` as their third parameter:
 
----
+| Handler | Signature | Uses ctx.session |
+|---------|-----------|------------------|
+| `enable` | `fn(ctx)` | No (only ctx.events) |
+| `disable` | `fn(ctx)` | No (only ctx.events) |
+| `setLifecycleEventsEnabled` | `fn(params, ctx)` | No |
+| `getFrameMetrics` | `fn()` | No |
+| `navigate` | `async fn(params, ctx)` | **Yes** — write lock |
+| `reload` | `async fn(params, ctx)` | **Yes** — write lock |
+| `getFrameTree` | `async fn(ctx)` | **Yes** — read lock |
+| `captureScreenshot` | `async fn(params, ctx)` | **Yes** — read lock |
+| `printToPDF` | `fn(params)` | **No** — placeholder only |
 
-## 2. fetch.rs Key Patterns
+### Mixed Sync/Async in Async Context
 
-### handle() dispatch
+The dispatch router calls `page::handle(...).await`, which awaits the entire function. This means:
+
+- Sync handlers (`fn`) are valid — they return `impl Future<Output = DomainResult>` which `.await` waits on
+- Async handlers (`async fn`) work naturally with `.await`
+- No breaking change to router required
+
+## captureScreenshot Has ctx Access
+
+`capture_screenshot` (lines 196-253) already demonstrates the pattern:
+
 ```rust
-pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    match method {
-        "enable" => enable(params, ctx),
-        "disable" => disable(ctx),
+async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    // ...
+    #[cfg(feature = "render")]
+    {
+        let guard = ctx.session.read().await;
+        let html = guard
+            .page()
+            .map(|p| p.content())
+            .unwrap_or("<html><body></body></html>");
         // ...
     }
 }
 ```
 
-### enable/disable — state stored on EventSender
-```rust
-fn enable(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    ctx.events.set_fetch_enabled(true);
-    ctx.events.set_fetch_patterns(patterns.clone());
-    Ok(Some(json!({})))
-}
+## printToPDF Currently Lacks ctx
 
-fn disable(ctx: &DispatchContext) -> DomainResult {
-    ctx.events.set_fetch_enabled(false);
-    ctx.events.set_fetch_patterns(vec![]);
-    Ok(Some(json!({})))
+`print_to_pdf` (lines 257-271) returns a placeholder:
+
+```rust
+fn print_to_pdf(params: Option<Value>) -> DomainResult {
+    #[cfg(feature = "render")]
+    {
+        // TODO: Integrate with session to get actual HTML content
+        // For now, return placeholder since we need ctx for session access
+        let _ = params;
+    }
+
+    Ok(Some(json!({
+        "data": "",
+        "stream": ""
+    })))
 }
 ```
 
-### emit_request_paused — takes EventSender directly
-```rust
-pub fn emit_request_paused(
-    events: &EventSender,
-    request_id: &str,
-    url: &str,
-    method: &str,
-    headers: &[(String, String)],
-    resource_type: &str,
-) {
-    events.send_fetch_event("Fetch.requestPaused", json!({...}));
-}
-```
+## Answer: Changing printToPDF to async with ctx is Safe
 
-**Key insight**: Event emission functions take `&EventSender` (not `&DispatchContext`), so they can be called from anywhere (network layer).
-
----
-
-## 3. CdpSession Creates DispatchContext (session.rs)
+The dispatch router in `mod.rs` (line 58) calls:
 
 ```rust
-async fn handle_text_message(&mut self, text: &str) -> anyhow::Result<()> {
-    // ... parse request ...
-
-    // Create dispatch context with session + event sender
-    let ctx = DispatchContext {
-        session: self.session.clone(),
-        events: self.event_sender.clone(),
-    };
-
-    // Dispatch to domain handler
-    let response = match domains::dispatch(&request.method, request.params, &ctx).await {
-        // ...
-    };
-}
+"Page" => page::handle(method_name, params, ctx).await,
 ```
 
-**Session fields**:
+Since `page::handle` is already `async fn`, changing `print_to_pdf` from:
 ```rust
-pub struct CdpSession {
-    browser: Arc<Browser>,
-    session: Arc<RwLock<oxibrowser_core::session::Session>>,
-    event_sender: EventSender,
-    // ...
-}
+"printToPDF" => print_to_pdf(params),
+```
+to:
+```rust
+"printToPDF" => print_to_pdf(params, ctx).await,
 ```
 
----
+**Will NOT break the dispatch router.** The `.await` on the whole `handle()` call handles both sync and async handlers transparently.
 
-## Pattern Summary for Task 1
+## Required Changes for printToPDF
 
-| Concern | Pattern |
-|---------|---------|
-| Domain handler signature | `async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult` |
-| State management | Store flags on `EventSender` via `set_*()` methods |
-| Event emission from network layer | `emit_*()` functions take `&EventSender`, called in `HttpClient` |
-| Error codes | `CdpError { code: -32601, message: "..." }` for unknown methods, `-32602` for bad params |
-| Response format | `Ok(Some(json!({})))` for success, `Err(CdpError)` for failures |
+1. **Signature**: Change from `fn(params)` to `async fn(params, ctx)`
+2. **Router call**: Add `.await` to the match arm
+3. **Implementation**: Get HTML from `ctx.session.read().await` and call `oxibrowser_render::render_to_pdf()`
+4. **Import**: Ensure `oxibrowser_render` is in scope (it's already used by `capture_screenshot`)
+
+## Relevant Files
+
+- `/Volumes/MERCURY/PROJECTS/session-b-cdp-perf/crates/oxibrowser-cdp/src/domains/page.rs` — handler implementations
+- `/Volumes/MERCURY/PROJECTS/session-b-cdp-perf/crates/oxibrowser-cdp/src/domains/mod.rs` — dispatch router
+- `/Volumes/MERCURY/PROJECTS/session-b-cdp-perf/crates/oxibrowser-render/src/lib.rs` — `render_to_pdf()` entry point
+- `/Volumes/MERCURY/PROJECTS/session-b-cdp-perf/crates/oxibrowser-render/src/config.rs` — `RenderConfig` builder API
