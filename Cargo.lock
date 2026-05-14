@@ -2550,6 +2550,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "image",
  "oxibrowser-core",
  "oxibrowser-render",
  "oxibrowser-webapi",

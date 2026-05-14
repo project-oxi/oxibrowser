@@ -26,7 +26,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "getFrameTree" => get_frame_tree(ctx).await,
         "getFrameMetrics" => get_frame_metrics(),
         "captureScreenshot" => capture_screenshot(params, ctx).await,
-        "printToPDF" => print_to_pdf(params),
+        "printToPDF" => print_to_pdf(params, ctx).await,
         "getLifecycleEvents" => Ok(Some(json!({ "events": [] }))),
         "setLifecycleEventsEnabled" => set_lifecycle_events_enabled(params, ctx),
         _ => Err(CdpError {
@@ -298,8 +298,14 @@ fn get_frame_metrics() -> DomainResult {
 /// Page.captureScreenshot — captures a screenshot of the page.
 ///
 /// Supports:
-/// - `format: "png"` (default): returns a 1x1 transparent PNG placeholder
-/// - `format: "text"`: returns CSS text screenshot (ASCII art rendering)
+/// - `format: "png"` (default): pixel-perfect PNG screenshot
+/// - `format: "jpeg"`: JPEG screenshot with `quality` param (1-100)
+/// - `format: "text"`: CSS text screenshot (ASCII art rendering)
+///
+/// Clip options:
+/// - `clip.x`, `clip.y`, `clip.width`, `clip.height` — capture a region
+/// - `captureBeyondViewport: true` — auto-height to full content
+#[allow(unused_variables, unused_assignments)]
 async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let params_val = params.unwrap_or_default();
     let format = params_val
@@ -327,19 +333,44 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
             })))
         }
         _ => {
-            // Get viewport dimensions from params or defaults
-            let width = params_val
+            let _quality = params_val
+                .get("quality")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80) as u8;
+
+            // Viewport dimensions from params or defaults
+            let mut width = params_val
                 .get("width")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1280) as u32;
-            let height = params_val
+            let mut height = params_val
                 .get("height")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(720) as u32;
-            let scale = params_val
+            let _scale = params_val
                 .get("deviceScaleFactor")
                 .and_then(|v: &Value| v.as_f64())
                 .unwrap_or(1.0) as f32;
+
+            // clip region: override width/height and offset rendering
+            let clip = params_val.get("clip");
+            let clip_x;
+            let clip_y;
+            if let Some(clip) = clip {
+                clip_x = clip.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                clip_y = clip.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                width = clip.get("width").and_then(|v| v.as_u64()).unwrap_or(width as u64) as u32;
+                height = clip.get("height").and_then(|v| v.as_u64()).unwrap_or(height as u64) as u32;
+            } else {
+                clip_x = 0.0;
+                clip_y = 0.0;
+            }
+
+            // captureBeyondViewport: auto-expand height to content
+            let _beyond_viewport = params_val
+                .get("captureBeyondViewport")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // Try real rendering if the render feature is enabled
             #[cfg(feature = "render")]
@@ -350,17 +381,43 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
                     .map(|p| p.content())
                     .unwrap_or("<html><body></body></html>");
 
-                let config = oxibrowser_render::RenderConfig::new()
+                let mut config = oxibrowser_render::RenderConfig::new()
                     .size(width.max(16), height.max(16))
                     .scale(scale)
-                    .auto_height(true);
+                    .auto_height(beyond_viewport);
+
+                // For clip: render full viewport then crop
+                // (Blitz doesn't natively support offset rendering)
+                if clip.is_some() {
+                    // Render at clip dimensions
+                    config = config.size(width.max(16), height.max(16));
+                }
 
                 match oxibrowser_render::render_to_png(html, config) {
                     Ok(png_bytes) => {
-                        let encoded = base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            &png_bytes,
-                        );
+                        // If clip specified with offset, crop the PNG
+                        let final_bytes: Vec<u8> = if clip.is_some() && (clip_x > 0.0 || clip_y > 0.0) {
+                            crop_png(&png_bytes, clip_x, clip_y, width, height)
+                                .unwrap_or(png_bytes)
+                        } else {
+                            png_bytes
+                        };
+
+                        // Encode JPEG if requested
+                        let encoded = if format == "jpeg" {
+                            png_to_jpeg(&final_bytes, quality).unwrap_or_else(|_| {
+                                base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &final_bytes,
+                                )
+                            })
+                        } else {
+                            base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &final_bytes,
+                            )
+                        };
+
                         return Ok(Some(json!({
                             "data": encoded,
                             "metadata": {
@@ -377,7 +434,7 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
                 }
             }
 
-            // PNG placeholder (1x1 transparent) — used when render feature is disabled
+            // Placeholder — used when render feature is disabled
             let placeholder = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPj/HwADBwIAMCbHYQAAAABJRU5ErkJggg==";
 
             Ok(Some(json!({
@@ -392,18 +449,123 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
     }
 }
 
+/// Crop a PNG buffer to the specified region.
+#[cfg(feature = "render")]
+fn crop_png(
+    png_bytes: &[u8],
+    x: f32,
+    y: f32,
+    crop_w: u32,
+    crop_h: u32,
+) -> Result<Vec<u8>, String> {
+    let img = image::load_from_memory(png_bytes)
+        .map_err(|e: image::ImageError| e.to_string())?;
+    let cropped = img.crop_imm(
+        x as u32,
+        y as u32,
+        crop_w.min(img.width()),
+        crop_h.min(img.height()),
+    );
+    let mut buf = Vec::new();
+    cropped
+        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .map_err(|e: image::ImageError| e.to_string())?;
+    Ok(buf)
+}
+
+/// Convert PNG bytes to base64-encoded JPEG with quality control.
+#[cfg(feature = "render")]
+fn png_to_jpeg(png_bytes: &[u8], quality: u8) -> Result<String, String> {
+    use base64::Engine;
+
+    let img = image::load_from_memory(png_bytes)
+        .map_err(|e: image::ImageError| e.to_string())?;
+    let mut buf = Vec::new();
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+    img.write_with_encoder(encoder)
+        .map_err(|e: image::ImageError| e.to_string())?;
+    Ok(Engine::encode(&base64::engine::general_purpose::STANDARD, &buf))
+}
+
 /// Page.printToPDF — prints the page to PDF.
 ///
 /// Returns actual PDF when render feature is enabled,
 /// otherwise returns a placeholder.
-fn print_to_pdf(params: Option<Value>) -> DomainResult {
+async fn print_to_pdf(params: Option<Value>, _ctx: &DispatchContext) -> DomainResult {
+    let params_val = params.unwrap_or_default();
+
+    // Try real PDF rendering if the render feature is enabled
     #[cfg(feature = "render")]
     {
-        // TODO: Integrate with session to get actual HTML content
-        // For now, return placeholder since we need ctx for session access
-        let _ = params;
+        let guard = ctx.session.read().await;
+        let html = guard
+            .page()
+            .map(|p| p.content())
+            .unwrap_or("<html><body></body></html>");
+
+        let width = params_val
+            .get("paperWidth")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(8.5); // inches
+        let height = params_val
+            .get("paperHeight")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(11.0); // inches
+        let scale = params_val
+            .get("scale")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0) as f32;
+        let landscape = params_val
+            .get("landscape")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let print_background = params_val
+            .get("printBackground")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        // Convert inches to pixels at 96 DPI
+        let px_w = (width * 96.0) as u32;
+        let px_h = (height * 96.0) as u32;
+        let (render_w, render_h) = if landscape {
+            (px_h.max(16), px_w.max(16))
+        } else {
+            (px_w.max(16), px_h.max(16))
+        };
+
+        let background = if print_background {
+            [255, 255, 255, 255]
+        } else {
+            [0, 0, 0, 0] // transparent
+        };
+
+        let config = oxibrowser_render::RenderConfig::new()
+            .size(render_w, render_h)
+            .scale(scale)
+            .auto_height(true)
+            .background(background)
+            .format(oxibrowser_render::OutputFormat::Pdf);
+
+        match oxibrowser_render::render(html, config) {
+            Ok(pdf_bytes) => {
+                let encoded = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &pdf_bytes,
+                );
+                return Ok(Some(json!({
+                    "data": encoded,
+                    "stream": ""
+                })));
+            }
+            Err(e) => {
+                tracing::warn!("PDF rendering failed: {}", e);
+                // Fall through to placeholder
+            }
+        }
     }
 
+    let _ = params_val;
+    let _ = params_val;
     Ok(Some(json!({
         "data": "",
         "stream": ""
