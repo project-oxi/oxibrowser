@@ -3746,7 +3746,7 @@ fn register_window_globals(
         .build();
 
     // window.location
-    let parsed_url = url::Url::parse(&url_owned);
+    let parsed_url = url::Url::parse(&url_owned).ok();
     let loc_href = url_owned.clone();
     let loc_origin = parsed_url
         .as_ref()
@@ -3758,14 +3758,92 @@ fn register_window_globals(
         .unwrap_or_default();
     let loc_hostname = parsed_url
         .as_ref()
-        .ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_default();
     let loc_pathname = parsed_url
         .as_ref()
-        .ok()
         .map(|u| u.path().to_string())
         .unwrap_or_default();
+    let loc_search = parsed_url
+        .as_ref()
+        .and_then(|u| u.query())
+        .map(|q| format!("?{}", q))
+        .unwrap_or_default();
+    let loc_hash = parsed_url
+        .as_ref()
+        .and_then(|u| u.fragment())
+        .map(|f| format!("#{}", f))
+        .unwrap_or_default();
+    let loc_host = parsed_url
+        .as_ref()
+        .map(|u| {
+            let host = u.host_str().unwrap_or("");
+            u.port()
+                .map(|p| format!("{}:{}", host, p))
+                .unwrap_or_else(|| host.to_string())
+        })
+        .unwrap_or_default();
+    let loc_port = parsed_url
+        .as_ref()
+        .and_then(|u| u.port())
+        .map(|p| p.to_string())
+        .unwrap_or_default();
+
+    // Normalize: empty search/hash should be "" not "?" or "#"
+    let loc_search = if loc_search.is_empty() || loc_search == "?" {
+        String::new()
+    } else {
+        loc_search
+    };
+    let loc_hash = if loc_hash.is_empty() || loc_hash == "#" {
+        String::new()
+    } else {
+        loc_hash
+    };
+
+    // Navigation functions (use history_tx for assign/replace)
+    let history_tx_nav = history_tx_arc.clone();
+    let location_assign_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, _ctx| {
+            let url = args
+                .get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            if let Some(tx) = history_tx_nav.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::PushState {
+                    url,
+                });
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let history_tx_nav2 = history_tx_arc.clone();
+    let location_replace_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, _ctx| {
+            let url = args
+                .get(0)
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            if let Some(tx) = history_tx_nav2.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::ReplaceState {
+                    url,
+                });
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let history_tx_nav3 = history_tx_arc.clone();
+    let location_reload_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, _ctx| {
+            // reload = go(0) to reload current page
+            if let Some(tx) = history_tx_nav3.read().as_ref() {
+                let _ = tx.send(HistoryCommandType::Go { delta: 0 });
+            }
+            Ok(JsValue::undefined())
+        })
+    };
 
     let location_obj = boa_engine::object::ObjectInitializer::new(ctx)
         .property(
@@ -3784,8 +3862,18 @@ fn register_window_globals(
             Attribute::all(),
         )
         .property(
+            js_string!("host"),
+            JsValue::from(js_string!(loc_host.as_str())),
+            Attribute::all(),
+        )
+        .property(
             js_string!("hostname"),
             JsValue::from(js_string!(loc_hostname.as_str())),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("port"),
+            JsValue::from(js_string!(loc_port.as_str())),
             Attribute::all(),
         )
         .property(
@@ -3793,6 +3881,19 @@ fn register_window_globals(
             JsValue::from(js_string!(loc_pathname.as_str())),
             Attribute::all(),
         )
+        .property(
+            js_string!("search"),
+            JsValue::from(js_string!(loc_search.as_str())),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("hash"),
+            JsValue::from(js_string!(loc_hash.as_str())),
+            Attribute::all(),
+        )
+        .function(location_assign_fn, js_string!("assign"), 1)
+        .function(location_replace_fn, js_string!("replace"), 1)
+        .function(location_reload_fn, js_string!("reload"), 0)
         .build();
 
     // window.performance
