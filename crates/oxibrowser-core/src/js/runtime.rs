@@ -988,9 +988,16 @@ fn create_context(
             drop(tx);
 
             // Recreate tx after dropping the read guard (to avoid deadlock)
-            let tx = {
-                let guard = fetch_tx_inner.read();
-                guard.as_ref().cloned().unwrap()
+            let tx = match fetch_tx_inner.read().as_ref().cloned() {
+                Some(t) => t,
+                None => {
+                    // No fetch channel — return rejected Promise
+                    let reject_code = r#"
+                        Promise.reject(new Error('fetch() is not available — channel not set'))
+                    "#;
+                    let result = ctx.eval(Source::from_bytes(reject_code.trim()));
+                    return result;
+                }
             };
 
             let (response_tx, response_rx) = std::sync::mpsc::channel::<FetchResponseMsg>();
@@ -2737,7 +2744,10 @@ fn create_element_object(
                 .unwrap_or_default();
             let _callback = args.get(1);
 
-            let this_obj = _this.as_object().unwrap();
+            let this_obj = match _this.as_object() {
+                Some(o) => o,
+                None => return Ok(JsValue::undefined()),
+            };
             let listeners = this_obj.get(js_string!("__listeners"), ctx);
             if let Ok(l_val) = listeners {
                 if let Some(l_obj) = l_val.as_object() {
@@ -2767,7 +2777,10 @@ fn create_element_object(
                 return Ok(JsValue::from(true));
             };
 
-            let this_obj = _this.as_object().unwrap();
+            let this_obj = match _this.as_object() {
+                Some(o) => o,
+                None => return Ok(JsValue::from(true)),
+            };
             let listeners = this_obj.get(js_string!("__listeners"), ctx);
             if let Ok(l_val) = listeners {
                 if let Some(l_obj) = l_val.as_object() {
