@@ -4,6 +4,7 @@ members = [
     "crates/oxibrowser",
     "crates/oxibrowser-cdp",
     "crates/oxibrowser-core",
+    "crates/oxibrowser-render",
     "crates/oxibrowser-webapi",
 ]
 
@@ -51,6 +52,17 @@ base64 = "0.22"
 boa_engine = "0.20"
 boa_gc = "0.20"
 getrandom = "0.3"
+
+# Rendering stack (Blitz integration) — isolated to oxibrowser-render so the
+# Stylo / html5ever 0.39 / vello dependency trees stay out of the rest of the workspace.
+blitz-dom = "0.3.0-beta.1"
+blitz-html = "0.3.0-beta.1"
+blitz-paint = "0.3.0-beta.1"
+blitz-traits = "0.3.0-beta.1"
+anyrender = "0.11"
+anyrender_vello_cpu = "0.14"
+peniko = "0.6"
+png = "0.18"
 
 [workspace.metadata.release]
 version = "0.14.1"

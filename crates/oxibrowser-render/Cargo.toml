@@ -1,0 +1,28 @@
+[package]
+name = "oxibrowser-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "CSS-aware HTML rendering pipeline for OxiBrowser (Blitz-backed)"
+
+[dependencies]
+# Blitz rendering stack — isolated to this crate so the Stylo / html5ever 0.39
+# / vello dependency trees do not leak into the rest of the workspace.
+blitz-dom = { workspace = true }
+blitz-html = { workspace = true }
+blitz-paint = { workspace = true }
+blitz-traits = { workspace = true }
+anyrender = { workspace = true }
+anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
+peniko = { workspace = true }
+png = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
