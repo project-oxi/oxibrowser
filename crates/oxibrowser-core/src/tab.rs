@@ -811,7 +811,7 @@ impl Tab {
         let started = std::time::Instant::now();
         let session = self.inner.lock().await;
         let png = match session.page() {
-            Some(page) => page.to_screenshot_png(width)?,
+            Some(page) => page.to_screenshot_png_live(width)?,
             None => return Err(CoreError::PageNotLoaded),
         };
 

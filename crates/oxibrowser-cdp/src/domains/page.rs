@@ -368,7 +368,7 @@ async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> Dom
     let guard = ctx.session.read().await;
     let png_bytes: Vec<u8> = match guard.page() {
         Some(page) => page
-            .to_screenshot_png(viewport_width.max(64))
+            .to_screenshot_png_live(viewport_width.max(64))
             .unwrap_or_else(|_| {
                 oxibrowser_core::css::text_to_png("", viewport_width.max(64)).unwrap_or_default()
             }),
