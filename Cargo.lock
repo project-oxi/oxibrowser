@@ -2872,6 +2872,7 @@ dependencies = [
  "html5ever 0.29.1",
  "image",
  "markup5ever 0.14.1",
+ "oxibrowser-render",
  "oxibrowser-webapi",
  "parking_lot",
  "percent-encoding",

@@ -42,6 +42,7 @@ regex = "1.10"
 chrono = "0.4"
 
 oxibrowser-webapi = { version = "0.17.0", path = "../oxibrowser-webapi" }
+oxibrowser-render = { path = "../oxibrowser-render" }
 getrandom = { workspace = true }
 
 [dev-dependencies]

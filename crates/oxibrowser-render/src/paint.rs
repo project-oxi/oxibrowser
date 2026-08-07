@@ -13,21 +13,37 @@ use peniko::Fill;
 
 use crate::document::{RenderError, Viewport};
 
-/// Render `doc` to a PNG byte buffer at `viewport` size.
-pub(crate) fn capture_png(doc: &mut BaseDocument, viewport: Viewport) -> Result<Vec<u8>, RenderError> {
-    let width = viewport.width.max(1);
-    let height = viewport.height.max(1);
-    let scale = viewport.scale;
-
-    // Ensure layout reflects the latest state before painting.
+/// Render `doc` to a PNG byte buffer.
+///
+/// When `full_page` is true the height is taken from the root element's laid-out
+/// content height (a full-page screenshot); otherwise `viewport.height` is used.
+pub(crate) fn capture_png(
+    doc: &mut BaseDocument,
+    viewport: Viewport,
+    full_page: bool,
+) -> Result<Vec<u8>, RenderError> {
+    // Ensure layout reflects the latest state before measuring/painting.
     doc.resolve(0.0);
+
+    let width = viewport.width.max(1);
+    let height = if full_page {
+        let content_h = doc.root_element().final_layout.size.height;
+        if content_h.is_finite() && content_h > 0.0 {
+            content_h.ceil() as u32
+        } else {
+            viewport.height.max(1)
+        }
+    } else {
+        viewport.height.max(1)
+    };
+    let scale = viewport.scale;
 
     // `render_to_buffer` hands the closure a `&mut VelloCpuScenePainter`
     // (the `R::ScenePainter` for `VelloCpuImageRenderer`). Its concrete type is
     // inferred — do not annotate it (matches Blitz's capture.rs).
     let buffer = render_to_buffer::<VelloCpuImageRenderer, _>(
         |scene| {
-            // White background covering the whole viewport.
+            // White background covering the whole output area.
             scene.fill(
                 Fill::NonZero,
                 Default::default(),

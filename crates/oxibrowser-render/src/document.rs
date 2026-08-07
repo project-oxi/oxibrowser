@@ -55,6 +55,9 @@ pub struct CaptureOpts {
     /// Override the document viewport size. If `None`, the document's current
     /// viewport is used.
     pub viewport: Option<Viewport>,
+    /// Render the full document height (ignoring the viewport height), like a
+    /// browser's full-page screenshot. The viewport width is still respected.
+    pub full_page: bool,
 }
 
 /// A Blitz-backed renderable document.
@@ -105,9 +108,26 @@ impl RenderDocument {
         &mut self.doc
     }
 
+    /// The laid-out content size in CSS pixels (from the root element's
+    /// `final_layout`). Valid only after [`Self::from_html`] (which resolves).
+    pub fn content_size(&self) -> (u32, u32) {
+        let size = self.doc.root_element().final_layout.size;
+        let w = if size.width.is_finite() && size.width > 0.0 {
+            size.width.ceil() as u32
+        } else {
+            self.viewport.width
+        };
+        let h = if size.height.is_finite() && size.height > 0.0 {
+            size.height.ceil() as u32
+        } else {
+            self.viewport.height
+        };
+        (w, h)
+    }
+
     /// Render the current document state to a PNG.
     pub fn capture_png(&mut self, opts: &CaptureOpts) -> Result<Vec<u8>, RenderError> {
         let viewport = opts.viewport.unwrap_or(self.viewport);
-        paint::capture_png(&mut self.doc, viewport)
+        paint::capture_png(&mut self.doc, viewport, opts.full_page)
     }
 }
