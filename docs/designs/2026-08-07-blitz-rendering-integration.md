@@ -1,7 +1,7 @@
 # Blitz Rendering Integration — Design Spec
 
 **Date:** 2026-08-07
-**Status:** Approved (implementation in progress)
+**Status:** Phase 1 + Phase 2a/2b/2c SHIPPED on `feat/blitz-rendering` (commits `60b0042` `dfae6e9` `83cca96` `03d364d`). Real CSS screenshots — including correct post-JS live-DOM rendering — flow through CDP `Page.captureScreenshot` and CLI `session screenshot`. Remaining: full DOM unification (JsRuntime owns `RenderDocument`; retire `oxibrowser-webapi`) — see `2026-08-07-blitz-rendering-integration-plan.md`.
 **Supersedes:** text-based screenshot rendering (`css/screenshot.rs`, `css/visual.rs`)
 
 ## Goal
