@@ -69,10 +69,14 @@ impl BingEngine {
             return Err(SearchError::Network(format!("Bing returned HTTP {status}")));
         }
 
-        let html = response
-            .text()
+        let bytes = response
+            .bytes()
             .await
             .map_err(|e| SearchError::Network(e.to_string()))?;
+        // Bing sometimes mislabels UTF-8 responses with a legacy charset
+        // header, which makes reqwest's `.text()` mojibake CJK results.
+        // Trust the bytes: Bing's HTML is UTF-8 in practice.
+        let html = String::from_utf8_lossy(&bytes);
 
         // CAPTCHA detection
         if html.contains("CaptchaChallenge") || html.contains(" Bing captcha ") {
@@ -163,7 +167,32 @@ fn extract_bing_link(block: &str) -> (String, String) {
         None => String::new(),
     };
 
-    (title, url)
+    (title, decode_bing_redirect(&url))
+}
+
+/// Decode Bing's `/ck/a` tracking redirect to the real target URL.
+///
+/// Bing wraps organic results in
+/// `https://www.bing.com/ck/a?...&u=a1<base64url>` where the payload after
+/// the `a1` prefix is the base64url (unpadded) encoded target. Non-tracking
+/// URLs are returned unchanged.
+fn decode_bing_redirect(url: &str) -> String {
+    if !url.contains("/ck/a") {
+        return url.to_string();
+    }
+    let Some(u_pos) = url.find("u=a1") else {
+        return url.to_string();
+    };
+    let payload = &url[u_pos + "u=a1".len()..];
+    let payload = match payload.find('&') {
+        Some(end) => &payload[..end],
+        None => payload,
+    };
+    use base64::Engine as _;
+    match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => url.to_string(),
+    }
 }
 
 /// Extract snippet text from a Bing result block.
@@ -341,5 +370,28 @@ mod tests {
 
         let html2 = "<html> Bing captcha detected</html>";
         assert!(html2.contains(" Bing captcha "));
+    }
+
+    #[test]
+    fn test_decode_bing_redirect_real_payload() {
+        // Real-world shape: base64url (unpadded) of the target after `u=a1`.
+        let tracking = "https://www.bing.com/ck/a?!&&p=abc&u=a1aHR0cHM6Ly9uYW11Lndpa2kvdy9UT0tJTyglRUMlOTUlODQlRUMlOUQlQjQlRUIlOEYlOEMp&ntb=1";
+        assert_eq!(
+            decode_bing_redirect(tracking),
+            "https://namu.wiki/w/TOKIO(%EC%95%84%EC%9D%B4%EB%8F%8C)"
+        );
+    }
+
+    #[test]
+    fn test_decode_bing_redirect_passthrough() {
+        assert_eq!(
+            decode_bing_redirect("https://example.com/page"),
+            "https://example.com/page"
+        );
+        // /ck/a without a u=a1 payload — return unchanged.
+        assert_eq!(
+            decode_bing_redirect("https://www.bing.com/ck/a?x=1"),
+            "https://www.bing.com/ck/a?x=1"
+        );
     }
 }
