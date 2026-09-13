@@ -1852,6 +1852,15 @@ fn run_eval(
     }
 }
 
+/// Best-effort human-readable message from a panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
+}
+
 /// Main loop for the JS thread.
 ///
 /// Creates a single `Context`, registers globals, and processes commands
@@ -1955,11 +1964,7 @@ fn js_thread_loop(
                         continue;
                     }
                     Err(payload) => {
-                        let detail = payload
-                            .downcast_ref::<&str>()
-                            .map(|s| (*s).to_string())
-                            .or_else(|| payload.downcast_ref::<String>().cloned())
-                            .unwrap_or_else(|| "unknown panic".to_string());
+                        let detail = panic_message(payload.as_ref());
                         let _ = response_tx.send(JsResponse::Error {
                             message: format!("native binding panicked during evaluation: {detail}"),
                         });
@@ -2185,16 +2190,33 @@ fn js_thread_loop(
                                 *dom_snapshot.write() = Some(snap);
                             }
                         }
-                        run_navigation_scripts(
-                            &mut ctx,
-                            &job_queue,
-                            &scripts,
-                            nav_loop_limit,
-                            nav_recursion_limit,
-                            nav_stack_limit,
-                            nav_timeout_ms,
-                        );
-                        let _ = response_tx.send(JsResponse::Done);
+                        // Contained like the Eval arm: a panic in a page
+                        // script's native binding must not kill the JS thread
+                        // — set_document reports it instead.
+                        let nav = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_navigation_scripts(
+                                &mut ctx,
+                                &job_queue,
+                                &scripts,
+                                nav_loop_limit,
+                                nav_recursion_limit,
+                                nav_stack_limit,
+                                nav_timeout_ms,
+                            );
+                        }));
+                        match nav {
+                            Ok(()) => {
+                                let _ = response_tx.send(JsResponse::Done);
+                            }
+                            Err(payload) => {
+                                let _ = response_tx.send(JsResponse::Error {
+                                    message: format!(
+                                        "native binding panicked during navigation scripts: {}",
+                                        panic_message(payload.as_ref())
+                                    ),
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = response_tx.send(JsResponse::Error {
@@ -2322,15 +2344,21 @@ fn js_thread_loop(
                                 *child_dom_snapshot.write() = Some(snap);
                             }
                         }
-                        run_navigation_scripts(
-                            &mut child_ctx,
-                            &child_jq,
-                            &scripts,
-                            nav_loop_limit,
-                            nav_recursion_limit,
-                            nav_stack_limit,
-                            nav_timeout_ms,
-                        );
+                        // Contained like the Eval arm (same panic class).
+                        let nav = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_navigation_scripts(
+                                &mut child_ctx,
+                                &child_jq,
+                                &scripts,
+                                nav_loop_limit,
+                                nav_recursion_limit,
+                                nav_stack_limit,
+                                nav_timeout_ms,
+                            );
+                        }));
+                        // Register the frame even when scripts panicked: the
+                        // document itself is intact and the context id stays
+                        // resolvable for later commands.
                         child_frames.insert(
                             context_id,
                             ChildFrame {
@@ -2340,7 +2368,19 @@ fn js_thread_loop(
                                 dom_snapshot_arc: child_dom_snapshot,
                             },
                         );
-                        let _ = response_tx.send(JsResponse::Done);
+                        match nav {
+                            Ok(()) => {
+                                let _ = response_tx.send(JsResponse::Done);
+                            }
+                            Err(payload) => {
+                                let _ = response_tx.send(JsResponse::Error {
+                                    message: format!(
+                                        "native binding panicked during navigation scripts: {}",
+                                        panic_message(payload.as_ref())
+                                    ),
+                                });
+                            }
+                        }
                     }
                     Err(e) => {
                         let _ = response_tx.send(JsResponse::Error {
@@ -5499,7 +5539,16 @@ fn create_context(
                 nodeType: 11,
                 childNodes: [],
                 appendChild: function(child) {
-                    if (child && child.nodeType === 11) {
+                    if (child === frag) {
+                        // DOM spec: a fragment cannot contain itself — the
+                        // flatten below pushes onto the array being iterated
+                        // and would never terminate.
+                        throw new TypeError("cannot append a fragment to itself");
+                    }
+                    if (child == null) {
+                        throw new TypeError("appendChild requires a Node argument");
+                    }
+                    if (child.nodeType === 11) {
                         // Splice a nested fragment's children in — fragments
                         // never nest (DOM spec flattening).
                         for (var i = 0; i < child.childNodes.length; i++) {
@@ -5648,15 +5697,18 @@ fn create_render_element_object(
                 .unwrap_or(false);
 
             // Nodes to insert: the fragment's childNodes for a splice,
-            // otherwise the child itself. Nodes without a __nodeId are
-            // skipped — they cannot live in the render document.
+            // otherwise the child itself. Nodes without a __nodeId cannot
+            // live in the render document; createElement/createTextNode
+            // always mint one, so hitting this means foreign objects were
+            // pushed into childNodes by hand — skip them observably.
+            let mut skipped = 0usize;
             let insert_nodes: Vec<JsValue> = if is_fragment {
                 let frag_children = child
                     .as_object()
                     .and_then(|o| o.get(js_string!("childNodes"), ctx).ok())
                     .and_then(|v| v.as_object().cloned())
                     .map(JsArray::from_object);
-                match frag_children {
+                let children: Vec<JsValue> = match frag_children {
                     Some(Ok(arr)) => arr
                         .length(ctx)
                         .map(|len| {
@@ -5666,12 +5718,21 @@ fn create_render_element_object(
                         })
                         .unwrap_or_default(),
                     _ => Vec::new(),
-                }
+                };
+                let (with_id, without): (Vec<_>, Vec<_>) = children
+                    .into_iter()
+                    .partition(|n| node_id_of(n, ctx).is_some());
+                skipped = without.len();
+                with_id
             } else if node_id_of(&child, ctx).is_some() {
                 vec![child.clone()]
             } else {
+                skipped = 1;
                 Vec::new()
             };
+            if skipped > 0 {
+                tracing::warn!("appendChild: skipped {skipped} node(s) without a __nodeId");
+            }
             let insert_ids: Vec<usize> = insert_nodes
                 .iter()
                 .filter_map(|n| node_id_of(n, ctx))
@@ -5690,23 +5751,27 @@ fn create_render_element_object(
 
             // Fire connectedCallback OUTSIDE the render-doc borrow, so a
             // callback that touches the DOM (setAttribute/appendChild) can
-            // re-borrow the RefCell without panicking. For a fragment splice
-            // every inserted child fires.
-            for node in &insert_nodes {
-                call_global_helper(ctx, "__oxi_fire_connected", std::slice::from_ref(node));
+            // re-borrow the RefCell without panicking. Gated on `appended`:
+            // when the render doc is absent nothing was inserted, and custom
+            // elements must not observe a false "connected".
+            if appended {
+                for node in &insert_nodes {
+                    call_global_helper(ctx, "__oxi_fire_connected", std::slice::from_ref(node));
+                }
             }
 
             // Splice semantics: the fragment is left empty after insertion.
             if is_fragment
                 && appended
                 && let Some(frag_obj) = child.as_object()
-            {
-                let _ = frag_obj.set(
+                && let Err(e) = frag_obj.set(
                     js_string!("childNodes"),
                     JsValue::from(JsArray::new(ctx)),
                     true,
                     ctx,
-                );
+                )
+            {
+                tracing::warn!("failed to empty fragment after splice: {e}");
             }
             Ok(child)
         })
@@ -11203,6 +11268,28 @@ mod tests {
                 "{\"innerEmpty\":true,\"outerEmpty\":true,\"foundB\":true}"
             ))
         );
+    }
+
+    // Regression for issue #2's full-page form: an inline page script that
+    // appends a DocumentFragment must succeed during navigation (the old
+    // stub crashed here too, killing the thread before any evaluate ran).
+    #[tokio::test]
+    async fn test_nav_script_fragment_append_survives() {
+        let mut rt = JsRuntime::new();
+        rt.set_document_with_scripts(
+            NAV_HTML,
+            Some("https://example.com/"),
+            (400, 300),
+            vec![classic(
+                "var f = document.createDocumentFragment(); \
+                 f.appendChild(document.createElement('i')); \
+                 document.body.appendChild(f); window.__frag = 'ok';",
+            )],
+        )
+        .await
+        .expect("navigation with fragment append must not fail");
+        let r = rt.evaluate("window.__frag").await.expect("thread alive");
+        assert_eq!(r.value, Some(Value::from("ok")));
     }
     #[tokio::test]
     async fn test_capture_without_document_errors() {
