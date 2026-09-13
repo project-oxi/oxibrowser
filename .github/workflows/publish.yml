@@ -65,3 +65,26 @@ jobs:
         run: cargo publish -p oxibrowser
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [publish]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Create GitHub release from CHANGELOG
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          VER="${TAG#v}"
+          {
+            awk "/^## \\[$VER\\]/{f=1; next} /^## \\[/{f=0} f" CHANGELOG.md
+            printf '\n**Full changelog**: https://github.com/project-oxi/oxibrowser/blob/main/CHANGELOG.md\n'
+          } > release-notes.md
+          gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag

@@ -1,6 +1,6 @@
 [package]
 name = "oxibrowser"
-version = "0.21.0"
+version = "0.21.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -42,8 +42,8 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 
-oxibrowser-core = { version = "0.21.0", path = "../oxibrowser-core", optional = true }
-oxibrowser-cdp = { version = "0.21.0", path = "../oxibrowser-cdp", optional = true }
+oxibrowser-core = { version = "0.21.1", path = "../oxibrowser-core", optional = true }
+oxibrowser-cdp = { version = "0.21.1", path = "../oxibrowser-cdp", optional = true }
 
 [dev-dependencies]
 

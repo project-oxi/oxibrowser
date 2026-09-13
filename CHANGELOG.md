@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.1] - 2026-09-14
+
+### Fixed
+- **DocumentFragment `appendChild` no longer kills the JS thread** — `document.createDocumentFragment` was a stub returning a plain object with a bogus `__nodeId` (1100000); appending it into the document forwarded that id to the Blitz render doc, which panicked with "invalid key", and the unwind permanently killed the session's JS thread (every later `Runtime.evaluate` failed with "JS thread has died" while `captureScreenshot` kept returning 200 via its blank-PNG fallback). `DocumentFragment` now tracks its children, element `appendChild` splices them into the document per spec (emptying the fragment and flattening nesting), and native-binding panics on the eval path are contained into a per-evaluation error instead of killing the thread. Follow-up hardening: warn instead of silently dropping fragment children lacking a `__nodeId`, gate `connectedCallback` firing on an actual insertion, contain panics in `SetDocument`/`SetFrameDocument` navigation scripts too (the frame context stays registered), and guard the fragment stub against self-append (infinite flatten loop) and null children (TypeError per spec). Fixes #2.
+- **Bing search results decoded past tracking redirects** — organic results wrapped in `bing.com/ck/a` tracking links now expose the real destination (base64url payload after `u=a1`) instead of the tracking URL, and response bytes are decoded as UTF-8 directly because Bing mislabels charset headers on some locales, which mojibake'd CJK snippets through reqwest's `.text()`.
+
+### Security
+- **h2 bumped to 0.4.19** — resolves the RUSTSEC advisory on unbounded DATA frames (Cargo.lock-only bump; no manifest change).
+
 ## [0.21.0] - 2026-08-11
 
 ### Added

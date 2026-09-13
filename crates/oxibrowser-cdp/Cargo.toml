@@ -1,6 +1,6 @@
 [package]
 name = "oxibrowser-cdp"
-version = "0.21.0"
+version = "0.21.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -28,7 +28,7 @@ http-body-util = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }
 
-oxibrowser-core = { version = "0.21.0", path = "../oxibrowser-core" }
+oxibrowser-core = { version = "0.21.1", path = "../oxibrowser-core" }
 sha1 = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true }
