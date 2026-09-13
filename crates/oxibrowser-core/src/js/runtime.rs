@@ -1906,24 +1906,18 @@ fn js_thread_loop(
             } => {
                 ACTIVE_CONTEXT_ID.set(context_id);
 
-                let outcome = if context_id == 1 {
-                    run_eval(
-                        &mut ctx,
-                        &job_queue,
-                        &console_output,
-                        &mutations,
-                        &expression,
-                        timeout_ms,
-                        max_loop_iterations,
-                        max_recursion,
-                        max_stack_size,
-                        await_promise,
-                    )
-                } else {
-                    match child_frames.get_mut(&context_id) {
-                        Some(cf) => run_eval(
-                            &mut cf.ctx,
-                            &cf.job_queue,
+                // A native binding that panics must not unwind out of this
+                // loop — that killed the JS thread, and every later command
+                // failed with "JS thread has died" (issue #2). Contain the
+                // panic here and answer with a proper error. The context is
+                // deliberately kept: most panics originate in the render-doc
+                // bindings before boa state is touched, and recreating it
+                // would drop all page JS state.
+                let eval_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if context_id == 1 {
+                        Some(run_eval(
+                            &mut ctx,
+                            &job_queue,
                             &console_output,
                             &mutations,
                             &expression,
@@ -1932,14 +1926,45 @@ fn js_thread_loop(
                             max_recursion,
                             max_stack_size,
                             await_promise,
-                        ),
-                        None => {
-                            let _ = response_tx.send(JsResponse::Error {
-                                message: format!("unknown execution context id {context_id}"),
-                            });
-                            ACTIVE_CONTEXT_ID.set(1);
-                            continue;
-                        }
+                        ))
+                    } else {
+                        child_frames.get_mut(&context_id).map(|cf| {
+                            run_eval(
+                                &mut cf.ctx,
+                                &cf.job_queue,
+                                &console_output,
+                                &mutations,
+                                &expression,
+                                timeout_ms,
+                                max_loop_iterations,
+                                max_recursion,
+                                max_stack_size,
+                                await_promise,
+                            )
+                        })
+                    }
+                }));
+
+                let outcome = match eval_result {
+                    Ok(Some(outcome)) => outcome,
+                    Ok(None) => {
+                        let _ = response_tx.send(JsResponse::Error {
+                            message: format!("unknown execution context id {context_id}"),
+                        });
+                        ACTIVE_CONTEXT_ID.set(1);
+                        continue;
+                    }
+                    Err(payload) => {
+                        let detail = payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".to_string());
+                        let _ = response_tx.send(JsResponse::Error {
+                            message: format!("native binding panicked during evaluation: {detail}"),
+                        });
+                        ACTIVE_CONTEXT_ID.set(1);
+                        continue;
                     }
                 };
 
@@ -5463,15 +5488,31 @@ fn create_context(
     let _ = context.register_global_callable(js_string!("DragEvent"), 1, drag_event_ctor);
 
     // --- document.createDocumentFragment (via eval) ---
+    // A fragment tracks its children in a JS array and carries NO __nodeId:
+    // the render-doc appendChild splices those children into the document
+    // (DOM spec). The old stub carried a bogus __nodeId which panicked Blitz
+    // and permanently killed the JS thread on insert (issue #2).
     let _ = context.eval(Source::from_bytes(
         r#"
         document.createDocumentFragment = function() {
-            var fragId = 1100000;
-            return {
+            var frag = {
                 nodeType: 11,
-                __nodeId: fragId,
-                appendChild: function(child) { return child; }
+                childNodes: [],
+                appendChild: function(child) {
+                    if (child && child.nodeType === 11) {
+                        // Splice a nested fragment's children in — fragments
+                        // never nest (DOM spec flattening).
+                        for (var i = 0; i < child.childNodes.length; i++) {
+                            frag.childNodes.push(child.childNodes[i]);
+                        }
+                        child.childNodes.length = 0;
+                    } else {
+                        frag.childNodes.push(child);
+                    }
+                    return child;
+                }
             };
+            return frag;
         };
     "#,
     ));
@@ -5590,22 +5631,82 @@ fn create_render_element_object(
     let append_child_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let child = args.first().cloned().unwrap_or(JsValue::undefined());
-            let child_id = child
+            // A DocumentFragment (nodeType 11) is never inserted itself: per
+            // spec its children are spliced into the parent and the fragment
+            // is left empty. The fragment object carries no __nodeId —
+            // forwarding one to Blitz panics and kills the JS thread.
+            fn node_id_of(node: &JsValue, ctx: &mut Context) -> Option<usize> {
+                node.as_object()
+                    .and_then(|o| o.get(js_string!("__nodeId"), ctx).ok())
+                    .and_then(|v| v.as_number().map(|n| n as usize))
+            }
+            let is_fragment = child
                 .as_object()
-                .and_then(|o| o.get(js_string!("__nodeId"), ctx).ok())
-                .and_then(|v| v.as_number().map(|n| n as usize));
-            let appended = if let (Some(cid), Some(doc)) = (child_id, rd_ac.borrow_mut().as_mut()) {
-                doc.append_child(node_id, cid);
-                notify_mutation_observers(ctx, "childList", node_id as u32);
-                true
+                .and_then(|o| o.get(js_string!("nodeType"), ctx).ok())
+                .and_then(|v| v.as_number())
+                .map(|n| n as u32 == 11)
+                .unwrap_or(false);
+
+            // Nodes to insert: the fragment's childNodes for a splice,
+            // otherwise the child itself. Nodes without a __nodeId are
+            // skipped — they cannot live in the render document.
+            let insert_nodes: Vec<JsValue> = if is_fragment {
+                let frag_children = child
+                    .as_object()
+                    .and_then(|o| o.get(js_string!("childNodes"), ctx).ok())
+                    .and_then(|v| v.as_object().cloned())
+                    .map(JsArray::from_object);
+                match frag_children {
+                    Some(Ok(arr)) => arr
+                        .length(ctx)
+                        .map(|len| {
+                            (0..len)
+                                .filter_map(|i| arr.get(i as i32, ctx).ok())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                }
+            } else if node_id_of(&child, ctx).is_some() {
+                vec![child.clone()]
             } else {
-                false
+                Vec::new()
             };
+            let insert_ids: Vec<usize> = insert_nodes
+                .iter()
+                .filter_map(|n| node_id_of(n, ctx))
+                .collect();
+
+            let mut appended = false;
+            if let Some(doc) = rd_ac.borrow_mut().as_mut() {
+                for id in &insert_ids {
+                    doc.append_child(node_id, *id);
+                }
+                appended = !insert_ids.is_empty();
+                if appended {
+                    notify_mutation_observers(ctx, "childList", node_id as u32);
+                }
+            }
+
             // Fire connectedCallback OUTSIDE the render-doc borrow, so a
             // callback that touches the DOM (setAttribute/appendChild) can
-            // re-borrow the RefCell without panicking.
-            if appended {
-                call_global_helper(ctx, "__oxi_fire_connected", std::slice::from_ref(&child));
+            // re-borrow the RefCell without panicking. For a fragment splice
+            // every inserted child fires.
+            for node in &insert_nodes {
+                call_global_helper(ctx, "__oxi_fire_connected", std::slice::from_ref(node));
+            }
+
+            // Splice semantics: the fragment is left empty after insertion.
+            if is_fragment
+                && appended
+                && let Some(frag_obj) = child.as_object()
+            {
+                let _ = frag_obj.set(
+                    js_string!("childNodes"),
+                    JsValue::from(JsArray::new(ctx)),
+                    true,
+                    ctx,
+                );
             }
             Ok(child)
         })
@@ -11027,6 +11128,82 @@ mod tests {
         assert!(has_red, "the red .box should be rendered");
     }
 
+    // Regression test for GitHub issue #2: appending a DocumentFragment must
+    // splice its children into the document and leave the JS thread alive.
+    #[tokio::test]
+    async fn test_document_fragment_append_child_splices_and_survives() {
+        let mut rt = JsRuntime::new();
+        rt.set_document(
+            "<html><body><p id=\"out\">x</p></body></html>",
+            Some("https://example.com/"),
+            (400, 300),
+        )
+        .await
+        .unwrap();
+
+        // The exact 3-line repro from the issue.
+        let insert = rt
+            .evaluate(
+                "var f = document.createDocumentFragment(); \
+                 f.appendChild(document.createElement('i')); \
+                 document.body.appendChild(f); 'inserted'",
+            )
+            .await
+            .expect("fragment insert must not error");
+        assert_eq!(insert.value, Some(Value::from("inserted")));
+
+        // Splice semantics: children land in the document, fragment empties.
+        let spliced = rt
+            .evaluate(
+                "JSON.stringify({ \
+                    found: document.querySelector('i') !== null, \
+                    fragEmpty: f.childNodes.length === 0 })",
+            )
+            .await
+            .expect("JS thread must survive fragment appendChild");
+        assert_eq!(
+            spliced.value,
+            Some(Value::from("{\"found\":true,\"fragEmpty\":true}"))
+        );
+
+        // And the thread is still healthy afterwards.
+        rt.evaluate("1 + 1").await.expect("thread alive");
+    }
+
+    // Appending a fragment into a fragment splices (never nests); the outer
+    // fragment then inserts the whole set in one call.
+    #[tokio::test]
+    async fn test_nested_fragment_append_flattens() {
+        let mut rt = JsRuntime::new();
+        rt.set_document(
+            "<html><body></body></html>",
+            Some("https://example.com/"),
+            (400, 300),
+        )
+        .await
+        .unwrap();
+
+        let r = rt
+            .evaluate(
+                "var outer = document.createDocumentFragment(); \
+                 var inner = document.createDocumentFragment(); \
+                 inner.appendChild(document.createElement('b')); \
+                 outer.appendChild(inner); \
+                 outer.appendChild(document.createTextNode('t')); \
+                 document.body.appendChild(outer); \
+                 JSON.stringify({ innerEmpty: inner.childNodes.length === 0, \
+                                  outerEmpty: outer.childNodes.length === 0, \
+                                  foundB: document.querySelector('b') !== null })",
+            )
+            .await
+            .expect("nested fragment append must not error");
+        assert_eq!(
+            r.value,
+            Some(Value::from(
+                "{\"innerEmpty\":true,\"outerEmpty\":true,\"foundB\":true}"
+            ))
+        );
+    }
     #[tokio::test]
     async fn test_capture_without_document_errors() {
         let mut rt = JsRuntime::new();
