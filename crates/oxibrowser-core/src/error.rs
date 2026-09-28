@@ -74,6 +74,18 @@ pub enum CoreError {
 
     #[error("PDF render error: {0}")]
     PdfError(String),
+
+    #[error("session store encryption error: {0}")]
+    SessionStoreAead(String),
+
+    #[error("session store file format error: {0}")]
+    SessionStoreFormat(String),
+
+    #[error("session fingerprint mismatch: {0}")]
+    SessionFingerprintMismatch(String),
+
+    #[error("session store io error: {0}")]
+    SessionStoreIo(String),
 }
 
 /// Convenience Result alias.

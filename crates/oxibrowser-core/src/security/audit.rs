@@ -31,6 +31,18 @@ pub enum AuditEventKind {
     SessionTeardown,
     /// Policy violation or blocked action.
     PolicyViolation,
+    /// Account lifecycle transition (upper design §6.4) — `action` carries
+    /// `from->to`, `reason` the trigger detail.
+    AccountState,
+    /// Account context binding / grant consumption (agent_id in `reason`).
+    AccountUse,
+    /// Session envelope sealed for an account scope (`session_capture`).
+    SessionCapture,
+    /// Session envelope loaded into a live session (`session_restore`);
+    /// fingerprint-gate rejections are `deny` decisions.
+    SessionRestore,
+    /// Session envelope disposed (logout) (`session_discard`).
+    SessionDiscard,
 }
 
 /// Decision outcome recorded alongside the event kind.

@@ -9,6 +9,7 @@
 use crate::domains::{DispatchContext, DomainResult};
 use crate::protocol::CdpError;
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// Dispatch Target domain methods.
 pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
@@ -19,7 +20,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "detachFromTarget" => detach_from_target(params, ctx).await,
         "createTarget" => create_target(params, ctx).await,
         "closeTarget" => close_target(params, ctx).await,
-        "createBrowserContext" => create_browser_context(params, ctx),
+        "createBrowserContext" => create_browser_context(params, ctx).await,
         "disposeBrowserContext" => dispose_browser_context(params, ctx),
         "getTargets" => get_targets(ctx).await,
         "getTargetInfo" => get_target_info(params, ctx).await,
@@ -287,18 +288,24 @@ async fn close_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRes
 ///
 /// Returns `{"browserContextId": "ctx-N"}`. Standard parameters:
 /// `disposeOnDetach` and `proxyBypassList` are accepted but currently
-/// ignored; `proxyServer` fixes the context's egress proxy. The extension
-/// parameter `oxiAccount` is rejected with an honest error until account
-/// binding lands (M-D).
-fn create_browser_context(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+/// ignored; `proxyServer` fixes the context's egress proxy.
+///
+/// Extension parameter `oxiAccount` (+ `oxiAgentId`, M-D §3.3/§7.3): the
+/// **agent's route to an account sandbox** through standard Playwright-style
+/// APIs. The account-plane grant (`navigate`/`interact`) is checked
+/// non-consumingly against the scope-root origin; on approval a fresh
+/// context is minted with credential mode on and the account's session
+/// envelope restored into it — audited as `account_use`. On refusal:
+/// `accountAccessDenied` {consentRequired}; an unknown account answers
+/// `invalidAccount`.
+async fn create_browser_context(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let params = params.unwrap_or_default();
 
-    if params.get("oxiAccount").is_some() {
-        return Err(CdpError {
-            code: -32000,
-            message: "account binding not yet implemented".to_string(),
-        });
+    // -- account-bound path ----------------------------------------------
+    if let Some(account) = params.get("oxiAccount") {
+        return create_account_context(account, params.get("oxiAgentId"), ctx).await;
     }
+
     let _dispose_on_detach = params.get("disposeOnDetach").and_then(|v| v.as_bool());
     let proxy = params
         .get("proxyServer")
@@ -317,6 +324,143 @@ fn create_browser_context(params: Option<Value>, ctx: &DispatchContext) -> Domai
     Ok(Some(json!({
         "browserContextId": context.id().to_string()
     })))
+}
+
+/// The `oxiAccount` arm of [`create_browser_context`].
+async fn create_account_context(
+    account: &Value,
+    agent: Option<&Value>,
+    ctx: &DispatchContext,
+) -> DomainResult {
+    let err = |message: String| CdpError {
+        code: -32000,
+        message,
+    };
+
+    let account_id = account.as_str().filter(|s| !s.is_empty()).ok_or_else(|| {
+        err("invalidParameters: oxiAccount must be an account id string".to_string())
+    })?;
+    let agent_id = agent
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            err("invalidParameters: oxiAgentId (string) is required with oxiAccount".to_string())
+        })?;
+
+    // Account + login surface + consent store must exist.
+    let surface = ctx.logins.clone().ok_or_else(|| {
+        err("accountsUnavailable: no login surface configured on this server".to_string())
+    })?;
+    let manager = surface.orchestrator().shared_manager();
+    let record = manager
+        .registry()
+        .get(account_id)
+        .map_err(|_| err(format!("invalidAccount: {account_id}")))?;
+    let broker = ctx.credentials.clone().ok_or_else(|| {
+        err("credentialsUnavailable: no credential broker configured on this server".to_string())
+    })?;
+
+    // Account-plane grant check (subject: account+agent; actions
+    // navigate|interact) at the scope-root origin — §3.3 "승인이면 계정 세션을
+    // 주입한 컨텍스트 반환". Grants are agent-scoped: a grant for one agent
+    // never authorizes another (upper design §1).
+    let scope_origin = format!("https://{}", record.scope);
+    let granted = broker.engine.consents.active_account_any(
+        account_id,
+        agent_id,
+        &scope_origin,
+        &["navigate", "interact"],
+    );
+    if granted.is_none() {
+        audit_account_use(
+            &broker,
+            account_id,
+            agent_id,
+            false,
+            format!("no navigate/interact grant at {scope_origin}"),
+        );
+        return Err(err(
+            "accountAccessDenied: consentRequired — no active account grant for this origin"
+                .to_string(),
+        ));
+    }
+
+    let context = ctx
+        .browser
+        .new_context(oxibrowser_core::context::ContextConfig {
+            label: Some(format!("account:{account_id}")),
+            proxy: None,
+        })
+        .map_err(|e| err(format!("failed to create browser context: {e}")))?;
+    context.set_credential_mode(true);
+
+    // Restore the account envelope into the context (a session in it shares
+    // the context jar). Accounts without a captured session get an empty
+    // sandbox — `OXI.loginWithAccount` fills it.
+    let mut restored = 0usize;
+    let store = manager
+        .registry()
+        .session_store(account_id)
+        .map_err(|e| err(e.to_string()))?;
+    if store.path_for(&record.scope).exists() {
+        let session = ctx
+            .browser
+            .new_session_in(&context)
+            .await
+            .map_err(|e| err(format!("session init failed: {e}")))?;
+        let keys = surface.orchestrator().shared_keys();
+        let mut guard = session.write().await;
+        let current = oxibrowser_core::storage::session_store::FingerprintMeta {
+            user_agent: guard.effective_ua(),
+            ..oxibrowser_core::storage::session_store::FingerprintMeta::default()
+        };
+        let envelope = manager
+            .restore(account_id, &mut guard, keys.as_ref(), Some(&current))
+            .map_err(|e| err(format!("accountAccessDenied: session_restore denied: {e}")))?;
+        restored = envelope.state.cookies.len();
+    }
+
+    audit_account_use(
+        &broker,
+        account_id,
+        agent_id,
+        true,
+        format!(
+            "context={} restored_cookies={restored}",
+            context.id().as_str()
+        ),
+    );
+    surface.bind(account_id, Arc::clone(&context));
+
+    Ok(Some(json!({
+        "browserContextId": context.id().to_string()
+    })))
+}
+
+/// `account_use` audit line — allow or deny, agent id in the reason only.
+fn audit_account_use(
+    broker: &crate::credential::CredentialBroker,
+    account_id: &str,
+    agent_id: &str,
+    allowed: bool,
+    detail: String,
+) {
+    use oxibrowser_core::security::audit::{self, AuditDecision, AuditEvent, AuditEventKind};
+    let event = AuditEvent {
+        action: Some("account_use".to_string()),
+        ..audit::event(
+            AuditEventKind::AccountUse,
+            if allowed {
+                AuditDecision::Allow
+            } else {
+                AuditDecision::Deny
+            },
+            format!("account={account_id} agent={agent_id} {detail}"),
+        )
+    };
+    if let Err(e) = broker.engine.audit.record(event) {
+        tracing::warn!(error = %e, "account_use audit write failed");
+    }
 }
 
 /// Target.disposeBrowserContext — disposes a previously created context.
@@ -500,8 +644,12 @@ mod tests {
             events,
             fetch_registry: oxibrowser_core::network::intercept::shared_registry(),
             dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
-            browser,
+            browser: browser.clone(),
             child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+            browser_context: browser.default_context(),
+            credentials: None,
+            role: crate::session::RoleKind::Agent,
+            logins: None,
         };
         (ctx, rx)
     }
@@ -519,6 +667,10 @@ mod tests {
             dialog_gate: ctx.dialog_gate.clone(),
             browser: ctx.browser.clone(),
             child_targets: ctx.child_targets.clone(),
+            browser_context: ctx.browser.default_context(),
+            credentials: ctx.credentials.clone(),
+            role: ctx.role,
+            logins: ctx.logins.clone(),
         }
     }
 
@@ -640,10 +792,10 @@ mod tests {
         assert!(ctx.child_targets.entries().await.is_empty());
     }
 
-    /// (c) createBrowserContext with the oxiAccount extension fails honestly
-    /// until account binding lands (M-D).
+    /// (c) createBrowserContext with a malformed `oxiAccount` fails honestly:
+    /// the extension requires a string account id + `oxiAgentId` (M-D).
     #[tokio::test]
-    async fn create_browser_context_oxi_account_rejected() {
+    async fn create_browser_context_oxi_account_malformed_rejected() {
         let (ctx, _rx) = make_ctx().await;
 
         let err = handle(
@@ -654,10 +806,32 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, -32000);
-        assert_eq!(err.message, "account binding not yet implemented");
+        assert!(
+            err.message.starts_with("invalidParameters"),
+            "object-form oxiAccount must be rejected: {}",
+            err.message
+        );
+
+        // A string account without oxiAgentId is also rejected.
+        let err = handle(
+            "createBrowserContext",
+            Some(json!({ "oxiAccount": "acc-1" })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.starts_with("invalidParameters"),
+            "missing oxiAgentId must be rejected: {}",
+            err.message
+        );
 
         // No context was created.
-        assert!(ctx.browser.context(&oxibrowser_core::ContextId::from_string("ctx-2")).is_none());
+        assert!(
+            ctx.browser
+                .context(&oxibrowser_core::ContextId::from_string("ctx-2"))
+                .is_none()
+        );
     }
 
     /// (d) disposeBrowserContext removes the context: subsequent
@@ -700,5 +874,177 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.code, -32000);
+    }
+
+    /// (e) `oxiAccount` binding: grant-less → `accountAccessDenied`;
+    /// granted → context with credential mode on and the envelope restored.
+    #[tokio::test]
+    async fn create_browser_context_oxi_account_gate() {
+        use oxibrowser_core::account::{
+            AccountManager, AccountRecord, AccountState, LoginOrchestrator,
+        };
+
+        use oxibrowser_core::security::audit::AuditLog;
+        use oxibrowser_core::storage::session_store::StaticKeyProvider;
+        use oxibrowser_credentials::{
+            ConsentRecord, ConsentStore, ConsentSubject, InMemoryProvider, PolicyEngine,
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("oxi-target-oxiaccount-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let audit = Arc::new(AuditLog::open(dir.join("audit.jsonl")).unwrap());
+        let registry =
+            oxibrowser_core::account::AccountRegistry::open(dir.join("accounts")).unwrap();
+        registry
+            .add(AccountRecord::new("acc", "example.test").unwrap())
+            .unwrap();
+        let manager = Arc::new(AccountManager::with_audit(registry, audit));
+        let mut config = BrowserConfig::headless();
+        config.enable_ssrf_filter = false;
+        let browser = Arc::new(Browser::new(config).await.unwrap());
+        let orch = Arc::new(LoginOrchestrator::new(
+            Arc::clone(&manager),
+            Arc::clone(&browser),
+            Arc::new(StaticKeyProvider::new([3u8; 32])),
+        ));
+        let surface = crate::account::LoginSurface::new(Arc::clone(&orch), Arc::clone(&browser));
+
+        let engine = Arc::new(PolicyEngine::new(
+            Vec::new(),
+            ConsentStore::open(dir.join("consents.jsonl")).unwrap(),
+            Arc::new(AuditLog::open(dir.join("policy.jsonl")).unwrap()),
+        ));
+        let broker = Arc::new(crate::credential::CredentialBroker::new(
+            Arc::new(InMemoryProvider::new()),
+            Arc::clone(&engine),
+        ));
+
+        // Capture a one-cookie envelope for the account (logging_in → valid).
+        let ctx0 = browser
+            .new_context(oxibrowser_core::ContextConfig {
+                label: None,
+                proxy: None,
+            })
+            .unwrap();
+        ctx0.set_credential_mode(true);
+        let session0 = browser.new_session_in(&ctx0).await.unwrap();
+        manager
+            .registry()
+            .set_state("acc", AccountState::LoggingIn, None)
+            .unwrap();
+        {
+            let guard = session0.write().await;
+            guard.cookie_jar().write().store(
+                &url::Url::parse("https://example.test/").unwrap(),
+                "sid=restored; Path=/; HttpOnly; Secure",
+            );
+            manager
+                .capture_session("acc", &guard, &StaticKeyProvider::new([3u8; 32]))
+                .unwrap();
+        }
+
+        let (events, _rx) = crate::event::event_channel();
+        let make = || DispatchContext {
+            session: session0.clone(),
+            events: events.clone(),
+            fetch_registry: oxibrowser_core::network::intercept::shared_registry(),
+            dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
+            browser: Arc::clone(&browser),
+            child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+            browser_context: browser.default_context(),
+            credentials: Some(Arc::clone(&broker)),
+            role: crate::session::RoleKind::Agent,
+            logins: Some(Arc::clone(&surface)),
+        };
+
+        // Grant-less → accountAccessDenied {consentRequired}.
+        let err = handle(
+            "createBrowserContext",
+            Some(json!({ "oxiAccount": "acc", "oxiAgentId": "omp" })),
+            &make(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.starts_with("accountAccessDenied"),
+            "grant-less binding must deny: {err:?}"
+        );
+
+        // Grant the account plane (navigate|interact) at the scope root —
+        // for a DIFFERENT agent first: agent-scoped grants must not leak.
+        engine
+            .consents
+            .grant(ConsentRecord::new(
+                ConsentSubject::Account {
+                    account: "acc".to_string(),
+                    agent: "someone-else".to_string(),
+                },
+                "https://example.test",
+                &["navigate", "interact"],
+                chrono::Duration::hours(1),
+                10,
+            ))
+            .unwrap();
+        let err = handle(
+            "createBrowserContext",
+            Some(json!({ "oxiAccount": "acc", "oxiAgentId": "omp" })),
+            &make(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.message.starts_with("accountAccessDenied"),
+            "grant for another agent must deny: {err:?}"
+        );
+
+        // Grant for the requesting agent → binding succeeds.
+        engine
+            .consents
+            .grant(ConsentRecord::new(
+                ConsentSubject::Account {
+                    account: "acc".to_string(),
+                    agent: "omp".to_string(),
+                },
+                "https://example.test",
+                &["navigate", "interact"],
+                chrono::Duration::hours(1),
+                10,
+            ))
+            .unwrap();
+
+        let resp = handle(
+            "createBrowserContext",
+            Some(json!({ "oxiAccount": "acc", "oxiAgentId": "omp" })),
+            &make(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let context_id = resp["browserContextId"].as_str().unwrap().to_string();
+        let bound = browser
+            .context(&oxibrowser_core::ContextId::from_string(&context_id))
+            .expect("bound context exists");
+        assert!(
+            bound.credential_mode(),
+            "account context runs in credential mode"
+        );
+        let cookies = bound.cookie_jar().read().get_all();
+        assert!(
+            cookies.iter().any(|c| c.name == "sid"),
+            "envelope restored into the context jar: {cookies:?}"
+        );
+
+        // Unknown account → invalidAccount.
+        let err = handle(
+            "createBrowserContext",
+            Some(json!({ "oxiAccount": "ghost", "oxiAgentId": "omp" })),
+            &make(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.message.starts_with("invalidAccount"), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

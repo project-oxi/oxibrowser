@@ -462,6 +462,19 @@ impl Tab {
         Ok(())
     }
 
+    /// Whether this tab's parent [`BrowserContext`] is in credential mode
+    /// (REPL/MCP literal-fill gate, design §6.2).
+    pub async fn in_credential_mode(&self) -> bool {
+        self.inner.lock().await.browser_context().credential_mode()
+    }
+
+    /// Whether `selector` matches an `input[type=password]` control —
+    /// the credential-mode literal-fill gate's target check.
+    pub async fn selector_targets_password(&self, selector: &str) -> bool {
+        let mut session = self.inner.lock().await;
+        session.selector_targets_password(selector).await
+    }
+
     /// Select an option by value or text.
     pub async fn select_option(&self, selector: &str, value: &str) -> Result<()> {
         let js = js::form::js_select_option(selector, value);
@@ -1079,11 +1092,8 @@ mod tests {
     /// Helper: create a Tab with a session loaded with an HTML page.
     async fn tab_with_html(html: &str) -> Tab {
         let config = BrowserConfig::headless();
-        let http_client = Arc::new(HttpClient::new(
-            &config,
-            Arc::new(RwLock::new(CookieJar::new())),
-        )
-        .unwrap());
+        let http_client =
+            Arc::new(HttpClient::new(&config, Arc::new(RwLock::new(CookieJar::new()))).unwrap());
         let context = Arc::new(crate::context::BrowserContext::with_cookie_jar(
             crate::context::ContextId::test_next(),
             None,

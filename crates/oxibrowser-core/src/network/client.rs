@@ -96,6 +96,45 @@ pub struct FetchedResource {
     pub final_url: String,
 }
 
+/// wreq [`wreq::cookie::CookieStore`] adapter over our [`CookieJar`] — the
+/// jar stays the single cookie authority per context. wreq queries it for
+/// every request (including internal redirect hops, which never pass through
+/// the wrapper's manual attach) and feeds every response's Set-Cookie back
+/// into it.
+struct JarCookieStore(Arc<RwLock<CookieJar>>);
+
+impl wreq::cookie::CookieStore for JarCookieStore {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &wreq::header::HeaderValue>,
+        uri: &wreq::Uri,
+    ) {
+        let Ok(url) = Url::parse(&uri.to_string()) else {
+            return;
+        };
+        let mut jar = self.0.write();
+        for val in cookie_headers {
+            if let Ok(cookie_str) = val.to_str() {
+                jar.store(&url, cookie_str);
+            }
+        }
+    }
+
+    fn cookies(&self, uri: &wreq::Uri, _version: wreq::Version) -> wreq::cookie::Cookies {
+        let Ok(url) = Url::parse(&uri.to_string()) else {
+            return wreq::cookie::Cookies::Empty;
+        };
+        let header = self.0.read().cookies_for_url(&url);
+        if header.is_empty() {
+            return wreq::cookie::Cookies::Empty;
+        }
+        match wreq::header::HeaderValue::from_str(&header) {
+            Ok(value) => wreq::cookie::Cookies::Compressed(value),
+            Err(_) => wreq::cookie::Cookies::Empty,
+        }
+    }
+}
+
 /// HTTP client wrapper with cookie support and configurable defaults.
 pub struct HttpClient {
     client: Client,
@@ -184,6 +223,12 @@ impl HttpClient {
             .user_agent(&config.user_agent)
             .pool_max_idle_per_host(config.connection_pool_size)
             .timeout(config.default_timeout)
+            // The jar is also installed as the wreq cookie provider below —
+            // wreq consults it for every request (including internal
+            // redirect hops, which never pass through this wrapper) and
+            // feeds every response's Set-Cookie back into it. The redirect
+            // policy stays SSRF-only.
+            .cookie_provider(JarCookieStore(Arc::clone(&cookie_jar)))
             .redirect(wreq::redirect::Policy::custom(move |attempt| {
                 let url = match Url::parse(&attempt.uri.to_string()) {
                     Ok(u) => u,
@@ -265,13 +310,8 @@ impl HttpClient {
 
         tracing::debug!(url = %url, "HTTP request started");
 
-        let cookies = self.cookie_jar.read().cookies_for_url(url);
-        tracing::trace!(url = %url, cookie_count = cookies.len(), "cookies attached");
-
+        // Cookies are attached by the wreq cookie provider (JarCookieStore).
         let mut request = self.client.get(url.as_str());
-        if !cookies.is_empty() {
-            request = request.header("Cookie", cookies);
-        }
         request = apply_request_overrides(request, ov);
 
         let response = request
@@ -316,7 +356,6 @@ impl HttpClient {
 
         self.check_ssrf(url)?;
 
-        let cookies = self.cookie_jar.read().cookies_for_url(url);
         tracing::debug!(url = %url, method = %method, "HTTP request started");
 
         let method_upper = method.trim().to_ascii_uppercase();
@@ -324,9 +363,6 @@ impl HttpClient {
             .map_err(|e| CoreError::NetworkError(format!("invalid method {method:?}: {e}")))?;
         let mut req_builder = self.client.request(method_obj, url.as_str());
 
-        if !cookies.is_empty() {
-            req_builder = req_builder.header("Cookie", cookies);
-        }
         for (k, v) in headers {
             if let (Ok(name), Ok(val)) = (
                 HeaderName::try_from(k.as_str()),
@@ -662,8 +698,6 @@ impl HttpClient {
 
                 self.check_ssrf(&effective_url)?;
 
-                let cookies = self.cookie_jar.read().cookies_for_url(&effective_url);
-
                 let mut req_builder = if effective_method == "POST" {
                     let body = effective_post.unwrap_or_default();
                     self.client
@@ -673,9 +707,7 @@ impl HttpClient {
                     self.client.get(effective_url.as_str())
                 };
 
-                if !cookies.is_empty() {
-                    req_builder = req_builder.header("Cookie", cookies);
-                }
+                // Cookies are attached by the wreq cookie provider.
                 // Apply modified headers
                 for (k, v) in headers_mod.iter() {
                     if let (Ok(name), Ok(val)) = (

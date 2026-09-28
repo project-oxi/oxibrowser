@@ -13,10 +13,57 @@ use crate::protocol::{CdpError, CdpEvent, CdpRequest, CdpResponse};
 use crate::server::MAX_CDP_MESSAGE_SIZE;
 use futures::{SinkExt, StreamExt};
 use oxibrowser_core::Browser;
+use oxibrowser_core::context::BrowserContext;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite;
 use tracing::{debug, error, info, warn};
+
+/// Connection role (§5.2): agents automate; viewers mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleKind {
+    /// Full automation — input/capture denied only inside a takeover window.
+    Agent,
+    /// The human's mirror — screencast/input/navigate only (§5.2).
+    Viewer,
+}
+
+/// What a WebSocket connection is allowed to be, resolved at upgrade time.
+#[derive(Clone)]
+pub struct ConnectionRole {
+    pub kind: RoleKind,
+    /// The context this connection's session is created in (`None` → the
+    /// browser's default; viewers always carry the takeover context).
+    pub context: Option<Arc<BrowserContext>>,
+    /// Account/login surface (OXI account* methods, event forwarding).
+    pub logins: Option<Arc<crate::account::LoginSurface>>,
+}
+
+impl ConnectionRole {
+    /// An agent connection, optionally bound to the server's primary context.
+    pub fn agent(
+        context: Option<Arc<BrowserContext>>,
+        logins: Option<Arc<crate::account::LoginSurface>>,
+    ) -> Self {
+        ConnectionRole {
+            kind: RoleKind::Agent,
+            context,
+            logins,
+        }
+    }
+
+    /// A viewer connection — always lands in the takeover context.
+    pub fn viewer(
+        context: Arc<BrowserContext>,
+        logins: Option<Arc<crate::account::LoginSurface>>,
+    ) -> Self {
+        ConnectionRole {
+            kind: RoleKind::Viewer,
+            context: Some(context),
+            logins,
+        }
+    }
+}
 
 /// A single CDP session over a WebSocket connection.
 ///
@@ -51,6 +98,17 @@ pub struct CdpSession {
     dialog_gate: oxibrowser_core::js::DialogGate,
     /// Attached child targets (multi-tab): sessionId → child Browser Session.
     child_targets: crate::domains::ChildTargets,
+    /// Credential broker (provider + policy engine), when the server was
+    /// built with `with_credentials`. `None` keeps credential OXI methods
+    /// answering `credentialsUnavailable`.
+    credentials: Option<Arc<crate::credential::CredentialBroker>>,
+    /// Connection role (§5.2) — gates dispatch per method.
+    role: RoleKind,
+    /// Account/login surface, when the server was built with `with_login`.
+    logins: Option<Arc<crate::account::LoginSurface>>,
+    /// The context this session's main target lives in (credential-mode
+    /// gate + takeover gate).
+    session_context: Arc<BrowserContext>,
     /// Event receiver (drained by background task).
     event_receiver: Option<EventReceiver>,
     /// Shutdown signal for the CoreEvent drainer task — sent when `run`
@@ -61,20 +119,32 @@ pub struct CdpSession {
 impl CdpSession {
     /// Create a new CDP session wrapping a WebSocket stream.
     ///
-    /// This also creates a new Browser `Session` for page interaction
-    /// and an event broadcaster for CDP event publishing.
-    #[tracing::instrument(skip(ws_stream, browser), err)]
+    /// This also creates a Browser `Session` for page interaction (in the
+    /// connection's context — default context for plain agent connections,
+    /// the takeover context for viewers, the primary context for
+    /// `--account`-bound servers) and an event broadcaster for CDP event
+    /// publishing.
+    #[tracing::instrument(skip(ws_stream, browser, credentials, conn), err)]
     pub async fn new(
         ws_stream: tokio_tungstenite::WebSocketStream<
             hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>,
         >,
         browser: Arc<Browser>,
+        credentials: Option<Arc<crate::credential::CredentialBroker>>,
+        conn: ConnectionRole,
     ) -> anyhow::Result<Self> {
         let (sink, ws) = ws_stream.split();
         let session_id = format!("session-{}", uuid::Uuid::new_v4());
 
-        // Create a browser session for this CDP connection
-        let session = browser.new_session().await?;
+        // Create a browser session for this CDP connection, in its context.
+        let session = match conn.context.as_ref() {
+            Some(ctx) => browser.new_session_in(ctx).await?,
+            None => browser.new_session().await?,
+        };
+        let session_context = match conn.context.as_ref() {
+            Some(ctx) => Arc::clone(ctx),
+            None => browser.default_context(),
+        };
 
         let (event_sender, event_receiver) = event_channel();
         // CoreEvent sink: the JS thread (in core) pushes neutral CoreEvents
@@ -124,6 +194,10 @@ impl CdpSession {
             session,
             dialog_gate,
             child_targets,
+            credentials,
+            role: conn.kind,
+            logins: conn.logins,
+            session_context,
             event_sender,
             fetch_registry: oxibrowser_core::network::intercept::shared_registry(),
             event_receiver: Some(event_receiver),
@@ -155,6 +229,13 @@ impl CdpSession {
         // responses concurrently.
         let (response_tx, mut response_rx) = tokio::sync::mpsc::unbounded_channel::<CdpResponse>();
 
+        // Account-event forwarder (§7.3): orchestrator broadcasts →
+        // OXI.accountStateChanged / OXI.loginStateChanged on this connection.
+        // Exits with the connection (sender closed).
+        if let Some(surface) = self.logins.as_ref() {
+            spawn_account_event_forwarder(surface.clone(), self.event_sender.clone());
+        }
+
         loop {
             tokio::select! {
                 // Incoming CDP commands
@@ -169,6 +250,10 @@ impl CdpSession {
                                 dialog_gate: self.dialog_gate.clone(),
                                 browser: self.browser.clone(),
                                 child_targets: self.child_targets.clone(),
+                                browser_context: self.session_context.clone(),
+                                credentials: self.credentials.clone(),
+                                role: self.role,
+                                logins: self.logins.clone(),
                             };
                             let response_tx = response_tx.clone();
                             // Spawn so dispatch never blocks the loop — a
@@ -276,6 +361,64 @@ impl CdpSession {
     }
 }
 
+/// Pump the orchestrator's account/login events onto this connection as
+/// `OXI.accountStateChanged` / `OXI.loginStateChanged` (§7.3). Exits when
+/// the connection's event channel closes.
+fn spawn_account_event_forwarder(surface: Arc<crate::account::LoginSurface>, events: EventSender) {
+    let mut rx = surface.orchestrator().subscribe();
+    tokio::spawn(async move {
+        loop {
+            if events.is_closed() {
+                return;
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await {
+                Ok(Ok(oxibrowser_core::account::AccountEvent::StateChanged {
+                    account_id,
+                    to,
+                    detail,
+                    ..
+                })) => {
+                    events.send_event(
+                        "OXI.accountStateChanged",
+                        serde_json::json!({ "accountId": account_id, "state": to, "detail": detail }),
+                    );
+                }
+                Ok(Ok(oxibrowser_core::account::AccountEvent::LoginChanged {
+                    login_id,
+                    account_id,
+                    state,
+                })) => {
+                    events.send_event(
+                        "OXI.loginStateChanged",
+                        serde_json::json!({ "loginId": login_id, "accountId": account_id, "state": state }),
+                    );
+                }
+                Ok(Ok(oxibrowser_core::account::AccountEvent::AgentLogin {
+                    login_id,
+                    account_id,
+                    agent_id,
+                    state,
+                    detail,
+                })) => {
+                    events.send_event(
+                        "OXI.loginStateChanged",
+                        serde_json::json!({
+                            "loginId": login_id,
+                            "accountId": account_id,
+                            "agentId": agent_id,
+                            "state": state,
+                            "detail": detail,
+                        }),
+                    );
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => return,
+                Err(_timeout) => continue,
+            }
+        }
+    });
+}
+
 /// Parse + dispatch a single CDP command text, returning the response.
 ///
 /// Runs as a spawned task so dispatch never blocks the run loop's `select!`
@@ -334,16 +477,31 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
     // target, route to that session; otherwise use the default session.
     let effective_ctx = match &request.session_id {
         Some(sid) => {
-            let child = ctx.child_targets.session(sid).await;
+            let child = ctx.child_targets.get(sid).await;
             match child {
-                Some(child_session) => DispatchContext {
-                    session: child_session,
-                    events: ctx.events.clone(),
-                    fetch_registry: ctx.fetch_registry.clone(),
-                    dialog_gate: ctx.dialog_gate.clone(),
-                    browser: ctx.browser.clone(),
-                    child_targets: ctx.child_targets.clone(),
-                },
+                Some(entry) => {
+                    // The child's credential-mode gate reads the context the
+                    // target was created in (falling back to the default
+                    // context if it has since been disposed).
+                    let browser_context = ctx
+                        .browser
+                        .context(&oxibrowser_core::context::ContextId::from_string(
+                            entry.browser_context_id.clone(),
+                        ))
+                        .unwrap_or_else(|| ctx.browser.default_context());
+                    DispatchContext {
+                        session: entry.session,
+                        events: ctx.events.clone(),
+                        fetch_registry: ctx.fetch_registry.clone(),
+                        dialog_gate: ctx.dialog_gate.clone(),
+                        browser: ctx.browser.clone(),
+                        child_targets: ctx.child_targets.clone(),
+                        browser_context,
+                        credentials: ctx.credentials.clone(),
+                        role: ctx.role,
+                        logins: ctx.logins.clone(),
+                    }
+                }
                 None => {
                     if ctx.child_targets.is_closed(sid) {
                         // Closed target: fail loudly rather than silently
@@ -366,6 +524,10 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
                         dialog_gate: ctx.dialog_gate.clone(),
                         browser: ctx.browser.clone(),
                         child_targets: ctx.child_targets.clone(),
+                        browser_context: ctx.browser_context.clone(),
+                        credentials: ctx.credentials.clone(),
+                        role: ctx.role,
+                        logins: ctx.logins.clone(),
                     }
                 }
             }
@@ -377,6 +539,10 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
             dialog_gate: ctx.dialog_gate.clone(),
             browser: ctx.browser.clone(),
             child_targets: ctx.child_targets.clone(),
+            browser_context: ctx.browser_context.clone(),
+            credentials: ctx.credentials.clone(),
+            role: ctx.role,
+            logins: ctx.logins.clone(),
         },
     };
 

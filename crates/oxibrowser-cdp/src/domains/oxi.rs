@@ -15,11 +15,21 @@
 //!   `[ref=eN]` markers on interactive elements
 //! - `OXI.exportStorageState` / `OXI.importStorageState` — cookies +
 //!   localStorage snapshot round-trip (Playwright-compatible `StorageState`)
+//! - `OXI.credentialList` / `OXI.fillCredential` /
+//!   `OXI.resolveConfirmation` — credential broker surface (M4, design
+//!   `2026-09-27` §6.3). Values never cross the wire: fills inject broker
+//!   -resolved secrets, responses carry `{filled: true, masked: true}` and
+//!   handles only. Requires the server to be built with `with_credentials`.
 
+use crate::credential::{self, CredentialBroker, FieldKind};
 use crate::domains::{DispatchContext, DomainResult};
 use crate::protocol::CdpError;
 use crate::refs::RefRegistry;
+use oxibrowser_core::account::AccountRecord;
+use oxibrowser_core::network::origin_policy::{Decision, Origin, OriginPolicy};
+use oxibrowser_credentials::{CredentialId, UseRequest};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// Handle OXI domain methods.
 pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
@@ -37,6 +47,14 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "exportStorageState" => export_storage_state(ctx).await,
         "importStorageState" => import_storage_state(params, ctx).await,
         "getApiGaps" => get_api_gaps(params, ctx).await,
+        "credentialList" => credential_list(params, ctx).await,
+        "fillCredential" => fill_credential(params, ctx).await,
+        "resolveConfirmation" => resolve_confirmation(params, ctx).await,
+        "accountList" => account_list(params, ctx).await,
+        "beginLogin" => begin_login(params, ctx).await,
+        "loginWithAccount" => login_with_account(params, ctx).await,
+        "endLogin" => end_login(params, ctx).await,
+        "reportLoginSuccess" => report_login_success(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
             message: format!("unknown method: OXI.{}", method),
@@ -347,6 +365,19 @@ async fn fill_ref(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
 
     let (entry, _snapshot) = resolve_and_validate(&mut guard, &session_key, &r#ref).await?;
 
+    // Credential-mode literal gate (design §6.2): a literal value into an
+    // `input[type=password]` bypasses the broker's audited fill path — route
+    // to `OXI.fillCredential` instead.
+    if ctx.browser_context.credential_mode()
+        && guard.selector_targets_password(&entry.selector).await
+    {
+        return Err(CdpError {
+            code: -32000,
+            message: "passwordFillRequiresCredential: fill password fields via OXI.fillCredential"
+                .to_string(),
+        });
+    }
+
     let js = oxibrowser_core::js::form::js_fill(&entry.selector, &value);
     guard.evaluate_js(&js).await?;
     Ok(Some(json!({ "filled": true, "ref": r#ref })))
@@ -439,7 +470,12 @@ async fn aria_snapshot(_params: Option<Value>, ctx: &DispatchContext) -> DomainR
 
 /// OXI.exportStorageState — cookies + per-origin localStorage snapshot
 /// (Playwright-compatible `StorageState`).
+///
+/// Denied with `deniedInCredentialMode` while the session's context is in
+/// credential mode (design §6.3 CDP gating): a state export IS a cookie
+/// export, which would bypass the broker.
 async fn export_storage_state(ctx: &DispatchContext) -> DomainResult {
+    super::deny_in_credential_mode(ctx)?;
     let guard = ctx.session.read().await;
     let state = guard.export_state();
     let value = serde_json::to_value(&state).map_err(|e| CdpError {
@@ -450,7 +486,12 @@ async fn export_storage_state(ctx: &DispatchContext) -> DomainResult {
 }
 
 /// OXI.importStorageState — seed cookies + localStorage from a prior export.
+///
+/// Denied with `deniedInCredentialMode` while the session's context is in
+/// credential mode (export/import symmetry): injecting attacker-known
+/// session cookies into the account jar is a session-fixation vector.
 async fn import_storage_state(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    super::deny_in_credential_mode(ctx)?;
     let params = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "importStorageState requires parameters".to_string(),
@@ -492,6 +533,547 @@ fn api_gaps_payload() -> Value {
         .map(|(name, count)| json!({ "name": name, "count": count }))
         .collect();
     json!({ "gaps": gaps })
+}
+
+// ── Credential surface (OXI.credentialList / fillCredential /
+//    resolveConfirmation, design `2026-09-27` §6.3) ──────────────────────────
+
+/// Missing broker error: the server was not built with `with_credentials`.
+fn credentials_unavailable() -> CdpError {
+    credential::credentials_unavailable("no credential provider configured on this server")
+}
+
+// ── Account surface (OXI.accountList / beginLogin / endLogin /
+//    reportLoginSuccess, design `2026-09-28` §7.3) ────────────────────────────
+
+/// Missing login surface error: the server was not built with `with_login`.
+fn accounts_unavailable() -> CdpError {
+    CdpError {
+        code: -32000,
+        message: "accountsUnavailable".to_string(),
+    }
+}
+
+fn missing_login_surface(
+    ctx: &DispatchContext,
+) -> Result<Arc<crate::account::LoginSurface>, CdpError> {
+    ctx.logins.clone().ok_or_else(accounts_unavailable)
+}
+
+/// OXI.accountList — metadata + state only (§6.2: account.json is the one
+/// account artifact agents may see). `params.agent` is accepted for
+/// forward-compatibility and currently ignored (summaries carry no
+/// per-agent grants).
+async fn account_list(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let surface = missing_login_surface(ctx)?;
+    let records = surface.orchestrator().manager().registry().list()?;
+    let accounts: Vec<Value> = records
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "account_id": r.account_id,
+                "scope": r.scope,
+                "state": r.state.as_str(),
+                "state_detail": r.state_detail,
+                "login_hint": r.identity.login_hint,
+                "display_name": r.identity.display_name,
+                "session_summary": r.session_summary,
+            })
+        })
+        .collect();
+    Ok(Some(json!({ "accounts": accounts })))
+}
+
+/// OXI.beginLogin — open a login window (§5.1). `mode: "user"` issues a
+/// one-time viewer token delivered **out-of-band only** (CLI
+/// `account login --json` / host channel); `mode: "agent"` leaves the
+/// driving to the connected agent (M-D automates it later).
+///
+/// The token is never echoed in this response — any connected agent could
+/// otherwise mint viewer credentials in-band (VIEWER-TOKEN-INBAND, §5.2).
+///
+/// Response: `{loginId, timeoutMs}`.
+async fn begin_login(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let surface = missing_login_surface(ctx)?;
+    let params = params.unwrap_or(Value::Null);
+    let account_id = string_param(&params, "accountId")
+        .ok_or_else(|| missing_param("accountId"))?
+        .to_string();
+    let mode = match string_param(&params, "mode") {
+        Some("user") | None => oxibrowser_core::account::LoginMode::User,
+        Some("agent") => oxibrowser_core::account::LoginMode::Agent,
+        Some(other) => {
+            return Err(CdpError {
+                code: -32602,
+                message: format!("invalid mode {other:?} (expected \"user\" or \"agent\")"),
+            });
+        }
+    };
+    let timeout = params
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_millis);
+
+    let (handle, _ctx) = surface
+        .begin_login(&account_id, mode, timeout)
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+    Ok(Some(json!({
+        "loginId": handle.login_id,
+        "timeoutMs": handle.timeout_ms,
+    })))
+}
+
+/// OXI.loginWithAccount — start an **unattended** agent login (M-D, design
+/// §5.3): the broker drives the account's login form itself (credentials +
+/// TOTP injected from the keystore), and progress + the terminal state flow
+/// back as `OXI.loginStateChanged` events.
+///
+/// Start-time gates (synchronous errors):
+/// - unknown account → `invalidAccount`,
+/// - no credential broker wired → `credentialsUnavailable`,
+/// - no active `login` grant for the account's credentials (deny rules and
+///   consent consulted non-consumingly) → `accountAccessDenied`
+///   {consentRequired}.
+///
+/// Escalations arrive as events, not errors: `challenge` (Interactive /
+/// Blocked bot-management), `mfa_escalation` (SMS/email 2FA — forbidden
+/// list), `policy_violation` (final origin left the credential allowlist).
+async fn login_with_account(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let surface = missing_login_surface(ctx)?;
+    let broker = ctx
+        .credentials
+        .clone()
+        .ok_or_else(credentials_unavailable)?;
+    let params = params.unwrap_or(Value::Null);
+    let account_id = string_param(&params, "accountId")
+        .ok_or_else(|| missing_param("accountId"))?
+        .to_string();
+    let agent_id = string_param(&params, "agentId")
+        .unwrap_or("main")
+        .to_string();
+    let timeout = params
+        .get("timeoutMs")
+        .and_then(|v| v.as_u64())
+        .map(std::time::Duration::from_millis);
+
+    // Unknown account → invalidAccount (§7.3 error code).
+    let record = surface
+        .orchestrator()
+        .manager()
+        .registry()
+        .get(&account_id)
+        .map_err(|_| CdpError {
+            code: -32000,
+            message: format!("invalidAccount: {account_id}"),
+        })?;
+
+    // Start gate: a non-consuming `login` preflight over the origins the
+    // flow can actually authorize at (probe origin, scope root). The
+    // consuming decision happens inside the engine at resolution time.
+    if !agent_login_preflight(&broker, &record) {
+        return Err(CdpError {
+            code: -32000,
+            message: "accountAccessDenied: consentRequired — no active login grant for this account's credentials".to_string(),
+        });
+    }
+
+    let login_id = surface
+        .start_agent_login(&account_id, &agent_id, broker, timeout)
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+    Ok(Some(json!({
+        "loginId": login_id,
+        "accountId": account_id,
+        "agentId": agent_id,
+        "state": "started",
+    })))
+}
+
+/// Non-consuming grant peek for the M-D start gate: any of the account's
+/// credential handles with an active `login` grant at one of the flow's
+/// candidate origins.
+fn agent_login_preflight(broker: &CredentialBroker, record: &AccountRecord) -> bool {
+    let mut origins: Vec<String> = Vec::new();
+    if let Some(probe) = &record.probe
+        && let Ok(url) = url::Url::parse(&probe.url)
+    {
+        origins.push(
+            format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default())
+                + &url.port().map(|p| format!(":{p}")).unwrap_or_default(),
+        );
+    }
+    origins.push(format!("https://{}", record.scope));
+
+    for handle in &record.credentials {
+        for origin in &origins {
+            let Ok(top) = Origin::parse(origin) else {
+                continue;
+            };
+            let mut request = UseRequest::new(
+                CredentialId(handle.clone()),
+                top,
+                oxibrowser_credentials::CredentialAction::Login,
+            );
+            request.frame = Some(request.top_level.clone());
+            if broker.engine.preflight(&request) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// OXI.endLogin — host-explicit end: `outcome: "done"` judges the window as
+/// explicit success (capture); `outcome: "abort"` reverts to needs_login.
+async fn end_login(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let surface = missing_login_surface(ctx)?;
+    let params = params.unwrap_or(Value::Null);
+    let login_id = string_param(&params, "loginId")
+        .ok_or_else(|| missing_param("loginId"))?
+        .to_string();
+    let outcome = match string_param(&params, "outcome") {
+        Some("done") => oxibrowser_core::account::EndOutcome::Done,
+        Some("abort") | None => oxibrowser_core::account::EndOutcome::Abort,
+        Some(other) => {
+            return Err(CdpError {
+                code: -32602,
+                message: format!("invalid outcome {other:?} (expected \"done\" or \"abort\")"),
+            });
+        }
+    };
+
+    let result = surface
+        .end_login(&login_id, outcome)
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+    Ok(Some(json!({
+        "loginId": login_id,
+        "state": result.end_state,
+        "accountState": result.record.as_ref().map(|r| r.state.as_str()),
+    })))
+}
+
+/// OXI.reportLoginSuccess — the §4.3 highest-trust signal: capture the
+/// login window's session (explicit success ⇒ detector confirms).
+async fn report_login_success(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let surface = missing_login_surface(ctx)?;
+    let params = params.unwrap_or(Value::Null);
+    let login_id = string_param(&params, "loginId")
+        .ok_or_else(|| missing_param("loginId"))?
+        .to_string();
+
+    let result = surface
+        .report_success(&login_id)
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+    Ok(Some(json!({
+        "loginId": login_id,
+        "state": result.end_state,
+        "accountState": result.record.as_ref().map(|r| r.state.as_str()),
+    })))
+}
+
+/// OXI.credentialList — metadata-only credential listing.
+///
+/// `params.agent` optionally filters by agent id. The payload is the
+/// value-free [`oxibrowser_credentials::CredentialMeta`] projection, so no
+/// secret can appear by construction.
+async fn credential_list(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let broker = ctx
+        .credentials
+        .clone()
+        .ok_or_else(credentials_unavailable)?;
+    let agent = params.as_ref().and_then(|p| string_param(p, "agent"));
+    credential::credential_list_payload(&broker, agent).map(Some)
+}
+
+/// OXI.fillCredential — inject a broker-resolved credential value through the
+/// session fill path.
+///
+/// Flow (design §6.3): validate the ref → derive the top origin from the
+/// session's current URL (the ref came from the main-document snapshot, so
+/// the hosting frame is the top frame) → exact-origin allowlist check →
+/// [`PolicyEngine::authorize_use`]:
+///
+/// - `Allow` → resolve + inject → `{filled: true, masked: true}` (no value in
+///   the response),
+/// - `RequireConfirmation` → register a pending card, emit
+///   `OXI.confirmationRequired`, answer `consentRequired`,
+/// - `Deny` → `consentRequired`.
+///
+/// Errors: `refStale`, `originMismatch`, `credentialNotFound`,
+/// `consentRequired`, `credentialsUnavailable`.
+async fn fill_credential(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let broker = ctx
+        .credentials
+        .clone()
+        .ok_or_else(credentials_unavailable)?;
+    let params = params.ok_or_else(|| CdpError {
+        code: -32602,
+        message: "fillCredential requires parameters".to_string(),
+    })?;
+    let r#ref = string_param(&params, "ref")
+        .ok_or_else(|| missing_param("ref"))?
+        .to_string();
+    let credential_id = string_param(&params, "credentialId")
+        .ok_or_else(|| missing_param("credentialId"))?
+        .to_string();
+    let field_kind = FieldKind::parse(
+        string_param(&params, "fieldKind").ok_or_else(|| missing_param("fieldKind"))?,
+    )?;
+
+    let mut guard = ctx.session.write().await;
+    let session_key = guard.id().to_string();
+
+    // 1. The ref must still resolve against the live snapshot — any drift
+    //    rejects with `refStale` (the agent re-observes).
+    let (entry, _snapshot) = resolve_and_validate(&mut guard, &session_key, &r#ref).await?;
+
+    // 2. Origin of the page hosting the form, from the session's current URL.
+    let url = guard
+        .current_url()
+        .cloned()
+        .ok_or_else(|| credential::origin_mismatch("no page loaded"))?;
+    let origin = Origin::parse(url.as_str()).map_err(|_| {
+        credential::origin_mismatch(format!("page URL {url} has no usable web origin"))
+    })?;
+
+    // 3. The credential must exist (handle known to the broker).
+    let cred_id = CredentialId(credential_id);
+    let meta = broker
+        .provider
+        .metadata(&cred_id)
+        .map_err(credential::cred_error_to_cdp)?;
+
+    // 4. Exact-origin allowlist (core M1) — deny-biased with the engine's
+    //    verdict below. Fail-closed on unparseable stored origins.
+    let mut allowed = Vec::with_capacity(meta.allowed_origins.len());
+    for o in &meta.allowed_origins {
+        allowed.push(Origin::parse(o).map_err(|e| {
+            credential::origin_mismatch(format!(
+                "credential {} has unusable allowed origin {o}: {e}",
+                meta.id
+            ))
+        })?);
+    }
+    if OriginPolicy::default().evaluate(&allowed, &origin, Some(&origin)) != Decision::Allow {
+        return Err(credential::origin_mismatch(format!(
+            "credential {} is not allowed at {}",
+            meta.id,
+            origin.as_str()
+        )));
+    }
+
+    // 5. Policy engine: deny rules → consent → confirmation.
+    let mut request = UseRequest::new(meta.id.clone(), origin.clone(), field_kind.action());
+    request.frame = Some(origin.clone());
+    match broker.engine.authorize_use(&request) {
+        Decision::Allow => {
+            let fingerprint =
+                fill_with_credential(&mut guard, &broker, &meta.id, field_kind, &entry.selector)
+                    .await?;
+            credential::audit_fill(&broker.engine, &request, &fingerprint);
+            Ok(Some(json!({ "filled": true, "masked": true })))
+        }
+        Decision::RequireConfirmation { reason } => {
+            let token = broker.engine.issue_confirmation(&request);
+            let request_id = broker.register_pending(
+                request.clone(),
+                token,
+                session_key,
+                entry.selector,
+                meta.id.clone(),
+                field_kind,
+            );
+            ctx.events.send_event(
+                "OXI.confirmationRequired",
+                json!({
+                    "requestId": request_id,
+                    "action": field_kind.action().as_str(),
+                    "origin": origin.as_str(),
+                    "summary": {
+                        // Handles only — card rendering never sees values.
+                        "values": [meta.id.to_string()],
+                        "irreversible": false,
+                    },
+                    "timeoutMs": broker.confirmation_ttl().as_millis() as u64,
+                }),
+            );
+            Err(credential::consent_required(format!(
+                "confirmation required for {} fill at {} ({})",
+                field_kind.as_str(),
+                origin.as_str(),
+                reason
+            )))
+        }
+        Decision::Deny { reason } => Err(credential::consent_required(format!(
+            "{} fill at {} denied: {reason}",
+            field_kind.as_str(),
+            origin.as_str()
+        ))),
+    }
+}
+
+/// OXI.resolveConfirmation — resolve a pending confirmation card.
+///
+/// **Viewer connections only.** Approval is the human's out-of-band act on
+/// the token-authenticated mirror channel; agent connections are rejected at
+/// the role gate (`confirmationRequiresViewerRole`) and re-checked here.
+///
+/// `approved: true` re-validates via [`PolicyEngine::verify_confirmation`]
+/// (request-hash binding + TTL + deny rules) and, on `Allow`, completes the
+/// fill. Missing `approved` is a denial; an unknown or expired `requestId` is
+/// invalid — timeout never approves implicitly (design §6.3).
+///
+/// The minting session's binding check (`pending.session_key`) applies only
+/// to non-viewer resolvers; a viewer connection runs its own mirror session
+/// in the shared context, so a mismatch there is surfaced as response detail
+/// instead of a rejection.
+async fn resolve_confirmation(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    if ctx.role != crate::session::RoleKind::Viewer {
+        return Err(CdpError {
+            code: -32000,
+            message: "confirmationRequiresViewerRole".to_string(),
+        });
+    }
+    let broker = ctx
+        .credentials
+        .clone()
+        .ok_or_else(credentials_unavailable)?;
+    let params = params.ok_or_else(|| CdpError {
+        code: -32602,
+        message: "resolveConfirmation requires parameters".to_string(),
+    })?;
+    let request_id = string_param(&params, "requestId")
+        .ok_or_else(|| missing_param("requestId"))?
+        .to_string();
+    // Missing `approved` = denial (implicit approval is forbidden).
+    let approved = params
+        .get("approved")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Expired or unknown → treated as missing: nothing to approve.
+    let pending = broker.take(&request_id).ok_or_else(|| CdpError {
+        code: -32602,
+        message: format!("unknown or expired confirmation requestId: {request_id}"),
+    })?;
+
+    // Non-viewer resolvers may only resolve on the minting session (fail
+    // closed); for the viewer the binding is audit detail, not a gate — the
+    // mirror session shares the context but has its own session id.
+    let session_bound = {
+        let guard = ctx.session.read().await;
+        let bound = guard.id().to_string() != pending.session_key;
+        if bound && ctx.role != crate::session::RoleKind::Viewer {
+            return Err(CdpError {
+                code: -32000,
+                message: format!(
+                    "confirmation {request_id} is bound to a different session — re-request the fill"
+                ),
+            });
+        }
+        bound
+    };
+
+    if !approved {
+        credential::audit_rejection(
+            &broker.engine,
+            &pending.request,
+            "confirmation rejected by user",
+        );
+        return Ok(Some(json!({ "resolved": true, "outcome": "denied" })));
+    }
+
+    match broker
+        .engine
+        .verify_confirmation(&pending.token, &pending.request)
+    {
+        Decision::Allow => {
+            let mut guard = ctx.session.write().await;
+            let fingerprint = fill_with_credential(
+                &mut guard,
+                &broker,
+                &pending.credential,
+                pending.field_kind,
+                &pending.selector,
+            )
+            .await?;
+            credential::audit_fill(&broker.engine, &pending.request, &fingerprint);
+            Ok(Some(json!({
+                "resolved": true,
+                "outcome": "approved",
+                "filled": true,
+                "masked": true,
+                "sessionBound": session_bound,
+            })))
+        }
+        Decision::Deny { reason } | Decision::RequireConfirmation { reason } => Ok(Some(
+            json!({ "resolved": true, "outcome": "denied", "reason": reason }),
+        )),
+    }
+}
+
+/// Resolve the credential value and inject it through the session fill path
+/// ([`oxibrowser_core::js::form::js_fill`] against the ref's selector).
+///
+/// The secret exists only between `resolve` and the JS snippet — it never
+/// reaches a response, event, or log. Returns the value fingerprint for the
+/// audit correlation line.
+async fn fill_with_credential(
+    session: &mut oxibrowser_core::session::Session,
+    broker: &CredentialBroker,
+    credential_id: &CredentialId,
+    field_kind: FieldKind,
+    selector: &str,
+) -> Result<String, CdpError> {
+    let (meta, secret) = broker
+        .provider
+        .resolve(credential_id)
+        .map_err(credential::cred_error_to_cdp)?;
+    let value = match field_kind {
+        FieldKind::Totp => {
+            if !meta.has_totp {
+                return Err(credential::credential_not_found(format!(
+                    "{credential_id} carries no otpauth value"
+                )));
+            }
+            let uri = secret
+                .expose_str()
+                .map_err(credential::cred_error_to_cdp)?
+                .to_string();
+            // The TOTP code is generated in-broker and injected directly —
+            // never returned over CDP (design §6.3).
+            oxibrowser_credentials::TotpGenerator::from_otpauth(&uri)
+                .map_err(credential::cred_error_to_cdp)?
+                .current()
+                .map_err(credential::cred_error_to_cdp)?
+                .0
+        }
+        FieldKind::Password | FieldKind::ApiKey => secret
+            .expose_str()
+            .map_err(credential::cred_error_to_cdp)?
+            .to_string(),
+    };
+    let fingerprint = secret.fingerprint();
+    drop(secret);
+    let js = oxibrowser_core::js::form::js_fill(selector, &value);
+    session.evaluate_js(&js).await?;
+    Ok(fingerprint)
 }
 
 #[cfg(test)]

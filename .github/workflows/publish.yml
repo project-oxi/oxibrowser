@@ -53,6 +53,15 @@ jobs:
       - name: Wait for index propagation
         run: sleep 30
 
+      - name: Publish oxibrowser-credentials
+        run: cargo publish -p oxibrowser-credentials
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index propagation
+        run: sleep 30
+
+
       - name: Publish oxibrowser-cdp
         run: cargo publish -p oxibrowser-cdp
         env:

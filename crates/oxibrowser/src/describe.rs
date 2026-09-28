@@ -35,6 +35,17 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "args": ["query"],
                 "flags": ["source","engine","repo","token","json","max-results","timeout"]
             },
+            "account": {
+                "subcommands": ["add","list","status","rm"],
+                "add_flags": ["site","id","login","display","json"],
+                "status_flags": ["probe","json"]
+            },
+            "credential": {
+                "subcommands": ["put","get","list","rm","totp","onboard"],
+                "put_flags": ["agent","site","kind","slug","login","origin","stdin","prompt"],
+                "get_flags": ["id","field"],
+                "note": "values never via argv; get has no --json (raw secret on stdout)"
+            },
             "skill": {}
         }))
     } else {
@@ -168,6 +179,58 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "skill": {
                     "description": "Print agent skill guide as markdown",
                     "usage": "oxibrowser skill"
+                },
+                "account": {
+                    "description": "Account registry and login-state management (per-site account sandboxes)",
+                    "usage": "oxibrowser account <add|list|status|rm> [args] [flags]",
+                    "subcommands": {
+                        "add": {
+                            "usage": "oxibrowser account add --site <domain> [--id <slug>] [--login <hint>] [--display <name>] [--json]",
+                            "description": "Register an account (state=needs_login); id derived from scope on conflict (-2, -3, …)"
+                        },
+                        "list": {
+                            "usage": "oxibrowser account list [--json]",
+                            "description": "Account status board: id/scope/state/login hint/session horizon"
+                        },
+                        "status": {
+                            "usage": "oxibrowser account status <id> [--probe] [--json]",
+                            "description": "One account; --probe re-validates the stored session over the network (keychain + browser)"
+                        },
+                        "rm": {
+                            "usage": "oxibrowser account rm <id> [--json]",
+                            "description": "Revoke: record + session envelopes deleted (keychain credentials kept)"
+                        }
+                    }
+                },
+                "credential": {
+                    "description": "Keychain-backed agent credentials; values never travel via argv and never serialize to JSON",
+                    "usage": "oxibrowser credential <put|get|list|rm|totp|onboard> [args] [flags]",
+                    "subcommands": {
+                        "put": {
+                            "usage": "oxibrowser credential put --agent <id> --site <domain> --kind <password|totp|api-key|note> [--slug <s>] [--login <hint>] --origin <origin>… [--stdin|--prompt]",
+                            "description": "Store a secret; value read from stdin or hidden prompt (never argv). totp accepts otpauth:// URI or base32 secret"
+                        },
+                        "get": {
+                            "usage": "oxibrowser credential get --id <handle> --field <password|otpauth>",
+                            "description": "Print one secret field raw to stdout; no --json by design"
+                        },
+                        "list": {
+                            "usage": "oxibrowser credential list [--agent <id>] [--json]",
+                            "description": "Credential metadata only (handles, kinds, hints — never values)"
+                        },
+                        "rm": {
+                            "usage": "oxibrowser credential rm --id <handle> [--json]",
+                            "description": "Delete a credential from the OS keychain"
+                        },
+                        "totp": {
+                            "usage": "oxibrowser credential totp --id <handle>",
+                            "description": "Current TOTP code with remaining validity (human output)"
+                        },
+                        "onboard": {
+                            "usage": "oxibrowser credential onboard --agent <id> --site <domain>",
+                            "description": "Keychain ACL onboarding notes and diagnostics script"
+                        }
+                    }
                 },
                 "search": {
                     "description": "Search the web or GitHub (lightweight HTTP, no browser needed)",

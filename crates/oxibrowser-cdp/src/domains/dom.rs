@@ -674,6 +674,10 @@ mod tests {
             dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
             browser: browser.clone(),
             child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+            browser_context: browser.default_context(),
+            credentials: None,
+            role: crate::session::RoleKind::Agent,
+            logins: None,
         };
         (ctx, session)
     }

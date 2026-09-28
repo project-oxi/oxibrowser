@@ -121,6 +121,7 @@ async fn emulate_network_conditions(params: Option<Value>, ctx: &DispatchContext
 
 /// Network.getAllCookies — returns all cookies for the session.
 async fn get_all_cookies(ctx: &DispatchContext) -> DomainResult {
+    super::deny_in_credential_mode(ctx)?;
     let session = ctx.session.read().await;
     let jar_guard = session.cookie_jar().read();
     let cookies = jar_guard.get_all();
@@ -151,6 +152,7 @@ async fn get_all_cookies(ctx: &DispatchContext) -> DomainResult {
 
 /// Network.getCookies — returns cookies for specific URLs.
 async fn get_cookies(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    super::deny_in_credential_mode(ctx)?;
     let urls = params
         .as_ref()
         .and_then(|p| p.get("urls"))
@@ -196,6 +198,7 @@ async fn get_cookies(params: Option<Value>, ctx: &DispatchContext) -> DomainResu
 
 /// Network.setCookie — creates a cookie with given properties.
 async fn set_cookie(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    super::deny_in_credential_mode(ctx)?;
     let p = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "setCookie requires parameters".to_string(),
@@ -237,6 +240,7 @@ async fn set_cookie(params: Option<Value>, ctx: &DispatchContext) -> DomainResul
 
 /// Network.deleteCookies — removes cookies matching the given name for a URL.
 async fn delete_cookies(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    super::deny_in_credential_mode(ctx)?;
     let p = params.ok_or_else(|| CdpError {
         code: -32602,
         message: "deleteCookies requires parameters".to_string(),
@@ -455,8 +459,12 @@ mod tests {
             events,
             fetch_registry: shared_registry(),
             dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
-            browser,
+            browser: browser.clone(),
             child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+            browser_context: browser.default_context(),
+            credentials: None,
+            role: crate::session::RoleKind::Agent,
+            logins: None,
         }
     }
 

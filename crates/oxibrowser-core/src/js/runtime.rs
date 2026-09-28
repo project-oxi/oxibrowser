@@ -1219,7 +1219,11 @@ fn content_type_mime(headers: &[(String, String)]) -> String {
 #[derive(Debug)]
 pub enum LocalStorageMsg {
     /// localStorage.setItem(key, value) for `origin`'s bucket.
-    SetItem { origin: String, key: String, value: String },
+    SetItem {
+        origin: String,
+        key: String,
+        value: String,
+    },
     /// localStorage.removeItem(key) from `origin`'s bucket.
     RemoveItem { origin: String, key: String },
     /// localStorage.clear() on `origin`'s bucket.

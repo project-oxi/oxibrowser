@@ -4,11 +4,12 @@ members = [
     "crates/oxibrowser",
     "crates/oxibrowser-cdp",
     "crates/oxibrowser-core",
+    "crates/oxibrowser-credentials",
     "crates/oxibrowser-render",
 ]
 
 [workspace.package]
-version = "0.23.0"
+version = "0.24.0"
 edition = "2024"
 license = "MIT"
 authors = ["project-oxi contributors"]
@@ -30,7 +31,7 @@ thiserror = "2"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-wreq = { version = "=6.0.0-rc.29", features = ["json", "form", "stream"] }
+wreq = { version = "=6.0.0-rc.29", features = ["json", "form", "stream", "cookies"] }
 wreq-util = "3.0.0-rc"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
@@ -66,7 +67,7 @@ peniko = "0.6"
 png = "0.18"
 
 [workspace.metadata.release]
-version = "0.23.0"
+version = "0.24.0"
 
 [profile.release]
 strip = true

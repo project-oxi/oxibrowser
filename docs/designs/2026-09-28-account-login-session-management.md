@@ -458,8 +458,12 @@ cf_clearance 재생 의존, 일상 Chrome 프로파일 attach, SMS/이메일 2FA
 
 - **받는 것**: 계정 목록·상태, IdentityCard(표시 정보), 그랜트된 계정으로 실행되는 격리
   컨텍스트(로그인 유지), 상태 변경 이벤트, 상승 요청 채널.
-- **절대 못 받는 것**: 쿠키 값, localStorage 원문, 비밀번호, TOTP 시크릿·코드, AEAD 키,
-  봉투 파일 경로·평문, 로그인 창의 화면.
+- **절대 못 받는 것**(게이트로 차단): CDP/CLI 경유 쿠키·스토리지 덤프(credential 모드 게이트), localStorage 원문 일괄 반출, 비밀번호, TOTP 시크릿·코드, AEAD 키,
+  봉투 파일 경로·평문, 로그인 창의 화면. **브라우저 의미론상 예외(2026-09-29 정정)**: 페이지 JS가
+  원래 도달 가능한 자산(non-`HttpOnly` 쿠키, 자기 오리진 localStorage)은 에이전트가 페이지를
+  구동하는 한 `document.cookie` 등으로 읽을 수 있다 — 이는 실제 브라우저와 동일한 한계로,
+  `read` 그랜트의 범위에 귀속시켜 문서화한다. `HttpOnly` 세션 쿠키는 JS 비가시 상태로 유지되고
+  일괄 반출 경로는 전부 게이트된다.
 - **요구되는 것**: agentId 자발 선언, 그랜트 내 행동, irreversible 확인 응답, challenge 시
   재시도 금지.
 
@@ -491,7 +495,12 @@ M-B → M-C → M-D. M-C의 호스트 계약(`--json` stdout)은 Codex Desktop�
 | PR | 상태 | 비고 |
 |---|---|---|
 | M-A | ✅ 구현+리뷰 완료 | `core/src/context.rs` 신설(ContextId/ContextConfig/BrowserContext — 전용 jar·오리진 키 localStorage·http_client), `browser.rs` default_context+레지스트리+new_context/dispose_context/new_session_in/new_tab_in, `session.rs` Session::new(Arc<BrowserContext>)·오리진 버킷 get/set/import·close 시 공유 스토리지 보존, `js/runtime.rs` 매 내비게이션 버킷 재시드. CDP `Target.createBrowserContext/disposeBrowserContext` 실구현 + 전 이벤트 실제 ctx id + `createTarget(browserContextId)`·`proxyServer` 매핑·`oxiAccount` 정직 거부(-32000). 리뷰 4건 수정: 컨텍스트 HttpClient를 항상 자기 jar에 결합(HTTP 경로 블리딩 제거), LocalStorageMsg 오리진 스탬프+내비게이션 전 Drain 배리어(경쟁 제거), dispose_context jar 클리어+감사, 무효 proxyServer 거부. 검증: 워크스페이스 775 테스트 통과, 실제 serve+raw WS 스모크 PASS(실HTTP Set-Cookie 컨텍스트 격리·레이스 생존·재사용 차단). 잔여: opaque origin(about:/data:) "null" 버킷 공유(문서화), named context는 휘발성(M-B+ 저장소 대기) |
-| M2 이하 | ⬜ 미구현 | |
+| M-B | ✅ 구현 완료 (2026-09-28) | `core/src/account/{mod,record,registry,manager,detector,probe}.rs` 신설 — AccountRecord(§4.1 스키마, 슬러그·스코프 검증, flat identity 카드), AccountRegistry(계정당 0700 디렉터리·0600 원자적 account.json·sessions/에 SessionStore 재사용·§4.2 전이 기계 강제), AccountManager(capture/restore/mark_stale/logout/verify_with_probe — 지문 불일치 기본 거부, 전 전이 감사 `session_capture`/`session_restore`/`session_discard`/`account_state`), LoginDetector(§4.3 신호 — 신규 HttpOnly+Secure 세션 쿠키·auth 경로 이탈·DOM 마커·신규 토큰성 localStorage·명시 신호, high+점수 ≥6 조합 판정, baseline 스냅샷), ValidationProbe(§4.4 — 마커 CSS-ish 셀렉터/리터럴 매칭, 로그인 폼 부재, 챌린지 분류, 도달 불가 시 상태 불변), 감사 `AuditEventKind` 5종 확장(account_state/account_use/session_capture/session_restore/session_discard). CLI `account add/list/status(--probe)/rm` + `credential put(stdin·prompt 전용)/get(--field, --json 불가)/list/rm/totp/onboard` — KeyringProvider·PolicyEngine·ConsentStore 실연결(로컬 사용자 자가 확인), 세션 AEAD 키는 키체인 `_session-keys/<scope>` create-once(M-C에서 credentials 크레이트 `KeyringKeyProvider`로 흡수 완료 §3.5). 테스트: 레지스트리 왕복·권한(0600/0700)·원자성, 상태 전이·감사 JSONL, detector 신호 조합, capture/restore StaticKeyProvider 실왕복, 프로브 wiremock HTTP, CLI 통합(격리 HOME). |
+| M2/M3/M4 | ✅ 구현 완료 (2026-09-29) | 신규 크레이트 `oxibrowser-credentials`: SecretBox(compile-fail 증명), KeyringProvider(§5.1 서비스 키), InMemoryProvider, TotpGenerator(RFC 6238 벡터·창 경계), ConsentStore(last-wins·톰스톤·만료/횟수·credential+account 이중 평면), PolicyEngine(deny→동의→confirmation, 해시 바인딩 토큰). CDP 표면: OXI.credentialList/fillCredential/confirmationRequired/resolveConfirmation + credential_mode 게이트(쿠키 4종·exportStorageState). 정정: account 그랜트는 **agent-스코프**(ConsentSubject::Account{account, agent}) — §1 정의 준수. |
+| M6′ | ✅ 구현 완료 (2026-09-29) | `core/storage/session_store.rs` — OXSESS1 XChaCha20-Poly1305 봉투, 원자적 0600 치환, 지문 fail-closed, KeyProvider 트레이트(+KeyringKeyProvider), 다중 오리진 `export_state_for_scope`. |
+| M-C | ✅ 구현 완료 (2026-09-29) | LoginOrchestrator(begin/complete/end/abort/timeout·원타임 viewer 토큰·이벤트), import 경로(storageState·Netscape cookies.txt→프로브→캡처), CLI `account login/logout/export-state` + `--account`(fetch/serve)·위저드·호스트 계약(--json stdout), viewer 역할(X-Oxi-Role/토큰·takeover 게이트), OXI account/login 명령·이벤트, REPL account_*·takeover. |
+| M-D | ✅ 구현 완료 (2026-09-29) | `core/account/agent_login.rs`(엔진+CredentialSource 포트, 후보 탐색이 자격증명 pinned origin 우선), OXI.loginWithAccount, `Target.createBrowserContext {oxiAccount}` 그랜트 게이트+세션 복원+credential_mode, SMS/이메일 2FA·Interactive 챌린지 즉시 상승, 리다이렉트 허용목록 거부권. CLI/REPL `--mode agent`. |
+| 배포 리뷰 | ✅ 완료 (2026-09-29) | 보안 리뷰 5건(중요 2·중간 3): 4건 코드 수정(confirmation viewer-전용 승인·beginLogin 토큰 in-band 제거·takeover 차단 확장(fillRef/clickRef/boxScreenshot/Runtime.evaluate)·fillRef/REPL/MCP 비밀번호 리터럴 거부+importStorageState 게이트), 1건(document.cookie 경유 non-HttpOnly 쿠키 가시성)은 브라우저 의미론상 구조적 — §8.4 문구 정정으로 반영. |
 
 M-D stretch(별도 PR, 우선순위 낮음): `Fetch.authRequired` 이벤트 + `Fetch.continueWithAuth`를
 브로커 자격증명과 연결(HTTP Basic 사이트 무인화).

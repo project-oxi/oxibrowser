@@ -24,6 +24,7 @@ use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use url::Url;
 
 /// Unique browser-context ID (`"ctx-<n>"`).
@@ -40,7 +41,10 @@ impl ContextId {
     pub(crate) fn test_next() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(1);
-        Self(format!("ctx-test-{}", COUNTER.fetch_add(1, Ordering::Relaxed)))
+        Self(format!(
+            "ctx-test-{}",
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     /// Rebuild a [`ContextId`] from its string form (e.g. a CDP-supplied
@@ -98,6 +102,10 @@ pub struct BrowserContext {
     local_storage: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// Egress client (dedicated when a proxy was set, else the browser's).
     http_client: Arc<HttpClient>,
+    /// Credential mode (M4, design §6.2): when set, storage-exporting CDP
+    /// surface (`Network.*Cookies`, `OXI.exportStorageState`) is denied for
+    /// sessions of this context — credentials flow only through the broker.
+    credential_mode: AtomicBool,
 }
 
 impl BrowserContext {
@@ -114,6 +122,7 @@ impl BrowserContext {
             cookie_jar,
             local_storage: Arc::new(RwLock::new(HashMap::new())),
             http_client,
+            credential_mode: AtomicBool::new(false),
         }
     }
 
@@ -154,6 +163,18 @@ impl BrowserContext {
     /// Clear every storage bucket in this context (all origins).
     pub fn clear_storage(&self) {
         self.local_storage.write().clear();
+    }
+
+    /// Enable or disable credential mode (M4, design §6.2). Flipping the flag
+    /// affects every session of this context immediately — the CDP gate reads
+    /// the flag live at command time.
+    pub fn set_credential_mode(&self, on: bool) {
+        self.credential_mode.store(on, Ordering::SeqCst);
+    }
+
+    /// Whether credential mode is active for this context.
+    pub fn credential_mode(&self) -> bool {
+        self.credential_mode.load(Ordering::SeqCst)
     }
 }
 
@@ -216,11 +237,23 @@ mod tests {
             .or_default()
             .insert("k".into(), "v".into());
         assert_eq!(
-            ctx.storage_bucket("https://a.test").get("k").map(String::as_str),
+            ctx.storage_bucket("https://a.test")
+                .get("k")
+                .map(String::as_str),
             Some("v")
         );
         assert!(ctx.storage_bucket("https://missing.test").is_empty());
         ctx.clear_storage();
         assert!(ctx.storage_bucket("https://a.test").is_empty());
+    }
+
+    #[test]
+    fn credential_mode_defaults_off_and_toggles_live() {
+        let ctx = test_context();
+        assert!(!ctx.credential_mode(), "credential mode defaults to off");
+        ctx.set_credential_mode(true);
+        assert!(ctx.credential_mode());
+        ctx.set_credential_mode(false);
+        assert!(!ctx.credential_mode());
     }
 }

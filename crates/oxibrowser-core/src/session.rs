@@ -187,6 +187,9 @@ pub struct Session {
     /// per-context isolation, M-A).
     #[allow(dead_code)]
     cookie_jar: Arc<RwLock<CookieJar>>,
+    /// The session's parent [`BrowserContext`] — backs the credential-mode
+    /// gate on non-CDP surfaces (REPL/MCP fill paths) and context lookups.
+    browser_context: Arc<BrowserContext>,
     /// Active page (current document).
     active_page: Option<Page>,
     /// Navigation history (URLs visited).
@@ -834,7 +837,11 @@ fn handle_local_storage_sync(
                     .insert(key, value);
             }
             LocalStorageMsg::RemoveItem { origin, key } => {
-                local_storage.write().entry(origin).or_default().remove(&key);
+                local_storage
+                    .write()
+                    .entry(origin)
+                    .or_default()
+                    .remove(&key);
             }
             LocalStorageMsg::Clear { origin } => {
                 local_storage.write().entry(origin).or_default().clear();
@@ -965,6 +972,7 @@ impl Session {
             config,
             http_client,
             cookie_jar,
+            browser_context: context,
             active_page: None,
             history: Vec::new(),
             history_index: 0,
@@ -1683,6 +1691,34 @@ impl Session {
         self.evaluate_js_with_await(expression, false).await
     }
 
+    /// The session's parent [`BrowserContext`].
+    pub fn browser_context(&self) -> &Arc<BrowserContext> {
+        &self.browser_context
+    }
+
+    /// Probe whether `selector` matches an `input[type=password]` control —
+    /// the credential-mode literal-fill gate's target check (design §6.2).
+    /// Element-less selectors, JS errors, or a closed session are `false`:
+    /// fail-open to the ordinary fill, policy lives with the callers.
+    pub async fn selector_targets_password(&mut self, selector: &str) -> bool {
+        let sel = serde_json::to_string(selector).unwrap_or_else(|_| "''".to_string());
+        // `getAttribute('type')`, not the `.type` IDL property — the engine
+        // does not reflect form-control properties. `password` is never an
+        // implicit default, so the attribute is authoritative here.
+        let js = format!(
+            "(function() {{ var el = document.querySelector({sel}); \
+             return !!el && (el.getAttribute('type') || '').toLowerCase() === 'password'; }})()"
+        );
+        match self.evaluate_js(&js).await {
+            Ok(result) => result
+                .value
+                .as_ref()
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Evaluate a JS expression, optionally awaiting Promise resolution.
     #[tracing::instrument(skip(self), fields(session = %self.id), err)]
     pub async fn evaluate_js_with_await(
@@ -1905,7 +1941,9 @@ impl Session {
         // and proceed.
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         if self.ls_tx.send(LocalStorageMsg::Drain(ack_tx)).is_ok()
-            && ack_rx.recv_timeout(std::time::Duration::from_millis(250)).is_err()
+            && ack_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err()
         {
             tracing::warn!(
                 "localStorage drain barrier timed out; navigation seed may miss pending JS writes"
@@ -2403,6 +2441,66 @@ impl Session {
         crate::storage_state::StorageState { cookies, origins }
     }
 
+    /// Export the storage state restricted to one account scope (design M6′,
+    /// sub-design §5.3): the envelope payload persisted by
+    /// [`crate::storage::SessionStore`].
+    ///
+    /// Cookies are kept only when their domain's registrable domain (public
+    /// suffix list) equals `scope` — so `login.example.com` and `example.com`
+    /// cookies belong to scope `example.com`, while `other.org` does not.
+    /// Every context storage bucket whose origin's registrable domain equals
+    /// `scope` is included (unlike [`Session::export_state`], which folds in
+    /// only the current page's origin), so one scope's envelope carries all
+    /// its sub-origin state. Origins that fail to parse or are opaque are
+    /// skipped; an empty bucket contributes nothing.
+    pub fn export_state_for_scope(&self, scope: &str) -> crate::storage_state::StorageState {
+        let scope = scope.to_ascii_lowercase();
+        let cookies = self
+            .cookie_jar
+            .read()
+            .get_all()
+            .into_iter()
+            .filter(|cookie| {
+                cookie
+                    .domain
+                    .as_deref()
+                    .map(|domain| {
+                        crate::network::cookie::registrable_domain(domain.trim_start_matches('.'))
+                            == scope
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+        let origins = {
+            let map = self.local_storage.read();
+            map.iter()
+                .filter_map(|(origin, bucket)| {
+                    let url = url::Url::parse(origin).ok()?;
+                    if !matches!(url.origin(), url::Origin::Tuple(..)) {
+                        return None;
+                    }
+                    if crate::network::cookie::registrable_domain(url.host_str()?) != scope {
+                        return None;
+                    }
+                    if bucket.is_empty() {
+                        return None;
+                    }
+                    Some(crate::storage_state::OriginState {
+                        origin: origin.clone(),
+                        local_storage: bucket
+                            .iter()
+                            .map(|(k, v)| crate::storage_state::LocalStorageEntry {
+                                name: k.clone(),
+                                value: v.clone(),
+                            })
+                            .collect(),
+                    })
+                })
+                .collect()
+        };
+        crate::storage_state::StorageState { cookies, origins }
+    }
+
     /// Import a storage state (Playwright `storageState` merge): cookies are
     /// merged into the session's [`CookieJar`] (same-name/path cookies per
     /// domain are replaced), and each `OriginState`'s localStorage entries
@@ -2842,11 +2940,8 @@ mod tests {
     /// Session-bound [`BrowserContext`] with a fresh jar/client and the
     /// given config.
     fn make_context(config: &BrowserConfig) -> Arc<BrowserContext> {
-        let http_client = Arc::new(HttpClient::new(
-            config,
-            Arc::new(RwLock::new(CookieJar::new())),
-        )
-        .unwrap());
+        let http_client =
+            Arc::new(HttpClient::new(config, Arc::new(RwLock::new(CookieJar::new()))).unwrap());
         Arc::new(BrowserContext::with_cookie_jar(
             ContextId::test_next(),
             None,
@@ -3125,6 +3220,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_export_state_for_scope_filters_by_registrable_domain() {
+        use crate::network::cookie::CookieEntry;
+        use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
+        let mut session = make_session().await;
+
+        let cookie = |name: &str, value: &str, domain: &str| CookieEntry {
+            name: name.into(),
+            value: value.into(),
+            domain: Some(domain.into()),
+            ..Default::default()
+        };
+        let st = StorageState {
+            cookies: vec![
+                cookie("apex", "1", "example.com"),
+                // Leading-dot Domain= attribute form must also match.
+                cookie("sub", "2", ".login.example.com"),
+                cookie("elsewhere", "3", "other.org"),
+            ],
+            origins: vec![
+                OriginState {
+                    origin: "https://login.example.com".into(),
+                    local_storage: vec![LocalStorageEntry {
+                        name: "ls_login".into(),
+                        value: "a".into(),
+                    }],
+                },
+                OriginState {
+                    origin: "https://example.com".into(),
+                    local_storage: vec![LocalStorageEntry {
+                        name: "ls_apex".into(),
+                        value: "b".into(),
+                    }],
+                },
+                OriginState {
+                    origin: "https://other.org".into(),
+                    local_storage: vec![LocalStorageEntry {
+                        name: "ls_other".into(),
+                        value: "c".into(),
+                    }],
+                },
+            ],
+        };
+        session.import_state(&st).expect("import");
+
+        // Scope export: both example.com sub-origin buckets and only the
+        // example.com-family cookies; other.org is excluded everywhere.
+        let scoped = session.export_state_for_scope("example.com");
+        let mut cookie_names: Vec<_> = scoped.cookies.iter().map(|c| c.name.as_str()).collect();
+        cookie_names.sort();
+        assert_eq!(cookie_names, vec!["apex", "sub"], "domain filter");
+        let mut origins: Vec<_> = scoped.origins.iter().map(|o| o.origin.as_str()).collect();
+        origins.sort();
+        assert_eq!(
+            origins,
+            vec!["https://example.com", "https://login.example.com"],
+            "all matching context buckets, multi-origin"
+        );
+        let login = scoped
+            .origins
+            .iter()
+            .find(|o| o.origin == "https://login.example.com")
+            .unwrap();
+        assert_eq!(
+            login.local_storage,
+            vec![LocalStorageEntry {
+                name: "ls_login".into(),
+                value: "a".into()
+            }]
+        );
+
+        // A different scope picks up exactly its own state.
+        let scoped = session.export_state_for_scope("other.org");
+        assert_eq!(scoped.cookies.len(), 1);
+        assert_eq!(scoped.cookies[0].name, "elsewhere");
+        assert_eq!(scoped.origins.len(), 1);
+        assert_eq!(scoped.origins[0].origin, "https://other.org");
+
+        // Scope matching is case-insensitive (registrable domains are
+        // lowercase by convention).
+        assert_eq!(
+            session.export_state_for_scope("EXAMPLE.COM").origins.len(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn test_import_state_restores_local_storage_on_same_origin() {
         use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
         let mut session = make_session().await;
@@ -3262,7 +3443,6 @@ mod tests {
         );
     }
 
-
     #[tokio::test]
     async fn test_import_state_two_origins_route_to_own_buckets() {
         use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
@@ -3389,7 +3569,9 @@ mod tests {
 
         let map = session.local_storage.read().clone();
         assert_eq!(
-            map.get("https://write.test").and_then(|b| b.get("secret")).map(String::as_str),
+            map.get("https://write.test")
+                .and_then(|b| b.get("secret"))
+                .map(String::as_str),
             Some("s1"),
             "write must land in the writing origin's bucket"
         );
@@ -3423,9 +3605,7 @@ mod tests {
 
         // Immediate away + back, no waits anywhere.
         session.navigate("about:blank").await.expect("away nav");
-        session
-            .inject_dom_snapshot_for_test(mk_page().await)
-            .await;
+        session.inject_dom_snapshot_for_test(mk_page().await).await;
         let r = session
             .evaluate_js("localStorage.getItem('k')")
             .await

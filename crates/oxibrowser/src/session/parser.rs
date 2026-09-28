@@ -106,6 +106,26 @@ pub enum SessionCommand {
     SaveState { path: String },
     /// Load storage state from a JSON file into the active tab.
     LoadState { path: String },
+    /// List accounts with state (§7.2).
+    AccountList,
+    /// One account's state/detail/session horizon.
+    AccountStatus { id: String },
+    /// Dispose the envelope; back to needs_login.
+    AccountLogout { id: String },
+    /// Start a login flow: `--mode import` seeds from files; `--mode user`
+    /// opens a login window on a fresh account-context tab, finished by
+    /// `takeover done|abort`; `--mode agent` runs the unattended M-D flow
+    /// (broker fills credentials + TOTP) and reports the outcome.
+    AccountLogin {
+        id: String,
+        mode: Option<String>,
+        storage_state: Option<String>,
+        cookies: Option<String>,
+        agent: Option<String>,
+    },
+    /// Takeover window control: `takeover` status, `takeover done` capture,
+    /// `takeover abort` revert (§5.2 / M5′).
+    Takeover { action: Option<String> },
     /// Print help.
     Help,
     /// Exit the session.
@@ -265,6 +285,63 @@ pub fn parse_session_command(line: &str) -> Result<SessionCommand, String> {
         }
 
         "help" => Ok(SessionCommand::Help),
+
+        "account_list" => Ok(SessionCommand::AccountList),
+
+        "account_status" => {
+            let id = args.first().ok_or("account_status <id>")?.to_string();
+            Ok(SessionCommand::AccountStatus { id })
+        }
+
+        "account_logout" => {
+            let id = args.first().ok_or("account_logout <id>")?.to_string();
+            Ok(SessionCommand::AccountLogout { id })
+        }
+
+        "account_login" => {
+            let mut pos: Vec<&str> = Vec::new();
+            let mut mode = None;
+            let mut storage_state = None;
+            let mut cookies = None;
+            let mut agent = None;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i] {
+                    "--mode" => {
+                        mode = args.get(i + 1).map(|s| s.to_string());
+                        i += 2;
+                    }
+                    "--storage-state" => {
+                        storage_state = args.get(i + 1).map(|s| s.to_string());
+                        i += 2;
+                    }
+                    "--cookies" => {
+                        cookies = args.get(i + 1).map(|s| s.to_string());
+                        i += 2;
+                    }
+                    "--agent" => {
+                        agent = args.get(i + 1).map(|s| s.to_string());
+                        i += 2;
+                    }
+                    other => {
+                        pos.push(other);
+                        i += 1;
+                    }
+                }
+            }
+            let id = pos.first().ok_or("account_login <id> [--mode user|agent|import] [--agent ID] [--storage-state F] [--cookies F]")?.to_string();
+            Ok(SessionCommand::AccountLogin {
+                id,
+                mode,
+                storage_state,
+                cookies,
+                agent,
+            })
+        }
+
+        "takeover" => Ok(SessionCommand::Takeover {
+            action: args.first().map(|s| s.to_string()),
+        }),
 
         "exit" | "quit" => Ok(SessionCommand::Exit),
 

@@ -275,6 +275,14 @@ async fn call_tool(
             let selector =
                 string_arg(args, "selector").ok_or("missing required argument: selector")?;
             let value = string_arg(args, "value").ok_or("missing required argument: value")?;
+            // Credential-mode literal gate (design §6.2): passwords flow only
+            // through the audited credential path.
+            if tab.in_credential_mode().await && tab.selector_targets_password(&selector).await {
+                return Err(
+                    "passwordFillRequiresCredential: fill password fields via the credential path"
+                        .to_string(),
+                );
+            }
             tab.fill(&selector, &value)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -648,5 +656,69 @@ mod tests {
         assert_eq!(required("browser_eval"), vec!["expression"]);
         assert!(required("browser_screenshot").is_empty());
         assert!(required("browser_wait").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    const FORM_HTML: &str = "data:text/html,<html><body><form>\
+        <input id='user' type='text'><input id='pw' type='password'>\
+        </form></body></html>";
+
+    /// Credential-mode literal gate (design §6.2, F5): MCP `browser_fill`
+    /// into an `input[type=password]` is rejected while the context is in
+    /// credential mode; non-password targets and non-credential mode pass.
+    #[tokio::test]
+    async fn browser_fill_rejects_password_literal_in_credential_mode() {
+        let browser = Browser::new(oxibrowser_core::BrowserConfig::headless())
+            .await
+            .unwrap();
+        browser.default_context().set_credential_mode(true);
+        let tab_slot: Mutex<Option<Tab>> = Mutex::new(None);
+
+        call_tool(
+            &browser,
+            &tab_slot,
+            "browser_navigate",
+            &json!({ "url": FORM_HTML }),
+        )
+        .await
+        .unwrap();
+
+        let err = call_tool(
+            &browser,
+            &tab_slot,
+            "browser_fill",
+            &json!({ "selector": "#pw", "value": "hunter2" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.contains("passwordFillRequiresCredential"),
+            "password literal must be gated: {err}"
+        );
+
+        // Non-password targets keep flowing.
+        let ok = call_tool(
+            &browser,
+            &tab_slot,
+            "browser_fill",
+            &json!({ "selector": "#user", "value": "user@example.com" }),
+        )
+        .await;
+        assert!(ok.is_ok(), "non-password fill must pass: {ok:?}");
+
+        // Mode off → the same literal passes.
+        browser.default_context().set_credential_mode(false);
+        let ok = call_tool(
+            &browser,
+            &tab_slot,
+            "browser_fill",
+            &json!({ "selector": "#pw", "value": "hunter2" }),
+        )
+        .await;
+        assert!(ok.is_ok(), "fill must pass outside credential mode: {ok:?}");
     }
 }

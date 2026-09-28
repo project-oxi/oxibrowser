@@ -89,6 +89,24 @@ oxibrowser fetch <url> --telemetry --json
 oxibrowser fetch http://127.0.0.1:8080/ --allow-private-ips --json
 ```
 
+## Accounts & Credentials (login persistence)
+
+```bash
+# Register an account and check its state board
+oxibrowser account add --site github.com --login me@corp.io --json
+oxibrowser account list --json            # id/scope/state/session horizon
+oxibrowser account status gh-work --json  # add --probe to re-validate live
+
+# Secrets live in the OS keychain; the value NEVER goes through argv
+echo "$PASS" | oxibrowser credential put --agent main --site github.com \
+  --kind password --slug work --origin https://github.com/ --stdin
+oxibrowser credential list --json         # metadata only, never values
+oxibrowser credential totp --id "kch:main/github.com/totp/work"
+
+# Rules: get prints the raw secret (no --json). Deny rules → consent →
+# local-user confirmation. account rm deletes envelopes, not keychain creds.
+```
+
 ## Output Format
 
 All JSON: `{"ok": true/false, "data": {...}, "error": "...", "error_code": "...", "meta": {"elapsed_ms": N}}`

@@ -17,8 +17,10 @@ pub mod runtime;
 pub mod target;
 pub mod tracing;
 
+use crate::credential::CredentialBroker;
 use crate::event::EventSender;
 use crate::protocol::CdpError;
+use oxibrowser_core::context::BrowserContext;
 use oxibrowser_core::network::SharedRegistry;
 use oxibrowser_core::session::Session;
 use serde_json::Value;
@@ -157,6 +159,117 @@ pub struct DispatchContext {
     pub browser: Arc<oxibrowser_core::Browser>,
     /// Attached child targets (multi-tab), keyed by sessionId.
     pub child_targets: ChildTargets,
+    /// The [`BrowserContext`] the routed session belongs to (main session →
+    /// the browser's default context; child target → its creation context).
+    /// Backs the credential-mode gate.
+    pub browser_context: Arc<BrowserContext>,
+    /// Credential broker (provider + policy engine + pending confirmations).
+    /// `None` — the server default — makes every `OXI.credential*` call answer
+    /// `credentialsUnavailable`; existing server behavior is unchanged.
+    pub credentials: Option<Arc<CredentialBroker>>,
+    /// Connection role (§5.2) — viewer allowlist, agent takeover denial.
+    pub role: crate::session::RoleKind,
+    /// Account/login surface. `None` — the server default — makes every
+    /// `OXI.account*` call answer `accountsUnavailable`.
+    pub logins: Option<Arc<crate::account::LoginSurface>>,
+}
+
+/// Credential-mode gate (design `2026-09-27` §6.3): storage-exporting CDP
+/// surface is denied while the session's context is in credential mode —
+/// credentials flow only through the broker's `OXI.fillCredential`.
+pub fn deny_in_credential_mode(ctx: &DispatchContext) -> Result<(), CdpError> {
+    if ctx.browser_context.credential_mode() {
+        return Err(CdpError {
+            code: -32000,
+            message: "deniedInCredentialMode".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Role gate (§5.2). Evaluated before every dispatch:
+///
+/// - **viewer** connections get the §5.2 allowlist only — screencast, input,
+///   navigate, and the login-surface methods (`resolveConfirmation`,
+///   `reportLoginSuccess`, `endLogin`). Cookies, storage,
+///   `Runtime.evaluate`, `exportStorageState`, and everything else answer
+///   `deniedForViewerRole`.
+/// - **agent** connections can never resolve confirmation cards — approval
+///   is the human's out-of-band act, so `OXI.resolveConfirmation` answers
+///   `confirmationRequiresViewerRole` unconditionally (OXI-CONFIRM-SELF-APPROVE).
+///   Inside a live takeover window for the routed session's context they are
+///   additionally denied input and capture — including the DOM-event and
+///   evaluate-based input/capture paths (`OXI.fillRef`, `OXI.clickRef`,
+///   `OXI.getBoxModelScreenshot`, `Runtime.evaluate`)
+///   (`input_denied_during_takeover` / `capture_denied_during_takeover`).
+fn gate_role(method: &str, ctx: &DispatchContext) -> Result<(), CdpError> {
+    match ctx.role {
+        crate::session::RoleKind::Viewer => {
+            let allowed = method.starts_with("Input.")
+                || matches!(
+                    method,
+                    "Page.navigate"
+                        | "Page.startScreencast"
+                        | "Page.stopScreencast"
+                        | "Page.screencastFrameAck"
+                        | "OXI.resolveConfirmation"
+                        | "OXI.reportLoginSuccess"
+                        | "OXI.endLogin"
+                );
+            if allowed {
+                Ok(())
+            } else {
+                Err(CdpError {
+                    code: -32000,
+                    message: "deniedForViewerRole".to_string(),
+                })
+            }
+        }
+        crate::session::RoleKind::Agent => {
+            // Confirmation approval is the human's out-of-band act on a
+            // viewer connection — never the requesting agent's own
+            // (OXI-CONFIRM-SELF-APPROVE).
+            if method == "OXI.resolveConfirmation" {
+                return Err(CdpError {
+                    code: -32000,
+                    message: "confirmationRequiresViewerRole".to_string(),
+                });
+            }
+            let Some(surface) = ctx.logins.as_ref() else {
+                return Ok(());
+            };
+            let Some(_takeover) = surface.active_takeover(ctx.browser_context.id().as_str()) else {
+                return Ok(());
+            };
+            if method.starts_with("Input.")
+                || matches!(
+                    method,
+                    // DOM-event/evaluate-based input and capture paths —
+                    // blocking `Input.*` alone leaves fillRef/clickRef and
+                    // `el.click()`-via-evaluate open (TAKEOVER-INPUT-BYPASS).
+                    "OXI.fillRef"
+                        | "OXI.clickRef"
+                        | "OXI.getBoxModelScreenshot"
+                        | "Runtime.evaluate"
+                )
+            {
+                Err(CdpError {
+                    code: -32000,
+                    message: "input_denied_during_takeover".to_string(),
+                })
+            } else if matches!(
+                method,
+                "Page.captureScreenshot" | "Page.startScreencast" | "Page.printToPDF"
+            ) {
+                Err(CdpError {
+                    code: -32000,
+                    message: "capture_denied_during_takeover".to_string(),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Result of handling a CDP domain method.
@@ -167,6 +280,7 @@ pub type DomainResult = std::result::Result<Option<Value>, CdpError>;
 /// Returns `Ok(Some(result))` on success, `Ok(None)` for empty results,
 /// or `Err(CdpError)` for unknown methods.
 pub async fn dispatch(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    gate_role(method, ctx)?;
     let parts: Vec<&str> = method.splitn(2, '.').collect();
     if parts.len() != 2 {
         return Err(CdpError {

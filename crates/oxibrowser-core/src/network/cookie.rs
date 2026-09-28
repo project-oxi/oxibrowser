@@ -200,6 +200,20 @@ pub(crate) fn registrable_domain(host: &str) -> String {
     host.to_lowercase()
 }
 
+/// Trustworthy origin per the secure-contexts rules (RFC 6265bis §5.4 /
+/// WHATWG): `https`, or a loopback host over plain http — browsers treat
+/// `localhost`/`127.0.0.1`/`::1` as potentially trustworthy, so Secure
+/// cookies may be *sent* there without TLS.
+fn is_trustworthy_origin(url: &Url) -> bool {
+    if url.scheme() == "https" {
+        return true;
+    }
+    matches!(
+        url.host_str(),
+        Some("localhost") | Some("127.0.0.1") | Some("::1")
+    )
+}
+
 /// Compute the default cookie path from a URL per RFC 6265 §5.1.4.
 fn default_path(url_path: &str) -> String {
     if url_path.is_empty() || !url_path.starts_with('/') {
@@ -556,7 +570,7 @@ impl CookieJar {
     pub fn cookies_for_url_with_context(&self, url: &Url, ctx: SameSiteContext) -> String {
         let host = url.host_str().unwrap_or("unknown").to_lowercase();
         let url_path = url.path();
-        let is_secure = url.scheme() == "https";
+        let is_secure = is_trustworthy_origin(url);
 
         let mut matching: Vec<&CookieEntry> = Vec::new();
 
@@ -622,7 +636,7 @@ impl CookieJar {
     pub fn cookies_for_js(&self, url: &Url) -> String {
         let host = url.host_str().unwrap_or("unknown").to_lowercase();
         let url_path = url.path();
-        let is_secure = url.scheme() == "https";
+        let is_secure = is_trustworthy_origin(url);
 
         let mut matching: Vec<&CookieEntry> = Vec::new();
 

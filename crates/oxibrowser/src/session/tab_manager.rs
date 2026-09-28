@@ -30,6 +30,15 @@ impl TabManager {
         Ok(id)
     }
 
+    /// Register an already-created tab (e.g. one created inside an account
+    /// context) and return its id.
+    pub fn insert_tab(&mut self, tab: Tab) -> String {
+        let id = format!("t{}", self.next_id);
+        self.next_id += 1;
+        self.tabs.insert(id.clone(), tab);
+        id
+    }
+
     /// Get a reference to a tab by id.
     pub fn get(&self, tab_id: &str) -> Option<&Tab> {
         self.tabs.get(tab_id)

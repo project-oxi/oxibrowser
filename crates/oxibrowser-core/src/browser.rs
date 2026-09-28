@@ -390,8 +390,9 @@ impl Browser {
     pub fn new_context(&self, cfg: ContextConfig) -> Result<Arc<BrowserContext>> {
         self.ensure_open()?;
         if let Some(proxy) = &cfg.proxy {
-            let url = url::Url::parse(proxy)
-                .map_err(|e| CoreError::SessionError(format!("invalid proxyServer {proxy:?}: {e}")))?;
+            let url = url::Url::parse(proxy).map_err(|e| {
+                CoreError::SessionError(format!("invalid proxyServer {proxy:?}: {e}"))
+            })?;
             if !matches!(url.scheme(), "http" | "https" | "socks4" | "socks5") {
                 return Err(CoreError::SessionError(format!(
                     "unsupported proxyServer scheme {:?} in {proxy:?}",
@@ -763,21 +764,20 @@ mod tests {
             "sibling context must not see c1's cookies"
         );
         assert!(
-            browser.default_context().cookie_jar().read().get_all().is_empty(),
+            browser
+                .default_context()
+                .cookie_jar()
+                .read()
+                .get_all()
+                .is_empty(),
             "default context must not see c1's cookies"
         );
 
         // Sessions inherit exactly their context's jar (same Arc).
         let s1 = browser.new_session_in(&c1).await.unwrap();
         let s2 = browser.new_session_in(&c2).await.unwrap();
-        assert!(Arc::ptr_eq(
-            s1.read().await.cookie_jar(),
-            c1.cookie_jar()
-        ));
-        assert!(Arc::ptr_eq(
-            s2.read().await.cookie_jar(),
-            c2.cookie_jar()
-        ));
+        assert!(Arc::ptr_eq(s1.read().await.cookie_jar(), c1.cookie_jar()));
+        assert!(Arc::ptr_eq(s2.read().await.cookie_jar(), c2.cookie_jar()));
     }
 
     #[tokio::test]
@@ -789,18 +789,12 @@ mod tests {
                 proxy: Some("http://127.0.0.1:1".into()),
             })
             .unwrap();
-        assert!(!Arc::ptr_eq(
-            &proxied.http_client(),
-            browser.http_client()
-        ));
+        assert!(!Arc::ptr_eq(&proxied.http_client(), browser.http_client()));
         // No proxy → still a dedicated client (bound to the context's own
         // jar — sharing the browser client would route session HTTP traffic
         // into the default jar).
         let plain = browser.new_context(ContextConfig::default()).unwrap();
-        assert!(!Arc::ptr_eq(
-            &plain.http_client(),
-            browser.http_client()
-        ));
+        assert!(!Arc::ptr_eq(&plain.http_client(), browser.http_client()));
     }
 
     #[tokio::test]
@@ -827,7 +821,11 @@ mod tests {
         );
 
         // Unknown ids error.
-        assert!(browser.dispose_context(&ContextId("ctx-999".into())).is_err());
+        assert!(
+            browser
+                .dispose_context(&ContextId("ctx-999".into()))
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -930,7 +928,10 @@ mod tests {
 
         // A default-context tab must NOT see the context cookie.
         let default_tab = browser.new_tab().await.unwrap();
-        default_tab.goto(&format!("{}/", server.uri())).await.unwrap();
+        default_tab
+            .goto(&format!("{}/", server.uri()))
+            .await
+            .unwrap();
         let doc = default_tab.evaluate("document.cookie").await.unwrap();
         let doc = doc.as_str().unwrap_or_default();
         assert!(
@@ -952,9 +953,7 @@ mod tests {
             })
             .unwrap();
         let url = url::Url::parse("https://keep.test/").unwrap();
-        ctx.cookie_jar()
-            .write()
-            .store(&url, "sid=leak-me; Path=/");
+        ctx.cookie_jar().write().store(&url, "sid=leak-me; Path=/");
         assert!(!ctx.cookie_jar().read().is_empty());
         let _session = browser.new_session_in(&ctx).await.unwrap();
 

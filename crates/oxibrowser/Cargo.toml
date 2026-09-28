@@ -1,6 +1,6 @@
 [package]
 name = "oxibrowser"
-version = "0.23.0"
+version = "0.24.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,7 +18,14 @@ default = []
 # Enable the headless browser engine (oxibrowser-core + oxibrowser-cdp).
 # Without this feature, only the lightweight search module is compiled —
 # no boa_engine (JS engine) dependency.
-browser = ["dep:oxibrowser-core", "dep:oxibrowser-cdp"]
+browser = [
+    "dep:oxibrowser-core",
+    "dep:oxibrowser-cdp",
+    "dep:oxibrowser-credentials",
+    "dep:chrono",
+    "dep:rpassword",
+    "dep:psl",
+]
 
 [[bin]]
 name = "oxibrowser"
@@ -42,8 +49,14 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 
-oxibrowser-core = { version = "0.23.0", path = "../oxibrowser-core", optional = true }
-oxibrowser-cdp = { version = "0.23.0", path = "../oxibrowser-cdp", optional = true }
+oxibrowser-core = { version = "0.24.0", path = "../oxibrowser-core", optional = true }
+oxibrowser-cdp = { version = "0.24.0", path = "../oxibrowser-cdp", optional = true }
+oxibrowser-credentials = { version = "0.24.0", path = "../oxibrowser-credentials", optional = true }
+
+# account/credential CLI support (browser feature)
+chrono = { version = "0.4", optional = true }
+rpassword = { version = "7", optional = true }
+psl = { workspace = true, optional = true }
 
 [dev-dependencies]
 

@@ -13,6 +13,7 @@ pub mod tab_manager;
 
 use crate::output::CliResponse;
 use std::io::BufRead;
+use std::sync::Arc;
 use tab_manager::TabManager;
 
 /// Run the session REPL. Returns exit code.
@@ -30,8 +31,10 @@ pub async fn run_session(allow_private_ips: bool) -> i32 {
             return 1;
         }
     };
+    let browser = Arc::new(browser);
 
     let mut manager = TabManager::new();
+    let mut accounts = executor::AccountRuntime::new(browser.clone());
 
     // Read from stdin on a blocking thread so we can select with signals
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<String>>(32);
@@ -87,7 +90,7 @@ pub async fn run_session(allow_private_ips: bool) -> i32 {
                             break 0;
                         }
 
-                        let resp = executor::execute(cmd, &browser, &mut manager).await;
+                        let resp = executor::execute(cmd, &browser, &mut manager, &mut accounts).await;
                         resp.print_json();
                     }
                     Some(None) | None => {

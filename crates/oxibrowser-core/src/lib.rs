@@ -2,6 +2,7 @@
 //!
 //! Uses Servo's html5ever for HTML parsing and boa_engine for JavaScript execution.
 
+pub mod account;
 pub mod browse_result;
 pub mod browser;
 pub mod challenge;
@@ -17,6 +18,7 @@ pub mod page;
 pub mod script;
 pub mod security;
 pub mod session;
+pub mod storage;
 pub mod storage_state;
 pub mod tab;
 
@@ -41,3 +43,9 @@ pub use error::Result;
 pub use event::BrowserEvent;
 pub use storage_state::{OriginState, StorageState};
 pub use tab::Tab;
+
+pub use account::{
+    AccountManager, AccountRecord, AccountRegistry, AccountState, Detection, DetectionInput,
+    LoginDetector, PreLoginSnapshot, ProbeConfig, ProbeOutcome, ProbeVerdict, SessionSummary,
+    ValidationProbe,
+};

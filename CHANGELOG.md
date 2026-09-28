@@ -8,6 +8,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-09-29
+
+Account login session management — the Codex-Desktop-style account layer:
+users log in once, accounts live in an encrypted sandbox, and agents work
+under explicit grants
+([design](docs/designs/2026-09-28-account-login-session-management.md)).
+
+### Added
+- **Browser contexts (M-A)** — `BrowserContext` gives every browsing context
+  its own cookie jar, origin-keyed localStorage, and egress-pinned HTTP
+  client. `Target.createBrowserContext`/`disposeBrowserContext` are
+  implemented for real (per-context `browserContextId` everywhere,
+  `createTarget {browserContextId}`, `proxyServer` mapping with validation);
+  `Target.createBrowserContext {oxiAccount, oxiAgentId}` binds a context to
+  a granted account. Cross-origin localStorage bleed between navigations is
+  gone (per-navigation origin-bucket re-seed, origin-stamped sync messages,
+  drain barrier).
+- **`oxibrowser-credentials` crate (M2/M3)** — OS-keychain credential broker:
+  `SecretBox` (zeroized, no Debug/Display/Serialize), `KeyringProvider`
+  (`com.oxibrowser.agent/<agent>/<scope>` service keys), RFC 6238 TOTP
+  (`otpauth://` normalization, window-boundary handling), consent store
+  (JSONL, last-wins, tombstones, expiry/use budgets, credential + account
+  subjects), and the deny→consent→confirmation policy engine.
+- **Encrypted session store (M6′)** — `~/.oxibrowser/accounts/<id>/sessions/
+  <scope>.session`: Playwright-compatible `StorageState` sealed in an
+  XChaCha20-Poly1305 `OXSESS1` envelope (key in the keychain, atomic 0600
+  writes, fingerprint fail-closed restore, no plaintext fallback).
+  Multi-origin scope export.
+- **Account registry & lifecycle (M-B)** — `account add/list/status/rm`,
+  login detector (cookie/navigation/DOM/storage signals), validation probe,
+  state machine `needs_login → valid → stale/challenge`, audit trail.
+- **Login orchestration (M-C)** — `account login` in three modes:
+  `import` (Playwright storageState / Netscape cookies.txt), `user` wizard
+  (terminal) or host contract (`--json` prints `{ws_url, viewer_token,
+  login_id}` for embedded-UI apps), and `agent` (unattended, M-D). Viewer
+  role over CDP (`X-Oxi-Role`/`X-Oxi-Viewer-Token`, one-time tokens,
+  takeover windows where only the user's mirror may type/capture).
+- **Unattended agent login (M-D)** — `OXI.loginWithAccount`: login-page
+  discovery (credential-pinned origins first), form detection, exact-origin
+  gating, broker injection (values never in responses/logs), TOTP, challenge
+  and SMS/email-2FA escalation, redirect-allowlist veto.
+- **Grant surface** — `account grant/revoke --agent` (agent-scoped account
+  grants) and `credential authorize/forget` (credential-plane consents);
+  `OXI.credentialList/fillCredential`, `OXI.confirmationRequired`/
+  `resolveConfirmation` (viewer-only approval), `OXI.accountList`/
+  `beginLogin`/`endLogin`/`reportLoginSuccess` + account/login state events.
+- **CDP gating** — cookie reads/writes and storage export/import are denied
+  in credential-mode contexts (`deniedInCredentialMode`); password-field
+  literal fills via `fillRef`/REPL `fill`/MCP `browser_fill` are rejected in
+  favor of the audited `fillCredential` path.
+
+### Security
+- Confirmation cards can only be resolved by viewer (user-channel)
+  connections — an agent cannot self-approve (design §1: deterministic
+  execution-layer gates).
+- `OXI.beginLogin` no longer returns the viewer token in-band; tokens are
+  delivered out-of-band via the CLI host contract only.
+- Takeover windows additionally block `OXI.fillRef`, `OXI.clickRef`,
+  `getBoxModelScreenshot`, and `Runtime.evaluate` for agent connections.
+- Release security review (5 findings: 2 high, 3 medium) — 4 fixed in code;
+  the fifth (page-JS visibility of non-`HttpOnly` cookies via
+  `document.cookie`) is inherent browser semantics and is now documented as
+  such: `HttpOnly` cookies stay JS-invisible, bulk export paths stay gated.
+
 ## [0.23.0] - 2026-09-27
 
 Agent unattended-auth security hardening (P0 of

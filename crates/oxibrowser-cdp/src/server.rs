@@ -62,6 +62,17 @@ pub struct CdpServer {
     /// Optional authentication token for WebSocket connections.
     /// When set, clients must provide it via `?token=` query parameter.
     auth_token: Option<String>,
+    /// Optional credential broker (provider + policy engine). When unset,
+    /// `OXI.credentialList` / `OXI.fillCredential` answer
+    /// `credentialsUnavailable` and everything else is unchanged.
+    credentials: Option<Arc<crate::credential::CredentialBroker>>,
+    /// Context new agent connections are created in (default: the browser's
+    /// default context). `serve --account` sets this to the first bound
+    /// account's context.
+    primary_context: Option<Arc<oxibrowser_core::context::BrowserContext>>,
+    /// Account/login surface (§5.2, §7.3). When unset, the `OXI.account*`
+    /// methods answer `accountsUnavailable` and role headers are ignored.
+    login: Option<Arc<crate::account::LoginSurface>>,
 }
 
 impl CdpServer {
@@ -74,12 +85,57 @@ impl CdpServer {
             shutdown_tx,
             connection_count: Arc::new(AtomicUsize::new(0)),
             auth_token: None,
+            credentials: None,
+            primary_context: None,
+            login: None,
         }
     }
 
     /// Set an authentication token that WebSocket clients must provide.
     pub fn with_auth(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Create agent sessions in `ctx` instead of the browser's default
+    /// context (`serve --account <id>` binding).
+    pub fn with_primary_context(
+        mut self,
+        ctx: Arc<oxibrowser_core::context::BrowserContext>,
+    ) -> Self {
+        self.primary_context = Some(ctx);
+        self
+    }
+
+    /// Wire the account/login surface (§5.2, §7.3): `OXI.accountList` /
+    /// `beginLogin` / `endLogin` / `reportLoginSuccess`, viewer-role
+    /// upgrades, and takeover gating become available.
+    pub fn with_login(mut self, login: Arc<crate::account::LoginSurface>) -> Self {
+        self.login = Some(login);
+        self
+    }
+
+    /// Wire the credential broker (M4, design §6.3): every CDP session then
+    /// gets `OXI.credentialList` / `OXI.fillCredential` /
+    /// `OXI.resolveConfirmation` backed by `provider` + `engine`. Without it
+    /// those methods answer `credentialsUnavailable`.
+    pub fn with_credentials(
+        self,
+        provider: std::sync::Arc<dyn oxibrowser_credentials::CredentialProvider>,
+        engine: std::sync::Arc<oxibrowser_credentials::PolicyEngine>,
+    ) -> Self {
+        self.with_credentials_broker(Arc::new(crate::credential::CredentialBroker::new(
+            provider, engine,
+        )))
+    }
+
+    /// Wire a pre-built broker — lets a caller share one broker (and its
+    /// pending-confirmation table) across servers or tune its TTL.
+    pub fn with_credentials_broker(
+        mut self,
+        broker: Arc<crate::credential::CredentialBroker>,
+    ) -> Self {
+        self.credentials = Some(broker);
         self
     }
 
@@ -152,6 +208,9 @@ impl CdpServer {
         let ws_url = format!("ws://{}/ws", self.addr);
         let browser = self.browser.clone();
         let auth_token = self.auth_token.clone();
+        let credentials = self.credentials.clone();
+        let primary_context = self.primary_context.clone();
+        let login = self.login.clone();
 
         let io = TokioIo::new(stream);
 
@@ -159,7 +218,21 @@ impl CdpServer {
             let ws_url = ws_url.clone();
             let browser = browser.clone();
             let auth_token = auth_token.clone();
-            async move { Self::handle_http_request(req, &ws_url, browser, &auth_token).await }
+            let credentials = credentials.clone();
+            let primary_context = primary_context.clone();
+            let login = login.clone();
+            async move {
+                Self::handle_http_request(
+                    req,
+                    &ws_url,
+                    browser,
+                    &auth_token,
+                    credentials,
+                    primary_context,
+                    login,
+                )
+                .await
+            }
         });
 
         http1::Builder::new()
@@ -176,6 +249,9 @@ impl CdpServer {
         ws_url: &str,
         browser: Arc<Browser>,
         auth_token: &Option<String>,
+        credentials: Option<Arc<crate::credential::CredentialBroker>>,
+        primary_context: Option<Arc<oxibrowser_core::context::BrowserContext>>,
+        login: Option<Arc<crate::account::LoginSurface>>,
     ) -> anyhow::Result<Response<HttpBody>> {
         match req.uri().path() {
             "/health" => {
@@ -264,6 +340,44 @@ impl CdpServer {
                     .map(|s| s.to_string())
                     .unwrap_or_default();
 
+                // Role claim (§5.2): `X-Oxi-Role: viewer` + one-time
+                // `X-Oxi-Viewer-Token` upgrades the connection as the
+                // human's mirror; everything else is an agent connection.
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.trim().to_string())
+                };
+                let role_header = header("x-oxi-role");
+                let viewer_token = header("x-oxi-viewer-token");
+
+                let conn_ctx = match (role_header.as_deref(), viewer_token.as_deref()) {
+                    (Some("viewer"), Some(token)) => {
+                        let Some(surface) = login.as_ref() else {
+                            return Ok(Response::builder().status(StatusCode::FORBIDDEN).body(
+                                Full::new(Bytes::from(
+                                    "viewer role unavailable: no login surface on this server",
+                                )),
+                            )?);
+                        };
+                        match surface.take_viewer(token) {
+                            Some(ctx) => crate::session::ConnectionRole::viewer(ctx, login.clone()),
+                            None => {
+                                return Ok(Response::builder()
+                                    .status(StatusCode::FORBIDDEN)
+                                    .body(Full::new(Bytes::from(
+                                        "invalid, used, or expired viewer token",
+                                    )))?);
+                            }
+                        }
+                    }
+                    _ => crate::session::ConnectionRole::agent(
+                        primary_context.clone(),
+                        login.clone(),
+                    ),
+                };
+
                 let accept_key = derive_accept_key(client_key.as_bytes());
 
                 // Spawn a task to handle the upgraded WebSocket connection.
@@ -281,7 +395,7 @@ impl CdpServer {
                                 WebSocketStream::from_raw_socket(io, Role::Server, Some(ws_config))
                                     .await;
 
-                            match CdpSession::new(ws, browser).await {
+                            match CdpSession::new(ws, browser, credentials, conn_ctx).await {
                                 Ok(session) => {
                                     if let Err(e) = session.run().await {
                                         warn!(error = %e, "CDP session error");

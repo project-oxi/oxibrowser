@@ -1,0 +1,35 @@
+[package]
+name = "oxibrowser-credentials"
+version = "0.24.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+description = "Credential broker: keyring-backed secrets, TOTP codes, consent records, and the deny-first use policy"
+
+[dependencies]
+oxibrowser-core = { version = "0.24.0", path = "../oxibrowser-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = { workspace = true }
+zeroize = "1.9"
+base64 = { workspace = true }
+getrandom = { workspace = true }
+# keyring 4.x: the default `v1` feature registers the platform store as the
+# keyring-core default — Apple Keychain via apple-native-keyring-store on macOS
+# (design §10: the `apple-native` feature name from the 4.0 betas no longer
+# exists in released 4.x).
+keyring = { version = "4", features = ["v1"] }
+keyring-core = "1"
+# totp-rs 6 carries its own digest-0.11 tree (hmac 0.13 / sha1 0.11) without
+# touching the workspace's sha1 0.10 — the §4.4 first choice.
+totp-rs = { version = "6", features = ["otpauth"] }

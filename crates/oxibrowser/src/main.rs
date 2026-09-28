@@ -2,7 +2,8 @@
 //!
 //! Human is the default. `--json` opts into machine-readable output.
 //!
-//! 9 subcommands: fetch, extract, run, session, serve, search, describe, skill, version
+//! 11 subcommands: fetch, extract, run, session, serve, search, describe,
+//! skill, version, account, credential
 
 use clap::{Parser, Subcommand};
 use serde_json::Value;
@@ -18,6 +19,9 @@ mod output;
 mod session;
 mod skill;
 mod validate;
+
+#[cfg(feature = "browser")]
+mod account_cli;
 
 // search is declared in lib.rs and re-exported as `pub mod search`.
 use oxibrowser::search;
@@ -110,6 +114,10 @@ enum Commands {
         /// `OXI.getApiGaps`.
         #[arg(long)]
         telemetry: bool,
+        /// Bind to an account's session (restores the stored envelope into a
+        /// dedicated context, credential mode on).
+        #[arg(long, value_name = "ID")]
+        account: Option<String>,
         /// Timeout in seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -202,6 +210,12 @@ enum Commands {
         /// instead of a CDP listener.
         #[arg(long)]
         mcp: bool,
+        /// Bind to one or more accounts (comma-separated): each gets a
+        /// context with its stored envelope restored (credential mode on);
+        /// the first account becomes the primary context. Enables the
+        /// OXI.account* surface (login windows, viewer role).
+        #[arg(long, value_name = "IDS")]
+        account: Option<String>,
     },
 
     /// Print CLI schema as JSON (for agents).
@@ -255,6 +269,20 @@ enum Commands {
         #[arg(long, hide = true)]
         json: bool,
     },
+
+    /// Account registry and login-state management.
+    #[cfg(feature = "browser")]
+    Account {
+        #[command(subcommand)]
+        command: account_cli::AccountCommand,
+    },
+
+    /// Keychain-backed agent credentials (values never via argv).
+    #[cfg(feature = "browser")]
+    Credential {
+        #[command(subcommand)]
+        command: account_cli::CredentialCommand,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +322,11 @@ async fn main() {
         oxibrowser_core::security::redact::set_extra_sensitive_headers(cli.redact_headers.clone());
     }
 
+    #[cfg(feature = "browser")]
+    let audit_ctx = account_cli::AuditContext {
+        path: effective_audit_path(&cli),
+    };
+
     let exit_code = match cli.command {
         Commands::Fetch {
             url,
@@ -315,6 +348,7 @@ async fn main() {
             har_raw,
             allow_private_ips,
             telemetry,
+            account,
             timeout,
         } => {
             run_fetch(
@@ -337,6 +371,7 @@ async fn main() {
                 har_raw,
                 allow_private_ips,
                 telemetry,
+                account.as_deref(),
                 timeout,
             )
             .await
@@ -381,6 +416,7 @@ async fn main() {
             proxy,
             auth_token,
             mcp,
+            account,
         } => {
             if mcp {
                 mcp::run_mcp_stdio(cookie_file.as_deref(), allow_private_ips, proxy).await
@@ -392,6 +428,8 @@ async fn main() {
                     allow_private_ips,
                     proxy,
                     auth_token,
+                    account.as_deref(),
+                    audit_ctx.path.clone(),
                 )
                 .await
             }
@@ -444,6 +482,10 @@ async fn main() {
                 0
             }
         }
+        #[cfg(feature = "browser")]
+        Commands::Account { command } => account_cli::run_account(command, audit_ctx.clone()).await,
+        #[cfg(feature = "browser")]
+        Commands::Credential { command } => account_cli::run_credential(command, audit_ctx).await,
     };
 
     if exit_code != 0 {
@@ -458,12 +500,27 @@ fn body_text(doc: &oxibrowser_core::js::dom_snapshot::DomSnapshot) -> Option<Str
     doc.text_content(body_id)
 }
 
+/// Resolved audit log path for subcommands needing an owned sink
+/// ([`account_cli::AuditContext`]): `--no-audit` → `None`, else `--audit
+/// PATH` or the default location.
+#[cfg(feature = "browser")]
+fn effective_audit_path(cli: &Cli) -> Option<PathBuf> {
+    if cli.no_audit {
+        None
+    } else {
+        Some(cli.audit.clone().unwrap_or_else(|| {
+            oxibrowser_core::security::audit::default_path()
+                .unwrap_or_else(|| PathBuf::from("/dev/null"))
+        }))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error output — human vs JSON
 // ---------------------------------------------------------------------------
 
 /// Print an error and return the exit code.
-fn print_error(msg: &str, error_code: &str, json: bool) -> i32 {
+pub(crate) fn print_error(msg: &str, error_code: &str, json: bool) -> i32 {
     let code = match error_code {
         "INVALID_URL" | "INVALID_SELECTOR" | "INPUT_VALIDATION" | "PATH_TRAVERSAL"
         | "SSRF_BLOCKED" => 2,
@@ -506,6 +563,7 @@ async fn run_fetch(
     har_raw: bool,
     allow_private_ips: bool,
     telemetry: bool,
+    account: Option<&str>,
     timeout: u64,
 ) -> i32 {
     let start = Instant::now();
@@ -539,11 +597,24 @@ async fn run_fetch(
         Ok(b) => b,
         Err(e) => return print_error(&format!("browser init failed: {e}"), "RUNTIME_ERROR", json),
     };
+    let browser = Arc::new(browser);
+
+    // `--account`: restore the envelope into a bound context and take the
+    // tab path (the only one that can run inside a non-default context).
+    let account_ctx = match account {
+        Some(id) => match account_cli::bind_account_context(&browser, id).await {
+            Ok(ctx) => Some(ctx),
+            Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
+        },
+        None => None,
+    };
+    let needs_tab = needs_tab || account_ctx.is_some();
 
     let result = if needs_tab {
         fetch_with_tab(
             start,
             &browser,
+            account_ctx.as_ref(),
             url,
             format,
             json,
@@ -867,6 +938,7 @@ async fn fetch_direct(
 async fn fetch_with_tab(
     start: Instant,
     browser: &oxibrowser_core::Browser,
+    account_ctx: Option<&Arc<oxibrowser_core::context::BrowserContext>>,
     url: &str,
     format: &str,
     json: bool,
@@ -886,7 +958,10 @@ async fn fetch_with_tab(
     har_raw: bool,
     timeout: u64,
 ) -> Result<(), FetchError> {
-    let tab = browser.new_tab().await.map_err(FetchError::from)?;
+    let tab = match account_ctx {
+        Some(ctx) => browser.new_tab_in(ctx).await.map_err(FetchError::from)?,
+        None => browser.new_tab().await.map_err(FetchError::from)?,
+    };
 
     let nav_result = tokio::time::timeout(Duration::from_secs(timeout), tab.goto(url)).await;
     match nav_result {
@@ -1408,6 +1483,8 @@ async fn run_serve(
     allow_private_ips: bool,
     proxy: Option<String>,
     auth_token: Option<String>,
+    accounts: Option<&str>,
+    audit_path: Option<std::path::PathBuf>,
 ) -> i32 {
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
         Ok(a) => a,
@@ -1450,6 +1527,76 @@ async fn run_serve(
     if let Some(token) = &auth_token {
         cdp_server = cdp_server.with_auth(token.clone());
     }
+
+    // `--account id[,id…]`: one context per account with its envelope
+    // restored (credential mode on); the first is the primary context. The
+    // login surface enables OXI.account* + viewer-role upgrades (§5.2).
+    if let Some(list) = accounts {
+        let ids: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            eprintln!("Error: --account requires at least one account id");
+            return 2;
+        }
+        let registry = match account_cli::oxi_accounts_registry() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
+        };
+        let (_manager, _login_browser, orch) =
+            match account_cli::login_stack(&registry, allow_private_ips).await {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return 1;
+                }
+            };
+        let surface = oxibrowser_cdp::LoginSurface::new(orch, browser.clone());
+        let mut primary = None;
+        for id in ids {
+            match account_cli::bind_account_context(&browser, id).await {
+                Ok(ctx) => {
+                    surface.bind(id, Arc::clone(&ctx));
+                    if primary.is_none() {
+                        primary = Some(ctx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return 1;
+                }
+            }
+        }
+        cdp_server = cdp_server.with_login(surface);
+        if let Some(ctx) = primary {
+            cdp_server = cdp_server.with_primary_context(ctx);
+        }
+    }
+
+    // Credential broker for account-bound serving: keychain provider +
+    // policy engine over the shared consent store. Fail-closed surface —
+    // when the keystore is unavailable the OXI credential/account commands
+    // answer `credentialsUnavailable` instead of half-working.
+    {
+        let broker = match account_cli::serve_credential_broker(account_cli::AuditContext {
+            path: audit_path.clone(),
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Warning: credential broker unavailable — {e}");
+                None
+            }
+        };
+        if let Some(b) = broker {
+            cdp_server = cdp_server.with_credentials_broker(b);
+        }
+    }
+
     let server = Arc::new(cdp_server);
     let bound_addr = match server.start().await {
         Ok(a) => a,
