@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1] - 2026-09-29
+
+Post-release hardening bundle.
+
+### Fixed
+- **CI on headless Linux** — `keyring` unit test panicked with
+  `NoDefaultStore` where no Secret Service daemon exists (ubuntu runners);
+  store-absence errors now skip with a note instead of failing.
+- **Restore-session leak** — `Target.createBrowserContext {oxiAccount}` and
+  `serve --account` left the one-shot envelope-restore session open
+  (a `max_sessions` slot + three bridge threads per call). Restore sessions
+  are closed and cleaned up after injection.
+- **Opaque-origin localStorage sharing** — `about:`/`data:` documents no
+  longer share a single `"null"` bucket; buckets are keyed by the full URL
+  (same URL revisits keep their storage, different `data:` URLs are
+  isolated).
+- **Keychain reads off the async runtime** — envelope restore in the CDP
+  account-context path and agent-login jar restore now run inside
+  `spawn_blocking` (sync keychain access no longer parks tokio workers).
+- Feature-gated clippy (`--features oxibrowser/browser`, `-D warnings`):
+  three `too_many_arguments` hits fixed per existing repo convention.
+
+
 ## [0.24.0] - 2026-09-29
 
 Account login session management — the Codex-Desktop-style account layer:

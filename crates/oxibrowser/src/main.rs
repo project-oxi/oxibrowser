@@ -1476,6 +1476,7 @@ async fn run_script(script_path_or_yaml: &str, timeout: u64) -> i32 {
 // ---------------------------------------------------------------------------
 // serve (CDP server)
 // ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)]
 async fn run_serve(
     host: &str,
     port: u16,

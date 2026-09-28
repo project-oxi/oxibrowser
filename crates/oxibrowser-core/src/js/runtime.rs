@@ -2317,9 +2317,11 @@ fn js_thread_loop(
                 // mirrors exactly that bucket — cross-origin bleeding is gone
                 // because each navigation swaps in its own origin's storage
                 // (this resolves the former TODO(#sop), which preserved one
-                // flat map across all navigations). Remaining limitation:
-                // opaque origins (`about:`, `data:`) all share the literal
-                // `"null"` bucket (documented M-A limitation). The origin is
+                // flat map across all navigations). Opaque origins
+                // (`about:`, `data:`) key their bucket by the full URL
+                // string (see `storage_origin_of`), so the same opaque URL
+                // revisits its own bucket while different opaque URLs stay
+                // isolated. The origin is
                 // also stamped onto outgoing LocalStorageMsg writes so the
                 // sync thread routes them to THIS bucket even if another
                 // navigation lands before the message is processed.

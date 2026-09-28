@@ -12,11 +12,12 @@
 //! cookies or web storage. The default context inherits the former global
 //! jar's role, keeping anonymous (context-unspecified) behavior unchanged.
 //!
-//! Known M-A limitation: opaque origins (`about:`, `data:` URLs) all serialize
-//! to the literal string `"null"` via
-//! [`url::Origin::ascii_serialization`] and therefore share one storage bucket.
-//! This mirrors what real browsers isolate further; per-opaque-origin
-//! partitioning is out of scope.
+//! Opaque origins (`about:`, `data:` URLs) have no tuple origin — their
+//! [`url::Origin::ascii_serialization`] is the literal string `"null"`.
+//! [`storage_origin_of`] keys them by the full URL string instead:
+//! revisiting the same opaque URL keeps its storage bucket while different
+//! opaque URLs stay isolated. (Real browsers isolate per opaque-origin
+//! instance; the URL-string key is the closest stable approximation.)
 
 use crate::network::HttpClient;
 use crate::network::cookie::CookieJar;
@@ -178,13 +179,22 @@ impl BrowserContext {
     }
 }
 
-/// Storage origin key for a URL: [`url::Origin::ascii_serialization`].
+/// Storage bucket key for `url`.
 ///
-/// Tuple origins serialize as `scheme://host[:port]`; opaque origins
-/// (`about:`, `data:`, …) all converge on `"null"` — the documented M-A
-/// limitation (see module docs).
+/// Tuple origins serialize as `scheme://host[:port]`. Opaque origins
+/// (`about:`, `data:`, …) serialize to the literal `"null"` via
+/// [`url::Origin::ascii_serialization`]; keying every opaque page on that
+/// one string would funnel them all into a single bucket, so they are keyed
+/// by their full URL string instead — revisiting the same `data:` URL keeps
+/// its bucket while different opaque URLs are isolated (see the module docs).
 pub fn storage_origin_of(url: &Url) -> String {
-    url.origin().ascii_serialization()
+    let origin = url.origin().ascii_serialization();
+    if origin == "null" {
+        // Opaque origin — bucket per full URL, not the shared "null".
+        url.as_str().to_string()
+    } else {
+        origin
+    }
 }
 
 #[cfg(test)]
@@ -221,11 +231,22 @@ mod tests {
         assert_eq!(storage_origin_of(&https), "https://github.com");
         assert_eq!(storage_origin_of(&other_port), "https://github.com:8443");
         assert_eq!(storage_origin_of(&https), storage_origin_of(&https));
-        // Opaque origins converge on "null" (documented M-A limitation).
+        // Opaque origins are keyed by the full URL string, not the shared
+        // "null": same URL → same bucket, different URLs → isolated.
         let about = Url::parse("about:blank").unwrap();
         let data = Url::parse("data:text/html,hi").unwrap();
-        assert_eq!(storage_origin_of(&about), "null");
-        assert_eq!(storage_origin_of(&data), "null");
+        assert_eq!(storage_origin_of(&about), "about:blank");
+        assert_eq!(storage_origin_of(&data), "data:text/html,hi");
+        // Revisiting the same opaque URL resolves to the same key.
+        assert_eq!(
+            storage_origin_of(&Url::parse("data:text/html,hi").unwrap()),
+            storage_origin_of(&data)
+        );
+        // Different opaque URLs never share a bucket.
+        assert_ne!(
+            storage_origin_of(&Url::parse("data:text/html,other").unwrap()),
+            storage_origin_of(&data)
+        );
     }
 
     #[test]

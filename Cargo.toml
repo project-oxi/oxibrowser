@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.24.0"
+version = "0.24.1"
 edition = "2024"
 license = "MIT"
 authors = ["project-oxi contributors"]
@@ -67,7 +67,7 @@ peniko = "0.6"
 png = "0.18"
 
 [workspace.metadata.release]
-version = "0.24.0"
+version = "0.24.1"
 
 [profile.release]
 strip = true

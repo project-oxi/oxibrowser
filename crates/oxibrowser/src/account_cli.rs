@@ -794,6 +794,7 @@ pub(crate) async fn login_stack(
     Ok((manager, browser, orch))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn account_login(
     id: &str,
     mode: &str,
@@ -1606,6 +1607,16 @@ pub(crate) async fn bind_account_context(
     let envelope = manager
         .restore(id, &mut guard, &session_keys(), Some(&current))
         .map_err(|e| e.to_string())?;
+    // The restore session is a one-shot injection channel: the envelope now
+    // lives in the context (shared jar + storage), so close the session and
+    // reclaim its slot — `serve --account` re-binds on every restart and
+    // would otherwise accumulate session slots plus runtime threads. Restore
+    // already succeeded, so close failures are warn-only.
+    if let Err(e) = guard.close().await {
+        tracing::warn!(error = %e, "account restore session close failed");
+    }
+    drop(guard);
+    browser.cleanup_closed_sessions();
     eprintln!(
         "account {id}: restored envelope ({} cookies, {} origins) into context {} \
          [credential mode on]",
@@ -1696,6 +1707,7 @@ fn otpauth_or_wrap(value: &str, slug: &str, scope: &str) -> Result<String, Strin
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn credential_put(
     agent: &str,
     site: &str,

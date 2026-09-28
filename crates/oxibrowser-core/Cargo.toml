@@ -1,6 +1,6 @@
 [package]
 name = "oxibrowser-core"
-version = "0.24.0"
+version = "0.24.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -45,7 +45,7 @@ wasmi = { workspace = true }
 chacha20poly1305 = "0.11"
 zeroize = "1.9"
 
-oxibrowser-render = { version = "0.24.0", path = "../oxibrowser-render" }
+oxibrowser-render = { version = "0.24.1", path = "../oxibrowser-render" }
 getrandom = { workspace = true }
 tokio-tungstenite = { workspace = true }
 

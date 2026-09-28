@@ -46,7 +46,7 @@ use tokio::sync::broadcast;
 use zeroize::Zeroizing;
 
 use crate::challenge::ChallengeKind;
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::js::dom_snapshot::{DomSnapshot, InteractiveElement};
 use crate::network::client::ChallengeOutcome;
 use crate::network::origin_policy::{Origin, OriginPolicy, RedirectVerdict};
@@ -990,16 +990,29 @@ impl AgentLoginEngine {
         session: &mut Session,
         record: &AccountRecord,
     ) -> Result<JarRestore> {
-        let restored = self.manager.restore(
-            account_id,
-            session,
-            self.keys.as_ref(),
-            Some(&self.current_fingerprint(session)),
-        );
-        let envelope = match restored {
+        // P4: loading the envelope does synchronous keychain + file IO —
+        // run it on the blocking pool so the tokio worker driving this
+        // engine never stalls. Injection is in-memory and stays inline.
+        let fingerprint = self.current_fingerprint(session);
+        let loaded = {
+            let manager = Arc::clone(&self.manager);
+            let keys = Arc::clone(&self.keys);
+            let account_id = account_id.to_string();
+            tokio::task::spawn_blocking(move || {
+                manager.load_envelope(&account_id, keys.as_ref(), Some(&fingerprint))
+            })
+            .await
+            .map_err(|e| CoreError::SessionError(format!("session_restore task failed: {e}")))?
+        };
+        let envelope = match loaded {
             Ok(envelope) => envelope,
             // No jar / fingerprint drift → fresh login (fail-open into the
             // credential-gated path, never into trust).
+            Err(_) => return Ok(JarRestore::Fresh),
+        };
+        let envelope = match self.manager.inject_envelope(account_id, session, envelope) {
+            Ok(envelope) => envelope,
+            // Same fail-open contract as the former whole-restore call.
             Err(_) => return Ok(JarRestore::Fresh),
         };
         self.audit_flow(

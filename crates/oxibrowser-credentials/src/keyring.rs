@@ -93,6 +93,23 @@ fn map_keyring_err(id: Option<&CredentialId>, e: keyring_core::Error) -> CredErr
     }
 }
 
+/// Store-absence family (mirrors the `KeyStoreUnavailable` grouping in
+/// [`map_keyring_err`]): the platform offers no usable default credential
+/// store — headless CI has no Secret Service, a locked keychain surfaces as
+/// `NoStorageAccess`/`PlatformFailure`. Tests that merely construct entries
+/// skip on these instead of panicking.
+#[cfg(test)]
+fn is_store_absent(e: &keyring_core::Error) -> bool {
+    use keyring_core::Error as KE;
+    matches!(
+        e,
+        KE::NoDefaultStore
+            | KE::NotSupportedByStore(_)
+            | KE::PlatformFailure(_)
+            | KE::NoStorageAccess(_)
+    )
+}
+
 fn entry_for(
     provider: &KeyringProvider,
     parts: &CredentialParts,
@@ -381,11 +398,35 @@ mod tests {
         ready().ok(); // store init is best-effort here; construction is the point
         let p = KeyringKeyProvider::new();
         let entry = keyring::v1::Entry::new(&p.service_of("example.com"), SESSION_KEY_ACCOUNT);
-        assert!(
-            entry.is_ok(),
-            "entry construction failed: {:?}",
-            entry.err()
-        );
+        match entry {
+            Ok(_) => {}
+            // Store-less hosts (headless CI Linux has no Secret Service)
+            // fail inside Entry::new itself. Construction semantics are only
+            // observable where a store exists; the real-store roundtrips are
+            // the #[ignore]d tests below — so skip instead of panicking.
+            Err(e) if is_store_absent(&e) => {
+                eprintln!("skipping entry-construction assert: no platform store: {e}");
+            }
+            Err(e) => panic!("entry construction failed: {e:?}"),
+        }
+    }
+
+    /// The skip predicate covers exactly the store-absence family — a
+    /// per-credential miss (`NoEntry`) is not a missing store and must
+    /// still fail the test.
+    #[test]
+    fn store_absence_errors_are_recognized() {
+        let absent = |msg: &str| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::<dyn std::error::Error + Send + Sync>::from(msg)
+        };
+        assert!(is_store_absent(&keyring_core::Error::NoDefaultStore));
+        assert!(is_store_absent(&keyring_core::Error::PlatformFailure(
+            absent("dbus not running")
+        )));
+        assert!(is_store_absent(&keyring_core::Error::NoStorageAccess(
+            absent("keychain locked")
+        )));
+        assert!(!is_store_absent(&keyring_core::Error::NoEntry));
     }
 
     /// Create-once + reuse roundtrip against the real login keychain.

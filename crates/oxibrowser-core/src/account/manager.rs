@@ -125,12 +125,27 @@ impl AccountManager {
         keys: &dyn KeyProvider,
         current: Option<&FingerprintMeta>,
     ) -> Result<SessionEnvelope> {
+        let envelope = self.load_envelope(account_id, keys, current)?;
+        self.inject_envelope(account_id, session, envelope)
+    }
+
+    /// Load `account_id`'s envelope without touching a session — the
+    /// blocking (keychain + file IO) half of [`AccountManager::restore`],
+    /// split out so async callers can run it under
+    /// `tokio::task::spawn_blocking` and inject separately. Fingerprint
+    /// mismatch is denied by default (fail-closed, FM-L2) and audited.
+    pub(crate) fn load_envelope(
+        &self,
+        account_id: &str,
+        keys: &dyn KeyProvider,
+        current: Option<&FingerprintMeta>,
+    ) -> Result<SessionEnvelope> {
         let record = self.registry.get(account_id)?;
-        let envelope = match self
+        match self
             .session_store(account_id)?
             .load(&record.scope, keys, current)
         {
-            Ok(env) => env,
+            Ok(env) => Ok(env),
             Err(err @ CoreError::SessionFingerprintMismatch(_)) => {
                 self.emit(
                     AuditEventKind::SessionRestore,
@@ -142,10 +157,22 @@ impl AccountManager {
                     ),
                     Some(record.scope.clone()),
                 );
-                return Err(err);
+                Err(err)
             }
-            Err(e) => return Err(e),
-        };
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Inject an already-loaded envelope into `session` and audit
+    /// `session_restore` (allow). The in-memory half of
+    /// [`AccountManager::restore`].
+    pub(crate) fn inject_envelope(
+        &self,
+        account_id: &str,
+        session: &mut Session,
+        envelope: SessionEnvelope,
+    ) -> Result<SessionEnvelope> {
+        let record = self.registry.get(account_id)?;
         session.import_state(&envelope.state)?;
         self.emit(
             AuditEventKind::SessionRestore,

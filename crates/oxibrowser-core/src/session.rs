@@ -202,9 +202,10 @@ pub struct Session {
     /// the current page's origin bucket; closing this session leaves the
     /// context map untouched.
     local_storage: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, String>>>>,
-    /// Origin key of the current page (`"null"` for opaque origins), shared
-    /// with the localStorage sync handler thread so JS writes land in the
-    /// right bucket. `None` until the first document injection.
+    /// Origin key of the current page (the full URL string for opaque
+    /// origins — see `storage_origin_of`), shared with the localStorage
+    /// sync handler thread so JS writes land in the right bucket. `None`
+    /// until the first document injection.
     current_origin: Arc<parking_lot::RwLock<Option<String>>>,
     /// Handle to the JS→sync-thread localStorage channel, used to drain
     /// pending writes (barrier) before snapshotting a bucket for navigation.
@@ -1925,8 +1926,9 @@ impl Session {
         // M-A: every document injection also re-points the storage origin at
         // THIS page's origin and swaps the JS-side localStorage to that
         // origin's context bucket — so values never bleed across origins
-        // (design §3.2). Opaque origins (`about:`, `data:`) converge on the
-        // literal `"null"` bucket (documented M-A limitation).
+        // (design §3.2). Opaque origins (`about:`, `data:`) key their bucket
+        // by the full URL string (see `storage_origin_of`); only an
+        // unparseable URL falls back to the literal `"null"` bucket.
         let page_origin = match Url::parse(&url) {
             Ok(u) => storage_origin_of(&u),
             Err(_) => "null".to_string(),
@@ -2354,7 +2356,7 @@ impl Session {
     ///
     /// Lands in the origin bucket selected by [`Session::storage_origin`] —
     /// the current page's origin when a page is open, else the last imported
-    /// storage state's origin, else the opaque `"null"` bucket.
+    /// storage state's origin, else the `"null"` bucket.
     pub fn set_local_storage(&self, key: impl Into<String>, value: impl Into<String>) {
         let origin = self.storage_origin();
         self.local_storage
@@ -2366,7 +2368,7 @@ impl Session {
 
     /// Origin bucket key for direct localStorage access: the current page's
     /// origin, else the origin of the last imported storage state, else the
-    /// opaque-origin bucket (`"null"`).
+    /// `"null"` bucket (no page and no import yet).
     fn storage_origin(&self) -> String {
         if let Some(origin) = self.current_origin.read().clone() {
             return origin;
@@ -3370,7 +3372,8 @@ mod tests {
             .expect("seed existing storage");
 
         // Import lands in the https://example.com bucket — it must not touch
-        // the opaque ("null") bucket the about: page writes into.
+        // the about:blank bucket (keyed by the URL string) the first page
+        // writes into.
         session
             .import_state(&StorageState {
                 cookies: vec![],
@@ -3390,8 +3393,9 @@ mod tests {
             })
             .expect("import");
 
-        // Revisiting about: swaps back to the "null" bucket: existing values
-        // persist, imported keys are absent (no cross-origin bleeding).
+        // Revisiting about:blank swaps back to its own bucket: existing
+        // values persist, imported keys are absent (no cross-origin
+        // bleeding).
         session
             .navigate("about:blank")
             .await
@@ -3515,19 +3519,43 @@ mod tests {
     #[tokio::test]
     async fn test_local_storage_persists_across_same_origin_revisit() {
         let mut session = make_session().await;
-        session
-            .navigate("data:text/html,<h1>one</h1>")
-            .await
-            .expect("data nav");
+        let url = "data:text/html,<h1>one</h1>";
+        session.navigate(url).await.expect("data nav");
         session
             .evaluate_js("localStorage.setItem('k', 'v')")
             .await
             .expect("setItem");
 
-        // Re-navigate (same opaque origin → "null" bucket): the JS-side map
-        // is re-seeded from the bucket, so the value survives — with NO wait
-        // between the write and the navigation (the drain barrier guarantees
-        // the sync thread applied the write before the seed is read).
+        // Re-navigate to the SAME opaque URL (its bucket key is the URL
+        // string — see `storage_origin_of`): the JS-side map is re-seeded
+        // from the bucket, so the value survives — with NO wait between the
+        // write and the navigation (the drain barrier guarantees the sync
+        // thread applied the write before the seed is read).
+        session.navigate(url).await.expect("same data nav");
+        let r = session
+            .evaluate_js("localStorage.getItem('k')")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::json!("v")),
+            "same-URL opaque revisit must keep localStorage"
+        );
+    }
+
+    /// P3: opaque origins are bucketed per full URL — two different `data:`
+    /// URLs are isolated buckets (they used to share one `"null"` bucket),
+    /// and each URL's bucket is retained for a later revisit.
+    #[tokio::test]
+    async fn test_local_storage_different_data_urls_are_isolated_buckets() {
+        let mut session = make_session().await;
+        let first = "data:text/html,<h1>one</h1>";
+        session.navigate(first).await.expect("first data nav");
+        session
+            .evaluate_js("localStorage.setItem('k', 'v1')")
+            .await
+            .expect("setItem");
+
         session
             .navigate("data:text/html,<h1>two</h1>")
             .await
@@ -3538,8 +3566,19 @@ mod tests {
             .expect("evaluate");
         assert_eq!(
             r.value,
-            Some(serde_json::json!("v")),
-            "same-origin revisit must keep localStorage"
+            Some(serde_json::Value::Null),
+            "a different data: URL must not see the first URL's bucket"
+        );
+
+        // The first URL's bucket survives untouched for its next visit.
+        let first_key = storage_origin_of(&Url::parse(first).unwrap());
+        let map = session.local_storage.read();
+        assert_eq!(
+            map.get(&first_key)
+                .and_then(|b| b.get("k"))
+                .map(String::as_str),
+            Some("v1"),
+            "first data: URL's bucket must be retained for revisit"
         );
     }
 
@@ -3576,7 +3615,8 @@ mod tests {
             "write must land in the writing origin's bucket"
         );
         assert!(
-            !map.get("null").is_some_and(|b| b.contains_key("secret")),
+            !map.get("about:blank")
+                .is_some_and(|b| b.contains_key("secret")),
             "write must not bleed into the new page's opaque bucket"
         );
     }

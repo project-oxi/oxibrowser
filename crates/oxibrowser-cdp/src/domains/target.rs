@@ -409,15 +409,35 @@ async fn create_account_context(
             .await
             .map_err(|e| err(format!("session init failed: {e}")))?;
         let keys = surface.orchestrator().shared_keys();
-        let mut guard = session.write().await;
         let current = oxibrowser_core::storage::session_store::FingerprintMeta {
-            user_agent: guard.effective_ua(),
+            user_agent: session.read().await.effective_ua(),
             ..oxibrowser_core::storage::session_store::FingerprintMeta::default()
         };
-        let envelope = manager
-            .restore(account_id, &mut guard, keys.as_ref(), Some(&current))
-            .map_err(|e| err(format!("accountAccessDenied: session_restore denied: {e}")))?;
+        // P4: `restore` reads the OS keychain and the envelope file
+        // synchronously — run the whole thing on the blocking pool so no
+        // tokio worker stalls while holding the session lock.
+        let manager = Arc::clone(&manager);
+        let account = account_id.to_string();
+        let restore_session = Arc::clone(&session);
+        let envelope = tokio::task::spawn_blocking(move || {
+            let mut guard = restore_session.blocking_write();
+            manager.restore(&account, &mut guard, keys.as_ref(), Some(&current))
+        })
+        .await
+        .map_err(|e| err(format!("session_restore failed: {e}")))?
+        .map_err(|e| err(format!("accountAccessDenied: session_restore denied: {e}")))?;
         restored = envelope.state.cookies.len();
+
+        // The restore session is a one-shot injection channel: the envelope
+        // now lives in the context (shared jar + storage), so close the
+        // session and reclaim its slot — otherwise every
+        // `createBrowserContext {oxiAccount}` leaks a session slot plus its
+        // runtime threads. Restore already succeeded, so close failures are
+        // warn-only.
+        if let Err(e) = session.write().await.close().await {
+            tracing::warn!(error = %e, "account restore session close failed");
+        }
+        ctx.browser.cleanup_closed_sessions();
     }
 
     audit_account_use(
@@ -1033,6 +1053,19 @@ mod tests {
         assert!(
             cookies.iter().any(|c| c.name == "sid"),
             "envelope restored into the context jar: {cookies:?}"
+        );
+
+        // P2: the one-shot restore session is closed and reclaimed — only
+        // the capture-setup session (session0) remains in browser.sessions.
+        assert_eq!(
+            browser.sessions().read().len(),
+            1,
+            "restore session must not linger after createBrowserContext"
+        );
+        let restored_jar = bound.cookie_jar().read().get_all();
+        assert!(
+            restored_jar.iter().any(|c| c.name == "sid"),
+            "restored envelope must survive the restore session's close"
         );
 
         // Unknown account → invalidAccount.
