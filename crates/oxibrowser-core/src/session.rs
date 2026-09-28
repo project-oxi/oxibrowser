@@ -5,6 +5,7 @@
 
 use crate::browser::BrowserId;
 use crate::config::BrowserConfig;
+use crate::context::{BrowserContext, storage_origin_of};
 use crate::error::{CoreError, Result};
 use crate::frame::Frame;
 use crate::frame::FrameId;
@@ -168,7 +169,10 @@ pub struct RequestOverrides {
     pub extra_headers: Vec<(String, String)>,
 }
 
-/// A browsing session with its own history, storage, and pages.
+/// A browsing session with its own history and pages, bound to a
+/// [`BrowserContext`] that provides the cookie jar, HTTP client, and
+/// origin-keyed localStorage (shared with sibling sessions of the same
+/// context — M-A).
 pub struct Session {
     /// Unique ID.
     id: SessionId,
@@ -177,9 +181,10 @@ pub struct Session {
     browser_id: BrowserId,
     /// Configuration.
     config: BrowserConfig,
-    /// HTTP client (shared from Browser).
+    /// HTTP client (derived from the session's [`BrowserContext`]).
     http_client: Arc<HttpClient>,
-    /// Cookie jar (may be shared or isolated).
+    /// Cookie jar (derived from the session's [`BrowserContext`] —
+    /// per-context isolation, M-A).
     #[allow(dead_code)]
     cookie_jar: Arc<RwLock<CookieJar>>,
     /// Active page (current document).
@@ -188,8 +193,23 @@ pub struct Session {
     history: Vec<Url>,
     /// Current position in history.
     history_index: usize,
-    /// Session-local storage (shared with localStorage sync handler thread).
-    local_storage: Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
+    /// Origin-keyed localStorage, **shared with the parent
+    /// [`BrowserContext`]** (and thus with sibling sessions of the same
+    /// context): `origin → {key → value}`. Writes from the JS thread land in
+    /// the current page's origin bucket; closing this session leaves the
+    /// context map untouched.
+    local_storage: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, String>>>>,
+    /// Origin key of the current page (`"null"` for opaque origins), shared
+    /// with the localStorage sync handler thread so JS writes land in the
+    /// right bucket. `None` until the first document injection.
+    current_origin: Arc<parking_lot::RwLock<Option<String>>>,
+    /// Handle to the JS→sync-thread localStorage channel, used to drain
+    /// pending writes (barrier) before snapshotting a bucket for navigation.
+    ls_tx: std::sync::mpsc::Sender<LocalStorageMsg>,
+    /// Origin of the most recently imported storage state; used to route
+    /// direct `get_local_storage`/`set_local_storage` calls when no page is
+    /// open (single-origin compat, design M6′).
+    last_import_origin: Option<String>,
     /// Stored response bodies (requestId -> body) for getResponseBody.
     response_bodies: Arc<parking_lot::RwLock<HashMap<String, CapturedResponse>>>,
     /// JS runtime (per-session).
@@ -260,10 +280,6 @@ pub struct Session {
     init_scripts: Vec<(String, String)>,
     /// Monotonic counter backing init-script ids (`"init-N"`, per session).
     init_script_counter: u64,
-    /// localStorage snapshot stashed by [`Session::import_state`] and handed
-    /// to the next `SetPageUrl` (i.e. the next document injection), which
-    /// seeds the JS-side storage and then drops it.
-    pending_seed: Option<HashMap<String, String>>,
 }
 
 /// Configurable download directory for `Content-Disposition: attachment`
@@ -795,24 +811,33 @@ pub(crate) fn handle_ws_requests(
 // ---------------------------------------------------------------------------
 // LocalStorage sync handler
 // ---------------------------------------------------------------------------
-/// Handle localStorage sync messages from the JS thread.
-///
-/// Updates the Session's shared `local_storage` HashMap in response to
-/// JS localStorage.setItem/removeItem/clear calls.
+/// Applies JS `localStorage.setItem/removeItem/clear` calls to the context's
+/// **origin-keyed** storage map: every message carries the origin captured at
+/// `register_local_storage` time, so a navigation that swaps the page before
+/// the message is processed cannot misroute (cross-origin bleed) or drop the
+/// write. A `Drain` barrier acknowledges once all previously queued messages
+/// have been applied.
 fn handle_local_storage_sync(
     ls_rx: std::sync::mpsc::Receiver<LocalStorageMsg>,
-    local_storage: Arc<parking_lot::RwLock<std::collections::HashMap<String, String>>>,
+    local_storage: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, String>>>>,
 ) {
     while let Ok(msg) = ls_rx.recv() {
         match msg {
-            LocalStorageMsg::SetItem(key, value) => {
-                local_storage.write().insert(key, value);
+            LocalStorageMsg::Drain(ack) => {
+                let _ = ack.send(());
             }
-            LocalStorageMsg::RemoveItem(key) => {
-                local_storage.write().remove(&key);
+            LocalStorageMsg::SetItem { origin, key, value } => {
+                local_storage
+                    .write()
+                    .entry(origin)
+                    .or_default()
+                    .insert(key, value);
             }
-            LocalStorageMsg::Clear => {
-                local_storage.write().clear();
+            LocalStorageMsg::RemoveItem { origin, key } => {
+                local_storage.write().entry(origin).or_default().remove(&key);
+            }
+            LocalStorageMsg::Clear { origin } => {
+                local_storage.write().entry(origin).or_default().clear();
             }
         }
     }
@@ -842,14 +867,20 @@ impl Drop for InFlightGuard {
 }
 
 impl Session {
-    /// Create a new session.
-    #[tracing::instrument(skip(config, http_client, cookie_jar), err)]
+    /// Create a new session bound to `context`.
+    ///
+    /// The session derives its HTTP client, cookie jar, and origin-keyed
+    /// localStorage map from the context — sessions sharing a context share
+    /// cookies and web storage; sessions in different contexts are fully
+    /// isolated (M-A).
+    #[tracing::instrument(skip(config, context), err)]
     pub async fn new(
         browser_id: BrowserId,
         config: BrowserConfig,
-        http_client: Arc<HttpClient>,
-        cookie_jar: Arc<RwLock<CookieJar>>,
+        context: Arc<BrowserContext>,
     ) -> Result<Self> {
+        let http_client = context.http_client();
+        let cookie_jar = context.cookie_jar().clone();
         let js_config = JsRuntimeConfig::from(&config);
 
         // Fetch channels: request sender (JS→background) + shared response
@@ -863,7 +894,7 @@ impl Session {
         // Create JS runtime and wire up fetch channels
         let mut js_runtime = JsRuntime::with_config(js_config);
         js_runtime.set_fetch_channel(fetch_tx, fetch_resp_rx);
-        js_runtime.set_local_storage_channel(ls_tx);
+        js_runtime.set_local_storage_channel(ls_tx.clone());
         // Dialog gate: shared cell for blocking alert/confirm/prompt, resolved
         // by the CDP layer via Page.handleJavaScriptDialog.
         let dialog_gate: crate::js::DialogGate = Arc::new(parking_lot::Mutex::new(None));
@@ -907,9 +938,18 @@ impl Session {
             handle_ws_requests(ws_req_rx, ws_event_tx);
         }));
 
-        // Spawn localStorage sync handler thread
-        let local_storage_arc =
-            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+        // Session-side origin tracking: used to route direct storage access
+        // (storage_origin) and to stamp each navigation's bucket seed. The
+        // localStorage sync thread no longer reads it — messages carry their
+        // own origin.
+        let current_origin: Arc<parking_lot::RwLock<Option<String>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+
+        // Spawn localStorage sync handler thread. The map is the context's
+        // origin-keyed storage map (shared with sibling sessions); each
+        // message carries its own origin so no shared origin cell is needed
+        // for routing.
+        let local_storage_arc = context.storage_map();
         let ls_arc_clone = local_storage_arc.clone();
         let local_storage_task = Some(std::thread::spawn(move || {
             handle_local_storage_sync(ls_rx, ls_arc_clone);
@@ -929,6 +969,9 @@ impl Session {
             history: Vec::new(),
             history_index: 0,
             local_storage: local_storage_arc,
+            current_origin,
+            ls_tx,
+            last_import_origin: None,
             response_bodies: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             js_runtime,
             fetch_task,
@@ -947,7 +990,6 @@ impl Session {
             offline,
             init_scripts: Vec::new(),
             init_script_counter: 0,
-            pending_seed: None,
         })
     }
 
@@ -1844,9 +1886,38 @@ impl Session {
         // re-registers the whole `window` global, so it must precede script
         // execution — otherwise any `window.*` properties a script sets
         // (window.onload handlers, framework globals, etc.) would be wiped.
-        // Consumes the storageState seed stashed by `import_state`, so the
-        // JS-side localStorage is seeded before init/page scripts run.
-        let seed = self.pending_seed.take();
+        // M-A: every document injection also re-points the storage origin at
+        // THIS page's origin and swaps the JS-side localStorage to that
+        // origin's context bucket — so values never bleed across origins
+        // (design §3.2). Opaque origins (`about:`, `data:`) converge on the
+        // literal `"null"` bucket (documented M-A limitation).
+        let page_origin = match Url::parse(&url) {
+            Ok(u) => storage_origin_of(&u),
+            Err(_) => "null".to_string(),
+        };
+        *self.current_origin.write() = Some(page_origin.clone());
+        // Synchronize JS-thread localStorage writes BEFORE reading this
+        // page's bucket: a Drain barrier acks only after the sync thread has
+        // applied every message queued before it, so the seed below can't
+        // miss a just-executed `localStorage.setItem(...)` (writes are also
+        // origin-stamped, so none can bleed into the new page's bucket).
+        // Timeout is a deadlock guard — the sync thread may be gone; warn
+        // and proceed.
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+        if self.ls_tx.send(LocalStorageMsg::Drain(ack_tx)).is_ok()
+            && ack_rx.recv_timeout(std::time::Duration::from_millis(250)).is_err()
+        {
+            tracing::warn!(
+                "localStorage drain barrier timed out; navigation seed may miss pending JS writes"
+            );
+        }
+        let seed = Some(
+            self.local_storage
+                .read()
+                .get(&page_origin)
+                .cloned()
+                .unwrap_or_default(),
+        );
         self.js_runtime.set_page_url_with_storage_seed(&url, seed);
         // Build/replace the render document AND execute the page's `<script>`
         // tags (Phase 1 keystone).
@@ -2242,8 +2313,30 @@ impl Session {
     }
 
     /// Set a local storage value.
+    ///
+    /// Lands in the origin bucket selected by [`Session::storage_origin`] —
+    /// the current page's origin when a page is open, else the last imported
+    /// storage state's origin, else the opaque `"null"` bucket.
     pub fn set_local_storage(&self, key: impl Into<String>, value: impl Into<String>) {
-        self.local_storage.write().insert(key.into(), value.into());
+        let origin = self.storage_origin();
+        self.local_storage
+            .write()
+            .entry(origin)
+            .or_default()
+            .insert(key.into(), value.into());
+    }
+
+    /// Origin bucket key for direct localStorage access: the current page's
+    /// origin, else the origin of the last imported storage state, else the
+    /// opaque-origin bucket (`"null"`).
+    fn storage_origin(&self) -> String {
+        if let Some(origin) = self.current_origin.read().clone() {
+            return origin;
+        }
+        if let Some(origin) = &self.last_import_origin {
+            return origin.clone();
+        }
+        "null".to_string()
     }
 
     /// Register an init script (Playwright `Page.addInitScript`).
@@ -2276,26 +2369,24 @@ impl Session {
 
     /// Export the session's storage state (Playwright `storageState`).
     ///
-    /// Cookies come from the session's [`CookieJar`]; localStorage is the
-    /// session's single storage map exported under **one** origin derived
-    /// from the current page URL. Limitation: the session keeps one flat
-    /// storage map, not per-origin partitions — entries stored while visiting
-    /// other origins are folded into the current origin's bucket (mirrored by
-    /// the TODO(#sop) cross-origin note on the `SetPageUrl` handler).
+    /// Cookies come from the session's [`CookieJar`]; localStorage carries the
+    /// **current page's origin bucket only** from the context's origin-keyed
+    /// map (single-origin compat, design M6′: multi-origin export is future
+    /// work). Entries stored while visiting other origins stay in their own
+    /// buckets and are not folded in.
     /// With no active page (or an opaque origin, e.g. `about:blank` / `data:`
     /// URLs), `origins` is empty.
     pub fn export_state(&self) -> crate::storage_state::StorageState {
         let cookies = self.cookie_jar.read().get_all();
         let origins = match self.current_url() {
-            Some(url) => match url.origin() {
-                url::Origin::Tuple(..) => {
-                    let map = self.local_storage.read();
-                    if map.is_empty() {
-                        Vec::new()
-                    } else {
+            Some(url) if matches!(url.origin(), url::Origin::Tuple(..)) => {
+                let origin_key = storage_origin_of(url);
+                let map = self.local_storage.read();
+                match map.get(&origin_key) {
+                    Some(bucket) if !bucket.is_empty() => {
                         vec![crate::storage_state::OriginState {
-                            origin: url.origin().ascii_serialization(),
-                            local_storage: map
+                            origin: origin_key,
+                            local_storage: bucket
                                 .iter()
                                 .map(|(k, v)| crate::storage_state::LocalStorageEntry {
                                     name: k.clone(),
@@ -2304,22 +2395,23 @@ impl Session {
                                 .collect(),
                         }]
                     }
+                    _ => Vec::new(),
                 }
-                _ => Vec::new(),
-            },
-            None => Vec::new(),
+            }
+            _ => Vec::new(),
         };
         crate::storage_state::StorageState { cookies, origins }
     }
 
     /// Import a storage state (Playwright `storageState` merge): cookies are
     /// merged into the session's [`CookieJar`] (same-name/path cookies per
-    /// domain are replaced), localStorage entries are injected into the
-    /// session storage map and stashed as a seed that the **next** document
-    /// injection hands to the JS thread (`SetPageUrl`), so `getItem` sees the
-    /// imported values after the following navigation. Limitation: as with
-    /// export, only the single flat session map exists — all origins' entries
-    /// merge into it (later origins overwrite earlier keys).
+    /// domain are replaced), and each `OriginState`'s localStorage entries
+    /// merge into **their own origin's bucket** of the context's origin-keyed
+    /// map — origin identity is preserved (fixes the former flat merge that
+    /// bled entries across origins). A subsequent navigation to a matching
+    /// origin hands that bucket to the JS thread via `SetPageUrl`; with no
+    /// page open, direct `get_local_storage`/`set_local_storage` calls route
+    /// to the last imported origin.
     pub fn import_state(&mut self, st: &crate::storage_state::StorageState) -> Result<()> {
         {
             let mut jar = self.cookie_jar.write();
@@ -2334,27 +2426,27 @@ impl Session {
         {
             let mut ls = self.local_storage.write();
             for origin in &st.origins {
+                let bucket = ls.entry(origin.origin.clone()).or_default();
                 for kv in &origin.local_storage {
-                    ls.insert(kv.name.clone(), kv.value.clone());
+                    bucket.insert(kv.name.clone(), kv.value.clone());
                 }
             }
         }
-        // Stash the full (post-injection) map: the JS-side storage starts
-        // empty on first registration, so the seed must carry everything the
-        // session map holds. Consumed on the next SetPageUrl.
-        let seed = self.local_storage.read().clone();
+        self.last_import_origin = st.origins.last().map(|o| o.origin.clone());
         tracing::debug!(
             origins = st.origins.len(),
-            keys = seed.len(),
-            "storageState localStorage seeded for next navigation"
+            "storageState localStorage merged into per-origin buckets"
         );
-        self.pending_seed = Some(seed);
         Ok(())
     }
 
     /// Get a local storage value.
+    ///
+    /// Reads the origin bucket selected by [`Session::storage_origin`] (see
+    /// [`Session::set_local_storage`]).
     pub fn get_local_storage(&self, key: &str) -> Option<String> {
-        self.local_storage.read().get(key).cloned()
+        let origin = self.storage_origin();
+        self.local_storage.read().get(&origin)?.get(key).cloned()
     }
 
     /// Store a response body for later retrieval (Network.getResponseBody).
@@ -2530,7 +2622,11 @@ impl Session {
         info!(id = %self.id, "session closed");
         self.active_page = None;
         self.history.clear();
-        self.local_storage.write().clear();
+        // Deliberately NOT clearing `local_storage`: the map is shared with
+        // the parent BrowserContext (M-A) — clearing here would wipe sibling
+        // sessions' storage and defeat per-context persistence. Context
+        // storage is disposed via `BrowserContext::clear_storage` /
+        // `Browser::dispose_context` (M-B+).
         Ok(())
     }
 
@@ -2738,18 +2834,34 @@ mod tests {
     use super::*;
     use crate::browser::BrowserId;
     use crate::config::BrowserConfig;
+    use crate::context::ContextId;
     use crate::network::HttpClient;
     use crate::network::cookie::CookieJar;
     use crate::page::Page;
+
+    /// Session-bound [`BrowserContext`] with a fresh jar/client and the
+    /// given config.
+    fn make_context(config: &BrowserConfig) -> Arc<BrowserContext> {
+        let http_client = Arc::new(HttpClient::new(
+            config,
+            Arc::new(RwLock::new(CookieJar::new())),
+        )
+        .unwrap());
+        Arc::new(BrowserContext::with_cookie_jar(
+            ContextId::test_next(),
+            None,
+            http_client,
+            Arc::new(RwLock::new(CookieJar::new())),
+        ))
+    }
 
     /// Build a Session with SSRF disabled (so tests can reach loopback mocks)
     /// and the default (high) nav-script limits.
     async fn make_session() -> Session {
         let mut config = BrowserConfig::headless();
         config.enable_ssrf_filter = false;
-        let cookie_jar = Arc::new(RwLock::new(CookieJar::new()));
-        let http_client = Arc::new(HttpClient::new(&config, cookie_jar.clone()).unwrap());
-        Session::new(BrowserId::next(), config, http_client, cookie_jar)
+        let context = make_context(&config);
+        Session::new(BrowserId::next(), config, context)
             .await
             .unwrap()
     }
@@ -2759,9 +2871,8 @@ mod tests {
         let mut config = BrowserConfig::headless();
         config.enable_ssrf_filter = false;
         let configured = config.user_agent.clone();
-        let cookie_jar = Arc::new(RwLock::new(CookieJar::new()));
-        let http_client = Arc::new(HttpClient::new(&config, cookie_jar.clone()).unwrap());
-        let mut session = Session::new(BrowserId::next(), config, http_client, cookie_jar)
+        let context = make_context(&config);
+        let mut session = Session::new(BrowserId::next(), config, context)
             .await
             .unwrap();
 
@@ -3014,7 +3125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storage_state_seed_restores_local_storage_after_navigate() {
+    async fn test_import_state_restores_local_storage_on_same_origin() {
         use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
         let mut session = make_session().await;
         session
@@ -3030,9 +3141,17 @@ mod tests {
             })
             .expect("import");
 
-        // The next navigation consumes the pending seed via SetPageUrl; the
-        // JS-side localStorage starts from the seed map.
-        session.navigate("about:blank").await.expect("navigate");
+        // M-A: the imported bucket is handed to the JS thread when a page on
+        // the SAME origin is injected — not to whatever origin loads next.
+        let page = Page::from_html(
+            Url::parse("https://example.com/x").unwrap(),
+            "<html><body></body></html>",
+            200,
+            "text/html".into(),
+        )
+        .await
+        .unwrap();
+        session.inject_dom_snapshot_for_test(page).await;
         let r = session
             .evaluate_js("localStorage.getItem('token')")
             .await
@@ -3040,12 +3159,24 @@ mod tests {
         assert_eq!(
             r.value,
             Some(serde_json::json!("t0k3n")),
-            "imported localStorage must be visible after the next navigation"
+            "imported localStorage must be visible on its own origin"
+        );
+
+        // And must NOT bleed onto a different (opaque) origin.
+        session.navigate("about:blank").await.expect("navigate");
+        let r = session
+            .evaluate_js("localStorage.getItem('token')")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::Value::Null),
+            "imported origin's localStorage must not bleed across origins"
         );
     }
 
     #[tokio::test]
-    async fn test_storage_state_seed_merges_into_existing_local_storage() {
+    async fn test_import_state_merges_into_per_origin_buckets() {
         use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
         let mut session = make_session().await;
         session
@@ -3057,7 +3188,8 @@ mod tests {
             .await
             .expect("seed existing storage");
 
-        // Import overwrites 'a', adds 'b', and must preserve 'c'.
+        // Import lands in the https://example.com bucket — it must not touch
+        // the opaque ("null") bucket the about: page writes into.
         session
             .import_state(&StorageState {
                 cookies: vec![],
@@ -3076,11 +3208,13 @@ mod tests {
                 }],
             })
             .expect("import");
+
+        // Revisiting about: swaps back to the "null" bucket: existing values
+        // persist, imported keys are absent (no cross-origin bleeding).
         session
             .navigate("about:blank")
             .await
             .expect("second navigate");
-
         let r = session
             .evaluate_js(
                 "(function(){ return { a: localStorage.getItem('a'), \
@@ -3091,14 +3225,215 @@ mod tests {
         let o = r.value.expect("object result");
         assert_eq!(
             o["a"],
-            serde_json::json!("2"),
-            "seed key overwrites existing"
+            serde_json::json!("1"),
+            "opaque-origin bucket is untouched by the import"
         );
-        assert_eq!(o["b"], serde_json::json!("3"), "seed key is added");
+        assert_eq!(
+            o["b"],
+            serde_json::Value::Null,
+            "imported keys must not bleed across origins"
+        );
+        assert_eq!(o["c"], serde_json::json!("1"));
+
+        // Loading the imported origin serves that origin's own bucket.
+        let page = Page::from_html(
+            Url::parse("https://example.com/x").unwrap(),
+            "<html><body></body></html>",
+            200,
+            "text/html".into(),
+        )
+        .await
+        .unwrap();
+        session.inject_dom_snapshot_for_test(page).await;
+        let r = session
+            .evaluate_js(
+                "(function(){ return { a: localStorage.getItem('a'), \
+                 b: localStorage.getItem('b'), c: localStorage.getItem('c') }; })()",
+            )
+            .await
+            .expect("evaluate");
+        let o = r.value.expect("object result");
+        assert_eq!(o["a"], serde_json::json!("2"), "import overwrote the key");
+        assert_eq!(o["b"], serde_json::json!("3"), "import added the key");
         assert_eq!(
             o["c"],
-            serde_json::json!("1"),
-            "existing non-seed key is preserved"
+            serde_json::Value::Null,
+            "other origin's keys stay partitioned"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn test_import_state_two_origins_route_to_own_buckets() {
+        use crate::storage_state::{LocalStorageEntry, OriginState, StorageState};
+        let mut session = make_session().await;
+        session
+            .import_state(&StorageState {
+                cookies: vec![],
+                origins: vec![
+                    OriginState {
+                        origin: "https://a.test".into(),
+                        local_storage: vec![LocalStorageEntry {
+                            name: "ka".into(),
+                            value: "va".into(),
+                        }],
+                    },
+                    OriginState {
+                        origin: "https://b.test".into(),
+                        local_storage: vec![LocalStorageEntry {
+                            name: "kb".into(),
+                            value: "vb".into(),
+                        }],
+                    },
+                ],
+            })
+            .expect("import");
+
+        // No page open: direct access routes to the LAST imported origin.
+        assert_eq!(
+            session.get_local_storage("kb").as_deref(),
+            Some("vb"),
+            "last imported origin is the fallback route"
+        );
+        assert_eq!(
+            session.get_local_storage("ka"),
+            None,
+            "the other origin's keys must not be visible through b.test"
+        );
+
+        // Each page origin serves exactly its own bucket via JS.
+        for (page_url, own_key, own_val, other_key) in [
+            ("https://a.test/", "ka", "va", "kb"),
+            ("https://b.test/", "kb", "vb", "ka"),
+        ] {
+            let page = Page::from_html(
+                Url::parse(page_url).unwrap(),
+                "<html><body></body></html>",
+                200,
+                "text/html".into(),
+            )
+            .await
+            .unwrap();
+            session.inject_dom_snapshot_for_test(page).await;
+            let r = session
+                .evaluate_js(&format!(
+                    "(function(){{ return {{ own: localStorage.getItem('{own_key}'), \
+                     other: localStorage.getItem('{other_key}') }}; }})()"
+                ))
+                .await
+                .expect("evaluate");
+            let o = r.value.expect("object result");
+            assert_eq!(o["own"], serde_json::json!(own_val));
+            assert_eq!(
+                o["other"],
+                serde_json::Value::Null,
+                "buckets stay partitioned per origin"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_storage_persists_across_same_origin_revisit() {
+        let mut session = make_session().await;
+        session
+            .navigate("data:text/html,<h1>one</h1>")
+            .await
+            .expect("data nav");
+        session
+            .evaluate_js("localStorage.setItem('k', 'v')")
+            .await
+            .expect("setItem");
+
+        // Re-navigate (same opaque origin → "null" bucket): the JS-side map
+        // is re-seeded from the bucket, so the value survives — with NO wait
+        // between the write and the navigation (the drain barrier guarantees
+        // the sync thread applied the write before the seed is read).
+        session
+            .navigate("data:text/html,<h1>two</h1>")
+            .await
+            .expect("second data nav");
+        let r = session
+            .evaluate_js("localStorage.getItem('k')")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::json!("v")),
+            "same-origin revisit must keep localStorage"
+        );
+    }
+
+    /// F2 (a): a `setItem` immediately followed by a cross-origin navigation
+    /// must land in the WRITING page's origin bucket (messages carry their
+    /// origin), never in the new page's bucket. No polling/wait: the write is
+    /// still in flight when the navigation starts.
+    #[tokio::test]
+    async fn test_local_storage_write_immediately_before_nav_lands_in_own_bucket() {
+        let mut session = make_session().await;
+        let page = Page::from_html(
+            Url::parse("https://write.test/").unwrap(),
+            "<html><body></body></html>",
+            200,
+            "text/html".into(),
+        )
+        .await
+        .unwrap();
+        session.inject_dom_snapshot_for_test(page).await;
+        session
+            .evaluate_js("localStorage.setItem('secret', 's1')")
+            .await
+            .expect("setItem");
+
+        // Immediate cross-origin navigation (opaque origin, no network wait).
+        session.navigate("about:blank").await.expect("nav");
+
+        let map = session.local_storage.read().clone();
+        assert_eq!(
+            map.get("https://write.test").and_then(|b| b.get("secret")).map(String::as_str),
+            Some("s1"),
+            "write must land in the writing origin's bucket"
+        );
+        assert!(
+            !map.get("null").is_some_and(|b| b.contains_key("secret")),
+            "write must not bleed into the new page's opaque bucket"
+        );
+    }
+
+    /// F2 (b): a `setItem` immediately before navigation must survive a
+    /// same-origin revisit — the drain barrier ensures the pending write is
+    /// applied before the navigation seeds the JS-side map from the bucket.
+    #[tokio::test]
+    async fn test_local_storage_write_immediately_before_nav_survives_revisit() {
+        let mut session = make_session().await;
+        let mk_page = || async {
+            Page::from_html(
+                Url::parse("https://write.test/").unwrap(),
+                "<html><body></body></html>",
+                200,
+                "text/html".into(),
+            )
+            .await
+            .unwrap()
+        };
+        session.inject_dom_snapshot_for_test(mk_page().await).await;
+        session
+            .evaluate_js("localStorage.setItem('k', 'v2')")
+            .await
+            .expect("setItem");
+
+        // Immediate away + back, no waits anywhere.
+        session.navigate("about:blank").await.expect("away nav");
+        session
+            .inject_dom_snapshot_for_test(mk_page().await)
+            .await;
+        let r = session
+            .evaluate_js("localStorage.getItem('k')")
+            .await
+            .expect("evaluate");
+        assert_eq!(
+            r.value,
+            Some(serde_json::json!("v2")),
+            "pending write must be applied before the revisit seeds storage"
         );
     }
 

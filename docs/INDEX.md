@@ -47,6 +47,7 @@ Total active docs (root + `design/` + `designs/` + `research/`): **30** `.md` fi
 | `session-a-web-platform.md` | Session A working notes — web platform side |
 | `session-b-cdp-perf.md` | Session B working notes — CDP perf side |
 | `2026-09-27-agent-auth-implementation.md` | Agent unattended auth — implementation design (from `research/` 2026-09-27) |
+| `2026-09-28-account-login-session-management.md` | Account layer: login session management, browser-context sandbox, login orchestration (amends 2026-09-27 M5/M6/M8, adds M-A~M-D) |
 
 
 ## `research/` — dated research reports (2026-09-27: agent unattended authentication)

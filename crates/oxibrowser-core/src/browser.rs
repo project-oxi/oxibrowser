@@ -4,6 +4,7 @@
 
 use crate::browse_result::BrowseResult;
 use crate::config::BrowserConfig;
+use crate::context::{BrowserContext, ContextConfig, ContextId};
 use crate::error::{CoreError, Result};
 use crate::event::BrowserEvent;
 use crate::network::HttpClient;
@@ -12,6 +13,7 @@ use crate::security::audit;
 use crate::session::Session;
 use crate::tab::Tab;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::broadcast;
@@ -37,18 +39,26 @@ impl std::fmt::Display for BrowserId {
 /// The top-level browser instance.
 ///
 /// A Browser can hold multiple Sessions (browsing contexts), each with its own
-/// cookie jar, storage, and pages.
+/// cookie jar, storage, and pages. All sessions hang off a
+/// [`BrowserContext`] (M-A): the default (anonymous) context inherits the
+/// former global jar's role; additional contexts isolate jar + storage + egress.
 pub struct Browser {
     /// Unique ID.
     id: BrowserId,
     /// Configuration.
     config: BrowserConfig,
-    /// Shared HTTP client.
+    /// Shared HTTP client (also the default context's client).
     http_client: Arc<HttpClient>,
     /// Active sessions.
     sessions: RwLock<Vec<Arc<tokio::sync::RwLock<Session>>>>,
-    /// Global cookie jar (shared across sessions by default).
-    cookie_jar: Arc<RwLock<CookieJar>>,
+    /// Default (anonymous) context — every context-less `new_session` /
+    /// `new_tab` lands here. Owns the cookie-file-loaded jar.
+    default_context: Arc<BrowserContext>,
+    /// Named contexts created via [`Browser::new_context`].
+    contexts: RwLock<HashMap<ContextId, Arc<BrowserContext>>>,
+    /// Monotonic counter backing [`ContextId`]s (`ctx-<n>`); the default
+    /// context consumes `ctx-1`.
+    context_seq: AtomicU64,
     /// Whether the browser has been closed.
     closed: std::sync::atomic::AtomicBool,
     /// Number of active Tab sessions (not in the sessions vec).
@@ -89,6 +99,15 @@ impl Browser {
 
         let cookie_jar = Arc::new(RwLock::new(cookie_jar));
         let http_client = Arc::new(HttpClient::new(&config, cookie_jar.clone())?);
+        // Default (anonymous) context: inherits the former global jar role and
+        // the browser's HTTP client. `ctx-1` is reserved for it; named
+        // contexts continue the sequence.
+        let default_context = Arc::new(BrowserContext::with_cookie_jar(
+            ContextId("ctx-1".into()),
+            None,
+            http_client.clone(),
+            cookie_jar,
+        ));
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
         // 32 slots = generous headroom; we emit ≤4 events per page load.
         let (event_tx, _) = broadcast::channel::<BrowserEvent>(32);
@@ -101,7 +120,9 @@ impl Browser {
             config,
             http_client,
             sessions: RwLock::new(Vec::new()),
-            cookie_jar,
+            default_context,
+            contexts: RwLock::new(HashMap::new()),
+            context_seq: AtomicU64::new(2),
             closed: std::sync::atomic::AtomicBool::new(false),
             tab_count: Arc::new(AtomicUsize::new(0)),
             shutdown_tx,
@@ -109,12 +130,31 @@ impl Browser {
         })
     }
 
+    /// Mint the next context id (`ctx-<n>`); `ctx-1` is the default context.
+    fn next_context_id(&self) -> ContextId {
+        let n = self.context_seq.fetch_add(1, Ordering::Relaxed);
+        ContextId(format!("ctx-{n}"))
+    }
+
     /// Create a new browsing session.
     ///
     /// A session represents a browsing context group (cookie jar, session
-    /// storage, navigation history).
+    /// storage, navigation history). Lands on the default (anonymous)
+    /// context — see [`Browser::new_session_in`] for per-context sessions.
     #[tracing::instrument(skip(self), fields(id = %self.id), err)]
     pub async fn new_session(&self) -> Result<Arc<tokio::sync::RwLock<Session>>> {
+        self.new_session_in(&self.default_context).await
+    }
+
+    /// Create a new browsing session bound to `ctx`.
+    ///
+    /// The session derives its cookie jar, HTTP client, and origin-keyed
+    /// localStorage from `ctx` — full isolation from other contexts.
+    #[tracing::instrument(skip(self, ctx), fields(id = %self.id), err)]
+    pub async fn new_session_in(
+        &self,
+        ctx: &Arc<BrowserContext>,
+    ) -> Result<Arc<tokio::sync::RwLock<Session>>> {
         self.ensure_open()?;
 
         // Check capacity: both CDP sessions and Tab sessions count.
@@ -125,19 +165,14 @@ impl Browser {
             ));
         }
 
-        let session = Session::new(
-            self.id,
-            self.config.clone(),
-            self.http_client.clone(),
-            self.cookie_jar.clone(),
-        )
-        .await?;
+        let session = Session::new(self.id, self.config.clone(), ctx.clone()).await?;
 
         let session = Arc::new(tokio::sync::RwLock::new(session));
         self.sessions.write().push(session.clone());
 
         info!(
             session_count = self.sessions.read().len(),
+            context = %ctx.id(),
             "new session created"
         );
         Ok(session)
@@ -180,6 +215,13 @@ impl Browser {
     /// subscribers of `subscribe_events()`.
     #[tracing::instrument(skip(self), fields(id = %self.id), err)]
     pub async fn new_tab(&self) -> Result<Tab> {
+        self.new_tab_in(&self.default_context).await
+    }
+
+    /// Open an interactive tab bound to `ctx` (per-context isolation —
+    /// see [`Browser::new_tab`]).
+    #[tracing::instrument(skip(self, ctx), fields(id = %self.id), err)]
+    pub async fn new_tab_in(&self, ctx: &Arc<BrowserContext>) -> Result<Tab> {
         self.ensure_open()?;
 
         // Check capacity against tracked sessions
@@ -192,17 +234,12 @@ impl Browser {
 
         self.tab_count.fetch_add(1, Ordering::Relaxed);
 
-        let session = Session::new(
-            self.id,
-            self.config.clone(),
-            self.http_client.clone(),
-            self.cookie_jar.clone(),
-        )
-        .await?;
+        let session = Session::new(self.id, self.config.clone(), ctx.clone()).await?;
 
         let tab_id = uuid::Uuid::new_v4();
         tracing::info!(
             session_count = self.sessions.read().len(),
+            context = %ctx.id(),
             tab_id = %tab_id,
             "new tab created"
         );
@@ -229,9 +266,11 @@ impl Browser {
             return Ok(()); // Already closed
         }
 
-        // Save cookies to disk if a cookie_file path is configured
+        // Save cookies to disk if a cookie_file path is configured. The file
+        // has always backed the default (anonymous) jar — named contexts are
+        // in-memory only (M-A).
         if let Some(path) = &self.config.cookie_file {
-            let jar = self.cookie_jar.read();
+            let jar = self.default_context.cookie_jar().read();
             let save_result = jar.save_to_file(path);
             drop(jar);
             match save_result {
@@ -254,17 +293,21 @@ impl Browser {
             }
         }
 
-        // Dispose of the in-memory jar so session cookies never outlive the
-        // browser (design §7 P0-3). `cookie_file` users already persisted above.
+        // Dispose of the in-memory jars so session cookies never outlive the
+        // browser (design §7 P0-3) — the default jar plus every named
+        // context's jar. `cookie_file` users already persisted above.
         if self.config.clear_cookies_on_close {
-            let cleared = self.cookie_jar.write().clear_and_count();
+            let mut cleared = self.default_context.cookie_jar().write().clear_and_count();
+            for ctx in self.contexts.read().values() {
+                cleared += ctx.cookie_jar().write().clear_and_count();
+            }
             if cleared > 0 {
                 audit::record(audit::event(
                     audit::AuditEventKind::SessionTeardown,
                     audit::AuditDecision::Allow,
                     "browser_close",
                 ));
-                info!(cleared, "cookie jar cleared on close");
+                info!(cleared, "cookie jars cleared on close");
             }
         }
 
@@ -321,9 +364,90 @@ impl Browser {
         &self.http_client
     }
 
-    /// Get the global cookie jar.
+    /// Get the default (anonymous) context.
+    pub fn default_context(&self) -> Arc<BrowserContext> {
+        self.default_context.clone()
+    }
+
+    /// Look up a context by ID (default or named).
+    pub fn context(&self, id: &ContextId) -> Option<Arc<BrowserContext>> {
+        if id == self.default_context.id() {
+            return Some(self.default_context.clone());
+        }
+        self.contexts.read().get(id).cloned()
+    }
+
+    /// Create a new isolated browser context.
+    ///
+    /// The context gets a dedicated cookie jar and its own origin-keyed
+    /// storage map, and a dedicated [`HttpClient`] **bound to that same
+    /// jar** — sharing the browser client would route all session HTTP
+    /// traffic (navigate, subresources, POSTs) into the default context's
+    /// jar, defeating isolation. `cfg.proxy` fixes the context's egress and
+    /// must parse as an http/https/socks4/socks5 URL; anything else is
+    /// rejected instead of silently degrading to direct egress.
+    #[tracing::instrument(skip(self, cfg), fields(id = %self.id), err)]
+    pub fn new_context(&self, cfg: ContextConfig) -> Result<Arc<BrowserContext>> {
+        self.ensure_open()?;
+        if let Some(proxy) = &cfg.proxy {
+            let url = url::Url::parse(proxy)
+                .map_err(|e| CoreError::SessionError(format!("invalid proxyServer {proxy:?}: {e}")))?;
+            if !matches!(url.scheme(), "http" | "https" | "socks4" | "socks5") {
+                return Err(CoreError::SessionError(format!(
+                    "unsupported proxyServer scheme {:?} in {proxy:?}",
+                    url.scheme()
+                )));
+            }
+        }
+        let id = self.next_context_id();
+        let jar = Arc::new(RwLock::new(CookieJar::new()));
+        let mut ctx_config = self.config.clone();
+        ctx_config.proxy = cfg.proxy.clone();
+        let http_client = Arc::new(HttpClient::new(&ctx_config, jar.clone())?);
+        let ctx = Arc::new(BrowserContext::with_cookie_jar(
+            id,
+            cfg.label,
+            http_client,
+            jar,
+        ));
+        self.contexts.write().insert(ctx.id().clone(), ctx.clone());
+        info!(context = %ctx.id(), "browser context created");
+        Ok(ctx)
+    }
+
+    /// Dispose of a named context: it is removed from the registry and its
+    /// cookie jar is cleared immediately.
+    ///
+    /// Live sessions keep the context's `Arc` alive and continue to work,
+    /// but the jar's cookies must never outlive the context (design §7
+    /// P0-3) — sessions holding an `Arc` past `Browser::close` would
+    /// otherwise still be able to read them.
+    pub fn dispose_context(&self, id: &ContextId) -> Result<()> {
+        if id == self.default_context.id() {
+            return Err(CoreError::SessionError(
+                "cannot dispose the default context".into(),
+            ));
+        }
+        match self.contexts.write().remove(id) {
+            Some(ctx) => {
+                let cleared = ctx.cookie_jar().write().clear_and_count();
+                if cleared > 0 {
+                    audit::record(audit::event(
+                        audit::AuditEventKind::SessionTeardown,
+                        audit::AuditDecision::Allow,
+                        format!("context_disposed context={} cookies={cleared}", ctx.id()),
+                    ));
+                }
+                info!(context = %ctx.id(), "browser context disposed");
+                Ok(())
+            }
+            None => Err(CoreError::SessionError(format!("unknown context {id}"))),
+        }
+    }
+
+    /// Get the default context's cookie jar (the former global jar).
     pub fn cookie_jar(&self) -> &Arc<RwLock<CookieJar>> {
-        &self.cookie_jar
+        self.default_context.cookie_jar()
     }
 
     /// Get active sessions.
@@ -594,6 +718,278 @@ mod tests {
                 assert_eq!(url, "https://example.com");
             }
             other => panic!("expected NavigationStarted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_ids_sequence_and_lookup() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        // ctx-1 is reserved for the default context.
+        assert_eq!(
+            browser.default_context().id().to_string(),
+            "ctx-1",
+            "default context must be ctx-1"
+        );
+        let c1 = browser
+            .new_context(ContextConfig {
+                label: Some("acct".into()),
+                proxy: None,
+            })
+            .unwrap();
+        let c2 = browser.new_context(ContextConfig::default()).unwrap();
+        assert_eq!(c1.id().to_string(), "ctx-2");
+        assert_eq!(c2.id().to_string(), "ctx-3");
+        assert_eq!(c1.label(), Some("acct"));
+        assert_eq!(c2.label(), None);
+        assert!(browser.context(c1.id()).is_some());
+        assert!(Arc::ptr_eq(&browser.context(c1.id()).unwrap(), &c1));
+        assert!(browser.context(&ContextId("ctx-99".into())).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_contexts_isolate_cookie_jars() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        let c1 = browser.new_context(ContextConfig::default()).unwrap();
+        let c2 = browser.new_context(ContextConfig::default()).unwrap();
+        let url = url::Url::parse("https://example.com/").unwrap();
+
+        {
+            let mut jar = c1.cookie_jar().write();
+            jar.store(&url, "sid=c1; Path=/");
+        }
+        assert_eq!(c1.cookie_jar().read().get_all().len(), 1);
+        assert!(
+            c2.cookie_jar().read().get_all().is_empty(),
+            "sibling context must not see c1's cookies"
+        );
+        assert!(
+            browser.default_context().cookie_jar().read().get_all().is_empty(),
+            "default context must not see c1's cookies"
+        );
+
+        // Sessions inherit exactly their context's jar (same Arc).
+        let s1 = browser.new_session_in(&c1).await.unwrap();
+        let s2 = browser.new_session_in(&c2).await.unwrap();
+        assert!(Arc::ptr_eq(
+            s1.read().await.cookie_jar(),
+            c1.cookie_jar()
+        ));
+        assert!(Arc::ptr_eq(
+            s2.read().await.cookie_jar(),
+            c2.cookie_jar()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_context_proxy_gets_dedicated_client() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        let proxied = browser
+            .new_context(ContextConfig {
+                label: None,
+                proxy: Some("http://127.0.0.1:1".into()),
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &proxied.http_client(),
+            browser.http_client()
+        ));
+        // No proxy → still a dedicated client (bound to the context's own
+        // jar — sharing the browser client would route session HTTP traffic
+        // into the default jar).
+        let plain = browser.new_context(ContextConfig::default()).unwrap();
+        assert!(!Arc::ptr_eq(
+            &plain.http_client(),
+            browser.http_client()
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_dispose_context_rules() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        let ctx = browser.new_context(ContextConfig::default()).unwrap();
+
+        // The default context can never be disposed.
+        let result = browser.dispose_context(browser.default_context().id());
+        assert!(
+            matches!(&result, Err(CoreError::SessionError(msg)) if msg.contains("default")),
+            "default dispose must be refused, got {result:?}"
+        );
+
+        // Disposal removes the registry entry only — the session keeps its
+        // Arc and stays fully functional.
+        let session = browser.new_session_in(&ctx).await.unwrap();
+        session.write().await.set_local_storage("k", "v");
+        assert!(browser.dispose_context(ctx.id()).is_ok());
+        assert!(browser.context(ctx.id()).is_none());
+        assert_eq!(
+            session.read().await.get_local_storage("k").as_deref(),
+            Some("v")
+        );
+
+        // Unknown ids error.
+        assert!(browser.dispose_context(&ContextId("ctx-999".into())).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_close_clears_all_context_jars() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        let c1 = browser.new_context(ContextConfig::default()).unwrap();
+        let url = url::Url::parse("https://example.com/").unwrap();
+        browser.cookie_jar().write().store(&url, "sid=d; Path=/");
+        c1.cookie_jar().write().store(&url, "sid=c1; Path=/");
+
+        browser.close().await.unwrap();
+        assert!(browser.cookie_jar().read().get_all().is_empty());
+        assert!(
+            c1.cookie_jar().read().get_all().is_empty(),
+            "close must clear every context's jar"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_close_keeps_context_storage() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        let ctx = browser.new_context(ContextConfig::default()).unwrap();
+
+        let session = browser.new_session_in(&ctx).await.unwrap();
+        session.write().await.set_local_storage("tok", "abc");
+        session.write().await.close().await.unwrap();
+        assert_eq!(
+            ctx.storage_bucket("null").get("tok").map(String::as_str),
+            Some("abc"),
+            "context storage must survive session close"
+        );
+
+        // A sibling session of the same context observes the storage.
+        let sibling = browser.new_session_in(&ctx).await.unwrap();
+        assert_eq!(
+            sibling.read().await.get_local_storage("tok").as_deref(),
+            Some("abc")
+        );
+    }
+
+    /// F1: a named context's HTTP traffic (navigate fetch carries Set-Cookie)
+    /// must land in the CONTEXT's jar — never the default jar, and never a
+    /// throwaway jar the JS `document.cookie` bridge can't see.
+    #[tokio::test]
+    async fn test_context_http_cookies_land_in_context_jar() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ctx"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>hi</body></html>")
+                    .insert_header("content-type", "text/html")
+                    .insert_header("set-cookie", "ctxc=1; Path=/"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>hi</body></html>")
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = BrowserConfig::headless();
+        config.enable_ssrf_filter = false; // reach the loopback mock
+        let browser = Browser::new(config).await.unwrap();
+        let ctx = browser
+            .new_context(ContextConfig {
+                label: Some("iso".into()),
+                proxy: None,
+            })
+            .unwrap();
+        let tab = browser.new_tab_in(&ctx).await.unwrap();
+        tab.goto(&format!("{}/ctx", server.uri())).await.unwrap();
+
+        let url = url::Url::parse(&server.uri()).unwrap();
+        let ctx_cookie = ctx.cookie_jar().read().cookies_for_js(&url);
+        assert!(
+            ctx_cookie.contains("ctxc=1"),
+            "Set-Cookie from context navigation must land in the context jar, got: {ctx_cookie:?}"
+        );
+        let default_cookie = browser.cookie_jar().read().cookies_for_js(&url);
+        assert!(
+            !default_cookie.contains("ctxc"),
+            "context cookies must not bleed into the default jar, got: {default_cookie:?}"
+        );
+        // The JS bridge reads the context jar too, so document.cookie sees it.
+        let doc = tab.evaluate("document.cookie").await.unwrap();
+        let doc = doc.as_str().unwrap_or_default();
+        assert!(
+            doc.contains("ctxc=1"),
+            "document.cookie must observe the context jar, got: {doc:?}"
+        );
+
+        // A default-context tab must NOT see the context cookie.
+        let default_tab = browser.new_tab().await.unwrap();
+        default_tab.goto(&format!("{}/", server.uri())).await.unwrap();
+        let doc = default_tab.evaluate("document.cookie").await.unwrap();
+        let doc = doc.as_str().unwrap_or_default();
+        assert!(
+            !doc.contains("ctxc"),
+            "default-context sessions must not observe context cookies, got: {doc:?}"
+        );
+    }
+
+    /// F3: dispose_context must clear the jar immediately — a session that
+    /// keeps the context Arc alive past dispose (or past Browser::close) must
+    /// not be able to read the disposed context's cookies.
+    #[tokio::test]
+    async fn test_dispose_context_clears_jar() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        let ctx = browser
+            .new_context(ContextConfig {
+                label: None,
+                proxy: None,
+            })
+            .unwrap();
+        let url = url::Url::parse("https://keep.test/").unwrap();
+        ctx.cookie_jar()
+            .write()
+            .store(&url, "sid=leak-me; Path=/");
+        assert!(!ctx.cookie_jar().read().is_empty());
+        let _session = browser.new_session_in(&ctx).await.unwrap();
+
+        browser.dispose_context(ctx.id()).unwrap();
+        assert!(
+            ctx.cookie_jar().read().is_empty(),
+            "disposed context jar must be cleared even though the session keeps the Arc alive"
+        );
+    }
+
+    /// F4: an invalid proxyServer must fail new_context instead of silently
+    /// degrading the context to direct egress.
+    #[tokio::test]
+    async fn test_new_context_rejects_invalid_proxy() {
+        let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
+        for bad in ["not a url", "ftp://proxy.test:1080", "://oops", ""] {
+            let Err(err) = browser.new_context(ContextConfig {
+                label: None,
+                proxy: Some(bad.to_string()),
+            }) else {
+                panic!("proxy {bad:?} must be rejected");
+            };
+            assert!(
+                matches!(&err, CoreError::SessionError(m) if m.contains("proxyServer")),
+                "error should mention proxyServer, got: {err:?}"
+            );
+        }
+        // Valid schemes are accepted.
+        for ok in ["http://proxy.test:8080", "socks5://proxy.test:1080"] {
+            browser
+                .new_context(ContextConfig {
+                    label: None,
+                    proxy: Some(ok.to_string()),
+                })
+                .unwrap_or_else(|e| panic!("proxy {ok:?} must be accepted: {e}"));
         }
     }
 }

@@ -915,6 +915,10 @@ PR 하나가 커지면 도메인 게이트부터 잘라낸다(M4는 게이트 �
 | M0.1 잔여 | ✅ 해소 | 전역 `--redact-header NAME`(fetch·serve 공통) — `redact::active_profile()`로 HAR·CDP 이벤트 URL 모두 확장 헤더 적용 |
 | M2 이하 | ⬜ 미구현 | |
 
+> **2026-09-28 정정**: M5(역할 인지 takeover로 확장)·M6(core 이동 + (account_id, scope) 키로 재키)·
+> M8(M-A 위에 구축)의 범위와 신규 마일스톤 M-A~M-D는
+> `2026-09-28-account-login-session-management.md`(계정 로그인 세션 관리 상위 설계)에서 정의한다.
+
 ---
 
 ## 9. 실패 모드

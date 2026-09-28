@@ -1210,14 +1210,24 @@ fn content_type_mime(headers: &[(String, String)]) -> String {
 // ---------------------------------------------------------------------------
 
 /// Messages sent from JS localStorage operations to Session for sync.
+///
+/// Every write carries the origin captured at `register_local_storage` time
+/// (the page URL the storage object was seeded for) so the sync thread
+/// routes it to that origin's bucket even if a navigation swaps the page
+/// before the message is processed — no shared "current origin" lookup at
+/// processing time.
 #[derive(Debug)]
 pub enum LocalStorageMsg {
-    /// localStorage.setItem(key, value)
-    SetItem(String, String),
-    /// localStorage.removeItem(key)
-    RemoveItem(String),
-    /// localStorage.clear()
-    Clear,
+    /// localStorage.setItem(key, value) for `origin`'s bucket.
+    SetItem { origin: String, key: String, value: String },
+    /// localStorage.removeItem(key) from `origin`'s bucket.
+    RemoveItem { origin: String, key: String },
+    /// localStorage.clear() on `origin`'s bucket.
+    Clear { origin: String },
+    /// Synchronous barrier: the sync thread replies once every previously
+    /// queued message has been applied. Used by Session before it snapshots
+    /// a bucket for a navigation seed.
+    Drain(std::sync::mpsc::Sender<()>),
 }
 
 // ---------------------------------------------------------------------------
@@ -1630,12 +1640,11 @@ impl JsRuntime {
         self.set_page_url_with_storage_seed(url, None);
     }
 
-    /// Update the page URL and (re-)seed the JS-side localStorage from an
-    /// imported [`crate::storage_state::StorageState`]: on first registration
-    /// the storage starts from the seed map; if the storage global already
-    /// exists the seed is merged into it (existing keys preserved, seed keys
-    /// overwrite). Consumed by the navigate path after
-    /// `Session::import_state`.
+    /// Update the page URL and swap the JS-side localStorage to the supplied
+    /// storage map: the map **replaces** whatever the JS thread held (M-A —
+    /// callers pass the current page's origin bucket from the shared context
+    /// map on every navigation). `None`/`set_page_url` registers an empty
+    /// storage.
     pub fn set_page_url_with_storage_seed(
         &mut self,
         url: &str,
@@ -2298,57 +2307,28 @@ fn js_thread_loop(
                     &render_doc_cell,
                     telemetry,
                 );
-                // Preserve localStorage across URL changes.
-                // TODO(#sop): Check same-origin before preserving localStorage.
-                // Currently preserves across all navigations, including cross-origin.
-                // In a production browser, localStorage should be scoped per-origin.
-                // The same single-origin limitation applies to imported storage
-                // state (see `Session::export_state`/`import_state`): a seed is a
-                // flat map with no origin partition, so it lands on whatever
-                // origin loads next.
-                //
-                // Only re-register localStorage if it hasn't been registered yet;
-                // otherwise the existing JS-side storage object persists across navigations
-                // (same-origin policy would be checked in a full implementation).
-                // Previously this always re-registered with an empty HashMap, wiping storage.
-                let existing_ls = ctx
-                    .global_object()
-                    .get(js_string!("localStorage"), &mut ctx)
-                    .ok();
-                if existing_ls
-                    .as_ref()
-                    .is_none_or(|v| v.is_undefined() || v.is_null())
-                {
-                    // First time — register fresh, starting from the imported
-                    // storageState seed when one was supplied (empty otherwise)
-                    // so `getItem` sees imported values on the very first
-                    // navigation after an import.
-                    register_local_storage(
-                        &mut ctx,
-                        seed_storage.unwrap_or_default(),
-                        &dom_snapshot_ref,
-                        local_storage_tx_arc.clone(),
-                    );
-                } else if let Some(seed) = seed_storage {
-                    // localStorage already exists: merge the seed into it —
-                    // existing keys are preserved, seed keys overwrite
-                    // (storageState import semantics, mirroring what a real
-                    // browser does when a stored origin's entries are applied).
-                    let mut seeded = 0usize;
-                    for (k, v) in seed {
-                        seeded += 1;
-                        let snippet = format!(
-                            "try {{ localStorage.setItem({}, {}); }} catch (e) {{}}",
-                            serde_json::to_string(&k).unwrap_or_else(|_| "\"\"".to_string()),
-                            serde_json::to_string(&v).unwrap_or_else(|_| "\"\"".to_string()),
-                        );
-                        if let Err(e) = ctx.eval(Source::from_bytes(&snippet)) {
-                            tracing::warn!(error = %e, "storageState localStorage seed merge failed");
-                        }
-                    }
-                    tracing::debug!(keys = seeded, "seeded storageState into live localStorage");
-                }
-                // else: localStorage already exists, preserve it across navigation
+                // M-A: the seed is the origin-keyed bucket for THIS page,
+                // derived by Session from the shared context map on every
+                // document injection. Always re-register so the JS-side map
+                // mirrors exactly that bucket — cross-origin bleeding is gone
+                // because each navigation swaps in its own origin's storage
+                // (this resolves the former TODO(#sop), which preserved one
+                // flat map across all navigations). Remaining limitation:
+                // opaque origins (`about:`, `data:`) all share the literal
+                // `"null"` bucket (documented M-A limitation). The origin is
+                // also stamped onto outgoing LocalStorageMsg writes so the
+                // sync thread routes them to THIS bucket even if another
+                // navigation lands before the message is processed.
+                let ls_origin = url::Url::parse(&url)
+                    .map(|u| crate::context::storage_origin_of(&u))
+                    .unwrap_or_else(|_| "null".to_string());
+                register_local_storage(
+                    &mut ctx,
+                    seed_storage.unwrap_or_default(),
+                    &dom_snapshot_ref,
+                    local_storage_tx_arc.clone(),
+                    ls_origin,
+                );
                 let _ = response_tx.send(JsResponse::Done);
             }
             JsCommand::SetMediaColorScheme { dark, response_tx } => {
@@ -9643,6 +9623,7 @@ fn register_local_storage(
     storage: std::collections::HashMap<String, String>,
     _dom_snapshot: &Arc<RwLock<Option<DomSnapshot>>>,
     local_storage_tx: Arc<RwLock<Option<std::sync::mpsc::Sender<LocalStorageMsg>>>>,
+    origin: String,
 ) {
     // Build a JS object with Storage interface methods
     // We store the HashMap in a RefCell so JS can mutate it.
@@ -9672,6 +9653,7 @@ fn register_local_storage(
     // --- setItem ---
     let set_storage = storage_arc.clone();
     let set_ls_tx = local_storage_tx.clone();
+    let set_origin = origin.clone();
     let set_item_fn = unsafe {
         NativeFunction::from_closure(
             move |_this: &JsValue, args: &[JsValue], ctx: &mut Context| {
@@ -9685,10 +9667,14 @@ fn register_local_storage(
                         .map(|s| s.to_std_string_escaped())
                         .unwrap_or_default();
                     set_storage.borrow_mut().insert(key.clone(), val.clone());
-                    // Sync to Session
+                    // Sync to Session (origin-stamped)
                     let tx_opt = { set_ls_tx.read().as_ref().cloned() };
                     if let Some(tx) = tx_opt {
-                        let _ = tx.send(LocalStorageMsg::SetItem(key, val));
+                        let _ = tx.send(LocalStorageMsg::SetItem {
+                            origin: set_origin.clone(),
+                            key,
+                            value: val,
+                        });
                     }
                 }
                 Ok(JsValue::undefined())
@@ -9699,6 +9685,7 @@ fn register_local_storage(
     // --- removeItem ---
     let rem_storage = storage_arc.clone();
     let rem_ls_tx = local_storage_tx.clone();
+    let rem_origin = origin.clone();
     let remove_item_fn = unsafe {
         NativeFunction::from_closure(
             move |_this: &JsValue, args: &[JsValue], ctx: &mut Context| {
@@ -9708,10 +9695,13 @@ fn register_local_storage(
                         .map(|s| s.to_std_string_escaped())
                         .unwrap_or_default();
                     rem_storage.borrow_mut().remove(&key);
-                    // Sync to Session
+                    // Sync to Session (origin-stamped)
                     let tx_opt = { rem_ls_tx.read().as_ref().cloned() };
                     if let Some(tx) = tx_opt {
-                        let _ = tx.send(LocalStorageMsg::RemoveItem(key));
+                        let _ = tx.send(LocalStorageMsg::RemoveItem {
+                            origin: rem_origin.clone(),
+                            key,
+                        });
                     }
                 }
                 Ok(JsValue::undefined())
@@ -9722,14 +9712,17 @@ fn register_local_storage(
     // --- clear ---
     let clear_storage = storage_arc.clone();
     let clear_ls_tx = local_storage_tx.clone();
+    let clear_origin = origin;
     let clear_fn = unsafe {
         NativeFunction::from_closure(
             move |_this: &JsValue, _args: &[JsValue], _ctx: &mut Context| {
                 clear_storage.borrow_mut().clear();
-                // Sync to Session
+                // Sync to Session (origin-stamped)
                 let tx_opt = { clear_ls_tx.read().as_ref().cloned() };
                 if let Some(tx) = tx_opt {
-                    let _ = tx.send(LocalStorageMsg::Clear);
+                    let _ = tx.send(LocalStorageMsg::Clear {
+                        origin: clear_origin.clone(),
+                    });
                 }
                 Ok(JsValue::undefined())
             },

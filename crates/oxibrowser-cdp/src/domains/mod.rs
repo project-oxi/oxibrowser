@@ -35,6 +35,8 @@ pub struct TargetEntry {
     pub session: Arc<RwLock<Session>>,
     /// Handle to the child's CoreEvent drainer task, aborted on close/detach.
     pub drain_abort: Option<tokio::task::AbortHandle>,
+    /// Real browser context id (`ctx-N`) the target was created in.
+    pub browser_context_id: String,
 }
 
 /// Registry of attached child targets (multi-tab), keyed by CDP sessionId.

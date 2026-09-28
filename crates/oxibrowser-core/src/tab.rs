@@ -1079,9 +1079,18 @@ mod tests {
     /// Helper: create a Tab with a session loaded with an HTML page.
     async fn tab_with_html(html: &str) -> Tab {
         let config = BrowserConfig::headless();
-        let cookie_jar = Arc::new(RwLock::new(CookieJar::new()));
-        let http_client = Arc::new(HttpClient::new(&config, cookie_jar.clone()).unwrap());
-        let mut session = Session::new(BrowserId::next(), config, http_client, cookie_jar)
+        let http_client = Arc::new(HttpClient::new(
+            &config,
+            Arc::new(RwLock::new(CookieJar::new())),
+        )
+        .unwrap());
+        let context = Arc::new(crate::context::BrowserContext::with_cookie_jar(
+            crate::context::ContextId::test_next(),
+            None,
+            http_client,
+            Arc::new(RwLock::new(CookieJar::new())),
+        ));
+        let mut session = Session::new(BrowserId::next(), config, context)
             .await
             .unwrap();
 

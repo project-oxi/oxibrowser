@@ -19,8 +19,10 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "detachFromTarget" => detach_from_target(params, ctx).await,
         "createTarget" => create_target(params, ctx).await,
         "closeTarget" => close_target(params, ctx).await,
+        "createBrowserContext" => create_browser_context(params, ctx),
+        "disposeBrowserContext" => dispose_browser_context(params, ctx),
         "getTargets" => get_targets(ctx).await,
-        "getTargetInfo" => get_target_info(params),
+        "getTargetInfo" => get_target_info(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
             message: format!("Target.{} not implemented", method),
@@ -41,6 +43,7 @@ fn set_discover_targets(params: Option<Value>, ctx: &DispatchContext) -> DomainR
 
     if discover {
         // Emit targetCreated for the default page target
+        let context_id = ctx.browser.default_context().id().to_string();
         ctx.events.send_event(
             "Target.targetCreated",
             json!({
@@ -51,7 +54,7 @@ fn set_discover_targets(params: Option<Value>, ctx: &DispatchContext) -> DomainR
                     "url": "about:blank",
                     "attached": false,
                     "canAccessOpener": false,
-                    "browserContextId": "default"
+                    "browserContextId": context_id
                 }
             }),
         );
@@ -78,6 +81,7 @@ fn set_auto_attach(params: Option<Value>, ctx: &DispatchContext) -> DomainResult
     if auto_attach {
         let session_id = format!("session-{}", uuid::Uuid::new_v4().as_simple());
         let attached_session_id = session_id.clone();
+        let context_id = ctx.browser.default_context().id().to_string();
 
         // Emit attachedToTarget for the default target
         ctx.events.send_event(
@@ -91,7 +95,7 @@ fn set_auto_attach(params: Option<Value>, ctx: &DispatchContext) -> DomainResult
                     "url": "about:blank",
                     "attached": true,
                     "canAccessOpener": false,
-                    "browserContextId": "default"
+                    "browserContextId": context_id
                 },
                 "waitingForDebugger": false
             }),
@@ -119,8 +123,11 @@ fn attach_to_target(params: Option<Value>, ctx: &DispatchContext) -> DomainResul
 /// Target.createTarget — creates a new page target (a real Browser session).
 ///
 /// The new session is registered under a fresh `sessionId` so flat-protocol
-/// commands routed by that `sessionId` reach it. Emits `Target.targetCreated`
-/// and `Target.attachedToTarget`.
+/// commands routed by that `sessionId` reach it. The optional
+/// `browserContextId` parameter selects the browser context (cookie jar,
+/// storage, egress) the target lives in; when absent the browser's default
+/// context is used. Emits `Target.targetCreated` and
+/// `Target.attachedToTarget` carrying the real context id.
 ///
 /// Child-target lifecycle events (load, etc.) currently do not flow (each child
 /// needs its own CoreEvent drainer); the command surface (navigate/evaluate/DOM)
@@ -132,10 +139,28 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
         .and_then(|v| v.as_str())
         .unwrap_or("about:blank");
 
-    let new_session = ctx.browser.new_session().await.map_err(|e| CdpError {
-        code: -32000,
-        message: format!("failed to create new session: {e}"),
-    })?;
+    // Resolve the target's browser context: explicit `browserContextId`,
+    // else the browser's default (anonymous) context.
+    let context = match params.get("browserContextId").and_then(|v| v.as_str()) {
+        Some(id) => ctx
+            .browser
+            .context(&oxibrowser_core::ContextId::from_string(id))
+            .ok_or_else(|| CdpError {
+                code: -32000,
+                message: "invalid browserContextId".to_string(),
+            })?,
+        None => ctx.browser.default_context(),
+    };
+    let context_id = context.id().to_string();
+
+    let new_session = ctx
+        .browser
+        .new_session_in(&context)
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: format!("failed to create new session: {e}"),
+        })?;
 
     let target_id = format!("TID-{}", uuid::Uuid::new_v4().as_simple());
     let session_id = format!("session-{}", uuid::Uuid::new_v4().as_simple());
@@ -172,6 +197,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
                 target_id: target_id.clone(),
                 session: new_session.clone(),
                 drain_abort: Some(drain_handle.abort_handle()),
+                browser_context_id: context_id.clone(),
             },
         )
         .await;
@@ -186,7 +212,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
                 "url": url,
                 "attached": false,
                 "canAccessOpener": false,
-                "browserContextId": "default"
+                "browserContextId": context_id
             }
         }),
     );
@@ -201,7 +227,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
                 "url": url,
                 "attached": true,
                 "canAccessOpener": false,
-                "browserContextId": "default"
+                "browserContextId": context_id
             },
             "waitingForDebugger": false
         }),
@@ -257,6 +283,65 @@ async fn close_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRes
     Ok(Some(json!({ "targetId": target_id, "success": true })))
 }
 
+/// Target.createBrowserContext — creates a new isolated browser context.
+///
+/// Returns `{"browserContextId": "ctx-N"}`. Standard parameters:
+/// `disposeOnDetach` and `proxyBypassList` are accepted but currently
+/// ignored; `proxyServer` fixes the context's egress proxy. The extension
+/// parameter `oxiAccount` is rejected with an honest error until account
+/// binding lands (M-D).
+fn create_browser_context(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+
+    if params.get("oxiAccount").is_some() {
+        return Err(CdpError {
+            code: -32000,
+            message: "account binding not yet implemented".to_string(),
+        });
+    }
+    let _dispose_on_detach = params.get("disposeOnDetach").and_then(|v| v.as_bool());
+    let proxy = params
+        .get("proxyServer")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let context = ctx
+        .browser
+        .new_context(oxibrowser_core::ContextConfig { label: None, proxy })
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: format!("failed to create browser context: {e}"),
+        })?;
+
+    Ok(Some(json!({
+        "browserContextId": context.id().to_string()
+    })))
+}
+
+/// Target.disposeBrowserContext — disposes a previously created context.
+///
+/// The default context cannot be disposed; unknown ids yield `-32000`.
+fn dispose_browser_context(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_default();
+    let id = params
+        .get("browserContextId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "browserContextId required".to_string(),
+        })?;
+
+    ctx.browser
+        .dispose_context(&oxibrowser_core::ContextId::from_string(id))
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+    Ok(Some(json!({})))
+}
+
 /// Target.detachFromTarget — detaches from a child target session.
 ///
 /// Aborts the child's event drainer and removes it from the registry; the
@@ -279,8 +364,10 @@ async fn detach_from_target(params: Option<Value>, ctx: &DispatchContext) -> Dom
 
 /// Target.getTargets — returns list of available targets.
 ///
-/// Lists the root `default` target plus every registered child target.
+/// Lists the root `default` target plus every registered child target,
+/// each carrying its real browser context id.
 async fn get_targets(ctx: &DispatchContext) -> DomainResult {
+    let default_context_id = ctx.browser.default_context().id().to_string();
     let mut infos = vec![json!({
         "targetId": "default",
         "type": "page",
@@ -288,7 +375,7 @@ async fn get_targets(ctx: &DispatchContext) -> DomainResult {
         "url": "about:blank",
         "attached": false,
         "canAccessOpener": false,
-        "browserContextId": "default"
+        "browserContextId": default_context_id
     })];
     for (_, entry) in ctx.child_targets.entries().await {
         infos.push(json!({
@@ -298,19 +385,28 @@ async fn get_targets(ctx: &DispatchContext) -> DomainResult {
             "url": "about:blank",
             "attached": true,
             "canAccessOpener": false,
-            "browserContextId": "default"
+            "browserContextId": entry.browser_context_id
         }));
     }
     Ok(Some(json!({ "targetInfos": infos })))
 }
 
 /// Target.getTargetInfo — returns info about a specific target.
-fn get_target_info(params: Option<Value>) -> DomainResult {
+///
+/// Registered child targets report their real browser context id; the root
+/// `default` target (and unknown ids, for compatibility) report the default
+/// context's id.
+async fn get_target_info(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let params = params.unwrap_or_default();
     let target_id = params
         .get("targetId")
         .and_then(|v| v.as_str())
         .unwrap_or("default");
+
+    let context_id = match ctx.child_targets.get(target_id).await {
+        Some(entry) => entry.browser_context_id,
+        None => ctx.browser.default_context().id().to_string(),
+    };
 
     Ok(Some(json!({
         "targetInfo": {
@@ -320,7 +416,7 @@ fn get_target_info(params: Option<Value>) -> DomainResult {
             "url": "about:blank",
             "attached": false,
             "canAccessOpener": false,
-            "browserContextId": "default"
+            "browserContextId": context_id
         }
     })))
 }
@@ -346,6 +442,7 @@ mod tests {
                     target_id: "TID-a".into(),
                     session: session.clone(),
                     drain_abort: None,
+                    browser_context_id: "ctx-1".into(),
                 },
             )
             .await;
@@ -356,6 +453,7 @@ mod tests {
                     target_id: "TID-b".into(),
                     session: session.clone(),
                     drain_abort: None,
+                    browser_context_id: "ctx-1".into(),
                 },
             )
             .await;
@@ -381,5 +479,226 @@ mod tests {
         assert_eq!(detached.target_id, "TID-a");
         assert!(registry.detach("session-a").await.is_none());
         assert!(registry.entries().await.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Browser contexts (M-A): Target.createBrowserContext / disposeBrowserContext
+    // and createTarget(browserContextId).
+    // ------------------------------------------------------------------
+
+    use super::*;
+
+    /// Build a DispatchContext backed by a real Browser session.
+    async fn make_ctx() -> (DispatchContext, crate::event::EventReceiver) {
+        let mut config = BrowserConfig::headless();
+        config.enable_ssrf_filter = false;
+        let browser = Arc::new(Browser::new(config).await.unwrap());
+        let session = browser.new_session().await.unwrap();
+        let (events, rx) = crate::event::event_channel();
+        let ctx = DispatchContext {
+            session,
+            events,
+            fetch_registry: oxibrowser_core::network::intercept::shared_registry(),
+            dialog_gate: Arc::new(parking_lot::Mutex::new(None)),
+            browser,
+            child_targets: Arc::new(crate::domains::TargetRegistry::new()),
+        };
+        (ctx, rx)
+    }
+
+    /// DispatchContext variant whose `session` is a child target's session,
+    /// so domain handlers (Network cookies, …) operate on that child.
+    fn child_ctx(
+        ctx: &DispatchContext,
+        session: Arc<tokio::sync::RwLock<oxibrowser_core::session::Session>>,
+    ) -> DispatchContext {
+        DispatchContext {
+            session,
+            events: ctx.events.clone(),
+            fetch_registry: ctx.fetch_registry.clone(),
+            dialog_gate: ctx.dialog_gate.clone(),
+            browser: ctx.browser.clone(),
+            child_targets: ctx.child_targets.clone(),
+        }
+    }
+
+    /// Look up the registry entry for a targetId.
+    async fn entry_for(ctx: &DispatchContext, target_id: &str) -> crate::domains::TargetEntry {
+        ctx.child_targets
+            .entries()
+            .await
+            .into_iter()
+            .find(|(_, e)| e.target_id == target_id)
+            .map(|(_, e)| e)
+            .unwrap_or_else(|| panic!("target {target_id} not registered"))
+    }
+
+    /// (a) createBrowserContext → createTarget(ctx id) → a cookie set in the
+    /// child is invisible to a default-context target (real jar isolation),
+    /// and both carry their real `browserContextId`.
+    #[tokio::test]
+    async fn create_browser_context_isolates_cookies() {
+        let (ctx, mut rx) = make_ctx().await;
+        let default_context_id = ctx.browser.default_context().id().to_string();
+
+        // Create an isolated context.
+        let resp = handle("createBrowserContext", Some(json!({})), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let context_id = resp["browserContextId"].as_str().unwrap().to_string();
+        assert!(context_id.starts_with("ctx-"));
+        assert_ne!(context_id, default_context_id);
+
+        // Target inside the new context: real context id everywhere.
+        let resp = handle(
+            "createTarget",
+            Some(json!({ "browserContextId": context_id })),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let isolated_target = resp["targetId"].as_str().unwrap().to_string();
+        let isolated = entry_for(&ctx, &isolated_target).await;
+        assert_eq!(isolated.browser_context_id, context_id);
+
+        // First event is the targetCreated for that target, carrying the id.
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ev.method, "Target.targetCreated");
+        assert_eq!(
+            ev.params.as_ref().unwrap()["targetInfo"]["browserContextId"],
+            context_id.as_str()
+        );
+
+        // Target in the default context (no browserContextId parameter).
+        let resp = handle("createTarget", Some(json!({})), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let default_target = resp["targetId"].as_str().unwrap().to_string();
+        let default_entry = entry_for(&ctx, &default_target).await;
+        assert_eq!(default_entry.browser_context_id, default_context_id);
+
+        // Set a cookie inside the isolated context via the child session.
+        let isolated_ctx = child_ctx(&ctx, isolated.session.clone());
+        crate::domains::network::handle(
+            "setCookie",
+            Some(json!({ "name": "iso", "value": "1", "url": "https://example.com/" })),
+            &isolated_ctx,
+        )
+        .await
+        .unwrap();
+
+        // The isolated context sees it…
+        let resp = crate::domains::network::handle("getAllCookies", None, &isolated_ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let names: Vec<&str> = resp["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert!(names.contains(&"iso"), "cookies: {names:?}");
+
+        // …but a default-context child does not (jar isolation).
+        let default_child_ctx = child_ctx(&ctx, default_entry.session.clone());
+        let resp = crate::domains::network::handle("getAllCookies", None, &default_child_ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let names: Vec<&str> = resp["cookies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"iso"), "cookies: {names:?}");
+    }
+
+    /// (b) createTarget with an unknown browserContextId fails with -32000.
+    #[tokio::test]
+    async fn create_target_unknown_context_errors() {
+        let (ctx, _rx) = make_ctx().await;
+
+        let err = handle(
+            "createTarget",
+            Some(json!({ "browserContextId": "ctx-999" })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32000);
+        assert!(err.message.contains("invalid browserContextId"));
+
+        // Nothing was registered.
+        assert!(ctx.child_targets.entries().await.is_empty());
+    }
+
+    /// (c) createBrowserContext with the oxiAccount extension fails honestly
+    /// until account binding lands (M-D).
+    #[tokio::test]
+    async fn create_browser_context_oxi_account_rejected() {
+        let (ctx, _rx) = make_ctx().await;
+
+        let err = handle(
+            "createBrowserContext",
+            Some(json!({ "oxiAccount": { "id": "acc-1" } })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32000);
+        assert_eq!(err.message, "account binding not yet implemented");
+
+        // No context was created.
+        assert!(ctx.browser.context(&oxibrowser_core::ContextId::from_string("ctx-2")).is_none());
+    }
+
+    /// (d) disposeBrowserContext removes the context: subsequent
+    /// createTarget for it fails. The default context cannot be disposed.
+    #[tokio::test]
+    async fn dispose_context_then_create_target_errors() {
+        let (ctx, _rx) = make_ctx().await;
+
+        let resp = handle("createBrowserContext", Some(json!({})), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let context_id = resp["browserContextId"].as_str().unwrap().to_string();
+
+        handle(
+            "disposeBrowserContext",
+            Some(json!({ "browserContextId": context_id })),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let err = handle(
+            "createTarget",
+            Some(json!({ "browserContextId": context_id })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32000);
+        assert!(err.message.contains("invalid browserContextId"));
+
+        // Disposing the default context is refused by core.
+        let err = handle(
+            "disposeBrowserContext",
+            Some(json!({ "browserContextId": ctx.browser.default_context().id().to_string() })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32000);
     }
 }
