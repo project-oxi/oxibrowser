@@ -32,6 +32,14 @@ pub struct AccountRuntime {
     browser: Arc<Browser>,
     orch: Option<Arc<LoginOrchestrator>>,
     active: Option<ActiveReplLogin>,
+    /// Primary bound account context (`session --account`): new REPL tabs
+    /// are created inside it (envelope restored, credential mode on).
+    primary_context: Option<std::sync::Arc<oxibrowser_core::context::BrowserContext>>,
+    /// `--lock-wait`/`--lock-timeout` applied to every manager constructed
+    /// here (global flags, threaded from `run_session`).
+    lock_policy: oxibrowser_core::account::LockPolicy,
+    /// `--ref` correlation stamped on REPL account events.
+    correlation: Option<String>,
 }
 
 struct ActiveReplLogin {
@@ -46,8 +54,32 @@ impl AccountRuntime {
             browser,
             orch: None,
             active: None,
+            primary_context: None,
+            lock_policy: oxibrowser_core::account::LockPolicy::default(),
+            correlation: None,
         }
     }
+
+    /// Apply `--lock-wait`/`--lock-timeout` and `--ref` to every manager
+    /// this runtime constructs (the REPL account surface).
+    pub fn set_account_options(
+        &mut self,
+        lock_policy: oxibrowser_core::account::LockPolicy,
+        ref_tag: Option<String>,
+    ) {
+        self.lock_policy = lock_policy;
+        self.correlation = ref_tag;
+    }
+
+    /// Set the primary bound context (`session --account`) — subsequent
+    /// `new` tabs are created inside it.
+    pub fn set_primary_context(
+        &mut self,
+        ctx: std::sync::Arc<oxibrowser_core::context::BrowserContext>,
+    ) {
+        self.primary_context = Some(ctx);
+    }
+
 
     fn orch(&mut self) -> Result<Arc<LoginOrchestrator>, String> {
         if let Some(orch) = &self.orch {
@@ -56,11 +88,15 @@ impl AccountRuntime {
         let base = AccountRegistry::default_dir()
             .ok_or_else(|| "HOME is not set — cannot locate ~/.oxibrowser".to_string())?;
         let registry = AccountRegistry::open(base).map_err(|e| e.to_string())?;
-        let manager = Arc::new(AccountManager::new(registry));
+        let mut manager = AccountManager::new(registry).with_lock_policy(self.lock_policy.clone());
+        if let Some(tag) = &self.correlation {
+            manager = manager.with_correlation(tag.clone());
+        }
+        let manager = Arc::new(manager);
         let orch = Arc::new(LoginOrchestrator::new(
             manager,
             self.browser.clone(),
-            Arc::new(oxibrowser_credentials::KeyringKeyProvider::new()),
+            Arc::new(crate::account_cli::session_keys()),
         ));
         self.orch = Some(orch.clone());
         Ok(orch)
@@ -71,7 +107,7 @@ impl AccountRuntime {
     /// to the default audit path.
     fn agent_source(&self) -> Result<Arc<oxibrowser_credentials::BrokerSource>, String> {
         let provider: Arc<dyn oxibrowser_credentials::CredentialProvider> =
-            Arc::new(oxibrowser_credentials::KeyringProvider::new());
+            Arc::new(crate::account_cli::provider());
         let consents = oxibrowser_credentials::ConsentStore::open_default()
             .map_err(|e| format!("cannot open consent store: {e}"))?;
         let audit_path = oxibrowser_core::security::audit::default_path()
@@ -384,15 +420,15 @@ async fn execute_inner(
                 )),
             }
         }
-
-        // ---- Tab lifecycle ----
         SessionCommand::New => {
-            let tab_id = manager
-                .create_tab(browser)
-                .await
-                .map_err(|e| CliResponse::error(e, "RUNTIME_ERROR"))?;
+            let tab_id = match &accounts.primary_context {
+                Some(ctx) => manager.create_tab_in(browser, ctx).await,
+                None => manager.create_tab(browser).await,
+            }
+            .map_err(|e| CliResponse::error(e, "RUNTIME_ERROR"))?;
             Ok((serde_json::json!({ "tab_id": tab_id }), Some(tab_id)))
         }
+
 
         SessionCommand::Close { tab_id } => {
             manager

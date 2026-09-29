@@ -14,6 +14,11 @@ pub mod exit_code {
     pub const TIMEOUT: i32 = 3;
     /// Network error: DNS, connection refused, HTTP 4xx/5xx.
     pub const NETWORK: i32 = 4;
+    /// Consent required: a grant/confirmation is missing or pending. The
+    /// JSON error envelope carries structured `details`
+    /// (`request_id`, `ttl`, `account`, `action`) so callers can resolve
+    /// without parsing the message.
+    pub const CONSENT_REQUIRED: i32 = 5;
 }
 
 /// Standard CLI JSON response wrapper.
@@ -33,6 +38,11 @@ pub struct CliResponse {
     /// Machine-readable error code on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
+    /// Structured error payload on failure. Populated for
+    /// `CONSENT_REQUIRED` (`{request_id, ttl, account, action}`); other
+    /// codes may adopt it later. Absent on success.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
     /// Metadata (timing, tab info).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<Meta>,
@@ -62,6 +72,7 @@ impl CliResponse {
             data: Some(data),
             error: None,
             error_code: None,
+            details: None,
             meta: None,
         }
     }
@@ -73,6 +84,7 @@ impl CliResponse {
             data: Some(data),
             error: None,
             error_code: None,
+            details: None,
             meta: Some(Meta {
                 tab_id,
                 elapsed_ms,
@@ -94,6 +106,7 @@ impl CliResponse {
             data: Some(data),
             error: None,
             error_code: None,
+            details: None,
             meta: Some(Meta {
                 tab_id: None,
                 elapsed_ms,
@@ -110,6 +123,26 @@ impl CliResponse {
             data: None,
             error: Some(error.into()),
             error_code: Some(error_code.as_ref().to_string()),
+            details: None,
+            meta: None,
+        }
+    }
+
+    /// Create an error response carrying a structured payload — the
+    /// `CONSENT_REQUIRED` contract (`details: {request_id, ttl, account,
+    /// action}`; `request_id`/`ttl` are null unless a confirmation is
+    /// actually pending).
+    pub fn error_with_details(
+        error: impl Into<String>,
+        error_code: impl AsRef<str>,
+        details: Value,
+    ) -> Self {
+        Self {
+            ok: false,
+            data: None,
+            error: Some(error.into()),
+            error_code: Some(error_code.as_ref().to_string()),
+            details: Some(details),
             meta: None,
         }
     }
@@ -127,6 +160,7 @@ impl CliResponse {
             data: None,
             error: Some(error.into()),
             error_code: Some(error_code.as_ref().to_string()),
+            details: None,
             meta: Some(Meta {
                 tab_id,
                 elapsed_ms,
@@ -154,6 +188,7 @@ impl CliResponse {
             | Some("SSRF_BLOCKED") => exit_code::INPUT,
             Some("TIMEOUT") => exit_code::TIMEOUT,
             Some("NETWORK_ERROR") | Some("HTTP_ERROR") => exit_code::NETWORK,
+            Some("CONSENT_REQUIRED") => exit_code::CONSENT_REQUIRED,
             _ => exit_code::RUNTIME,
         }
     }
@@ -369,6 +404,9 @@ pub fn build_summary(page: &oxibrowser_core::page::Page) -> Value {
 
 /// Map a core error to a machine-readable error code string.
 pub fn core_error_code(error: &oxibrowser_core::error::CoreError) -> &'static str {
+    if matches!(error, oxibrowser_core::error::CoreError::AccountLocked { .. }) {
+        return "ACCOUNT_LOCKED";
+    }
     let msg = format!("{error}");
     if msg.contains("timeout") || msg.contains("timed out") {
         "TIMEOUT"
@@ -764,6 +802,33 @@ mod tests {
         // InvalidUrl directly when they know the cause, while keeping
         // the From impl conservative.
         assert_eq!(cli.code_str(), "RUNTIME_ERROR");
+    }
+
+    #[test]
+    fn consent_required_maps_to_exit_5_with_details() {
+        let resp = CliResponse::error_with_details(
+            "consent required: gh-work may not be used for `login`",
+            "CONSENT_REQUIRED",
+            serde_json::json!({
+                "error_code": "CONSENT_REQUIRED",
+                "request_id": null,
+                "ttl": null,
+                "account": "gh-work",
+                "action": "login"
+            }),
+        );
+        assert_eq!(resp.exit_code(), 5);
+        assert_eq!(resp.exit_code(), exit_code::CONSENT_REQUIRED);
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["details"]["account"], "gh-work");
+        assert_eq!(v["error_code"], "CONSENT_REQUIRED");
+
+        // Plain errors carry no `details` key — the envelope stays minimal.
+        let plain = CliResponse::error("boom", "RUNTIME_ERROR");
+        assert_eq!(plain.exit_code(), 1);
+        let pv = serde_json::to_value(&plain).unwrap();
+        assert!(pv.get("details").is_none());
     }
 
     #[test]

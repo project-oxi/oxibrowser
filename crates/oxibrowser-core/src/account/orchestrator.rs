@@ -496,7 +496,7 @@ impl LoginOrchestrator {
             "login_aborted"
         };
         let from = AccountState::LoggingIn;
-        let record = self.manager.registry().set_state(
+        let record = self.manager.set_state_locked(
             &account_id,
             AccountState::NeedsLogin,
             Some(detail.to_string()),
@@ -578,7 +578,7 @@ impl LoginOrchestrator {
             Err(err) => {
                 let detail = format!("import_failed:{err}");
                 let from = AccountState::LoggingIn;
-                if let Ok(record) = self.manager.registry().set_state(
+                if let Ok(record) = self.manager.set_state_locked(
                     account_id,
                     AccountState::NeedsLogin,
                     Some(detail.clone()),
@@ -668,7 +668,7 @@ impl LoginOrchestrator {
     /// published). Legal only from `needs_login` / `stale`.
     fn enter_logging_in(&self, account_id: &str, mode: LoginMode) -> Result<AccountRecord> {
         let from = self.manager.registry().get(account_id)?.state;
-        let record = self.manager.registry().set_state(
+        let record = self.manager.set_state_locked(
             account_id,
             AccountState::LoggingIn,
             Some(format!("login_started:{}", mode.as_str())),
@@ -702,7 +702,7 @@ impl LoginOrchestrator {
     /// Failure exit from `logging_in` (§4.2: `Valid` | `NeedsLogin` only).
     async fn revert_to_needs_login(&self, account_id: &str, detail: &str) -> Result<AccountRecord> {
         let from = AccountState::LoggingIn;
-        let record = self.manager.registry().set_state(
+        let record = self.manager.set_state_locked(
             account_id,
             AccountState::NeedsLogin,
             Some(detail.to_string()),

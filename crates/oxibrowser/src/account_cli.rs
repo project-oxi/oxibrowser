@@ -40,34 +40,47 @@ use oxibrowser_cdp::{CdpServer, LoginSurface};
 use oxibrowser_credentials::keyring::KeyringProvider;
 use oxibrowser_credentials::provider::{SERVICE_PREFIX, service_key};
 use oxibrowser_credentials::{
-    ConsentRecord, ConsentStore, ConsentSubject, CredentialAction, CredentialId, CredentialKind,
-    CredentialProvider, DEFAULT_CONSENT_TTL, DEFAULT_MAX_USES, NewCredential, PolicyEngine,
-    SecretBox, TotpGenerator, UseRequest,
+    CONFIRMATION_TTL, ConsentRecord, ConsentStore, ConsentSubject, CredentialAction, CredentialId,
+    CredentialKind, CredentialProvider, DEFAULT_CONSENT_TTL, DEFAULT_MAX_USES, NewCredential,
+    PolicyEngine, SecretBox, TotpGenerator, UseRequest,
 };
 
 use crate::output::CliResponse;
-use crate::print_error;
+use crate::{print_error, print_error_details};
 
 // ---------------------------------------------------------------------------
 // Session AEAD keys — keychain-backed KeyProvider (lower design §5.1)
 // ---------------------------------------------------------------------------
 
 /// Session-key provider: the credentials crate's keychain implementation
-/// (§3.5 — the CLI carries no key material logic of its own).
+/// (§3.5 — the CLI carries no key material logic of its own). Honors
+/// `OXIBROWSER_KEYCHAIN_PREFIX` for parallel-install isolation (item 15).
 pub(crate) fn session_keys() -> oxibrowser_credentials::KeyringKeyProvider {
-    oxibrowser_credentials::KeyringKeyProvider::new()
+    oxibrowser_credentials::KeyringKeyProvider::with_service_prefix(keychain_prefix())
 }
 
+/// Effective keychain service prefix: `OXIBROWSER_KEYCHAIN_PREFIX` env
+/// override or the crate default (roadmap item 15 — parallel-install
+/// isolation; must stay consistent across credentials and session keys).
+pub(crate) fn keychain_prefix() -> String {
+    std::env::var("OXIBROWSER_KEYCHAIN_PREFIX")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| SERVICE_PREFIX.to_string())
+}
 // ---------------------------------------------------------------------------
 // Audit context (respects global --audit/--no-audit)
 // ---------------------------------------------------------------------------
 
 /// Audit sink configuration handed over from `main` (already resolved
-/// against `--audit`/`--no-audit`).
+/// against `--audit`/`--no-audit`), plus the account advisory-lock policy
+/// (`--lock-wait`/`--lock-timeout`).
 #[derive(Debug, Clone)]
 pub(crate) struct AuditContext {
     /// `None` = audit disabled (`--no-audit`).
     pub path: Option<PathBuf>,
+    /// Lock policy for envelope/registry mutations (FM-L7).
+    pub lock: oxibrowser_core::account::LockPolicy,
 }
 
 impl AuditContext {
@@ -219,6 +232,10 @@ pub(crate) enum AccountCommand {
         /// Max uses (default 50).
         #[arg(long)]
         max_uses: Option<u64>,
+        /// Correlation tag stored on the grant record and stamped on the
+        /// audit line — the join key with external task/run receipts.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -229,6 +246,72 @@ pub(crate) enum AccountCommand {
         /// Agent id whose grants are revoked.
         #[arg(long, value_name = "ID")]
         agent: String,
+        /// Correlation tag stamped on the audit line.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a command under a volatile grant: create → execute → tombstone on
+    /// any exit (item 1). The child inherits stdio; its exit code is
+    /// propagated. Grant lifecycle lines go to stderr as JSONL.
+    Exec {
+        id: String,
+        /// Agent id the volatile grant is bound to.
+        #[arg(long, value_name = "ID")]
+        agent: String,
+        /// Granted actions (comma list of navigate|interact|irreversible|login).
+        #[arg(long, value_delimiter = ',', default_values = ["navigate", "interact"])]
+        actions: Vec<String>,
+        /// Grant lifetime in seconds (default 3600, max 86400) — the crash
+        /// bound: a SIGKILLed wrapper leaves the grant only until expiry.
+        #[arg(long, value_name = "SEC")]
+        ttl: Option<u64>,
+        /// Max uses (default 1).
+        #[arg(long)]
+        max_uses: Option<u64>,
+        /// Correlation tag stored on the grant and stamped on audit lines.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
+        /// Command (with arguments) to run after `--`.
+        #[arg(trailing_var_arg = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Explicitly capture the live context's state as the stored envelope
+    /// ("stop the work" path) via a running `serve --account`: sends
+    /// `OXI.captureSession` over CDP.
+    Capture {
+        id: String,
+        /// WebSocket URL of the serve instance owning the account context
+        /// (e.g. `ws://127.0.0.1:9222/ws`, `?token=` when auth is on).
+        #[arg(long, value_name = "URL")]
+        ws: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List live grants for this account (consent ledger view).
+    Grants {
+        id: String,
+        /// Only grants bound to this agent.
+        #[arg(long, value_name = "ID")]
+        agent: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage per-account irreversible-action patterns (item 16): extra
+    /// deny-biased patterns on top of the built-in list, matched against
+    /// click/fill descriptors in account contexts.
+    Irreversible {
+        id: String,
+        /// Comma-separated patterns to append.
+        #[arg(long, value_delimiter = ',')]
+        add: Vec<String>,
+        /// Reset to the built-in defaults (drops all injected patterns).
+        #[arg(long)]
+        clear: bool,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -404,8 +487,8 @@ fn audit_sensitive(action: &str, reason: &str) {
     });
 }
 
-fn provider() -> KeyringProvider {
-    KeyringProvider::new()
+pub(crate) fn provider() -> KeyringProvider {
+    KeyringProvider::with_service_prefix(keychain_prefix())
 }
 
 fn policy_engine(audit: &AuditContext) -> Result<PolicyEngine, String> {
@@ -458,7 +541,7 @@ pub(crate) async fn run_account(command: AccountCommand, audit: AuditContext) ->
             probe,
             allow_private_ips,
             json,
-        } => account_status(&id, probe, allow_private_ips, json).await,
+        } => account_status(&id, probe, allow_private_ips, json, &audit).await,
         AccountCommand::Rm { id, json } => account_rm(&id, json),
         AccountCommand::Login {
             id,
@@ -483,7 +566,7 @@ pub(crate) async fn run_account(command: AccountCommand, audit: AuditContext) ->
             )
             .await
         }
-        AccountCommand::Logout { id, json } => account_logout(&id, json),
+        AccountCommand::Logout { id, json } => account_logout(&id, json, &audit),
         AccountCommand::ExportState { id, out, json } => account_export_state(&id, &out, json),
         AccountCommand::Grant {
             id,
@@ -491,9 +574,26 @@ pub(crate) async fn run_account(command: AccountCommand, audit: AuditContext) ->
             actions,
             ttl,
             max_uses,
+            ref_tag,
             json,
-        } => account_grant(&id, &agent, &actions, ttl, max_uses, json),
-        AccountCommand::Revoke { id, agent, json } => account_revoke(&id, &agent, json),
+        } => account_grant(&id, &agent, &actions, ttl, max_uses, ref_tag.as_deref(), json),
+        AccountCommand::Revoke { id, agent, ref_tag, json } => {
+            account_revoke(&id, &agent, ref_tag.as_deref(), json)
+        }
+        AccountCommand::Exec {
+            id,
+            agent,
+            actions,
+            ttl,
+            max_uses,
+            ref_tag,
+            cmd,
+        } => account_exec(&id, &agent, &actions, ttl, max_uses, ref_tag.as_deref(), cmd),
+        AccountCommand::Capture { id, ws, json } => account_capture(&id, &ws, json).await,
+        AccountCommand::Grants { id, agent, json } => account_grants(&id, agent.as_deref(), json),
+        AccountCommand::Irreversible { id, add, clear, json } => {
+            account_irreversible(&id, &add, clear, json, &audit)
+        }
     }
 }
 
@@ -534,6 +634,13 @@ fn account_add(
     };
     record.identity.login_hint = login.map(str::to_string);
     record.identity.display_name = display.map(str::to_string);
+    // Curated probe markers (item 12): known services get a verified
+    // URL+marker pair instead of the scope-root fallback.
+    if record.probe.is_none()
+        && let Some(curated) = oxibrowser_core::account::curated_for(&scope)
+    {
+        record.probe = Some(curated);
+    }
     let record = match registry.add(record) {
         Ok(r) => r,
         Err(e) => return print_error(&e.to_string(), "RUNTIME_ERROR", json),
@@ -584,7 +691,13 @@ fn account_list(json: bool) -> i32 {
     0
 }
 
-async fn account_status(id: &str, probe: bool, allow_private: bool, json: bool) -> i32 {
+async fn account_status(
+    id: &str,
+    probe: bool,
+    allow_private: bool,
+    json: bool,
+    audit: &AuditContext,
+) -> i32 {
     let registry = match oxi_accounts_registry() {
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
@@ -615,7 +728,7 @@ async fn account_status(id: &str, probe: bool, allow_private: bool, json: bool) 
             );
             return print_error(&msg, "NO_SESSION", json);
         }
-        let manager = AccountManager::new(registry.clone());
+        let manager = AccountManager::new(registry.clone()).with_lock_policy(audit.lock.clone());
         let mut config = BrowserConfig::headless();
         if allow_private {
             config.enable_ssrf_filter = false;
@@ -772,11 +885,19 @@ fn account_rm(id: &str, json: bool) -> i32 {
 
 /// Manager + browser + orchestrator bundle for login flows (audit goes to
 /// the process-global sink, like the other `account` subcommands).
+/// `ref_tag` (`--ref`) is stamped on every event the shared manager emits.
 pub(crate) async fn login_stack(
     registry: &AccountRegistry,
     allow_private: bool,
+    ref_tag: Option<&str>,
+    lock: &oxibrowser_core::account::LockPolicy,
 ) -> Result<(Arc<AccountManager>, Arc<Browser>, Arc<LoginOrchestrator>), String> {
-    let manager = Arc::new(AccountManager::new(registry.clone()));
+    let mut manager = AccountManager::new(registry.clone());
+    if let Some(tag) = ref_tag {
+        manager = manager.with_correlation(tag);
+    }
+    manager = manager.with_lock_policy(lock.clone());
+    let manager = Arc::new(manager);
     let mut config = BrowserConfig::headless();
     if allow_private {
         config.enable_ssrf_filter = false;
@@ -807,9 +928,11 @@ async fn account_login(
     audit: &AuditContext,
 ) -> i32 {
     match mode {
-        "import" => account_login_import(id, storage_state, cookies, allow_private, json).await,
-        "user" if json => account_login_host(id, timeout, allow_private).await,
-        "user" => account_login_wizard(id, timeout, allow_private).await,
+        "import" => {
+            account_login_import(id, storage_state, cookies, allow_private, json, audit).await
+        }
+        "user" if json => account_login_host(id, timeout, allow_private, audit).await,
+        "user" => account_login_wizard(id, timeout, allow_private, audit).await,
         "agent" => account_login_agent(id, agent, json, timeout, allow_private, audit).await,
         other => print_error(
             &format!("invalid --mode {other:?} (expected \"user\", \"agent\" or \"import\")"),
@@ -835,7 +958,7 @@ async fn account_login_agent(
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
     };
-    let (manager, _browser, orch) = match login_stack(&registry, allow_private).await {
+    let (manager, _browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
         Ok(s) => s,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
     };
@@ -854,7 +977,7 @@ async fn account_login_agent(
         manager,
         orch.shared_keys(),
         source,
-        agent_id,
+        agent_id.clone(),
     )
     .with_events(orch.event_sender());
     if let Some(secs) = timeout {
@@ -870,6 +993,28 @@ async fn account_login_agent(
     drop(guard);
 
     use oxibrowser_core::account::AgentLoginOutcome;
+    // Consent gate surfaced as an outcome (core `abort_on_source_error`
+    // prefixes the reason with `consent_required:`) — convert it to the
+    // structured exit-5 contract instead of a generic failure.
+    if let Ok(AgentLoginOutcome::NeedsLogin { reason, .. }) = &outcome
+        && reason.starts_with("consent_required:")
+    {
+        return print_error_details(
+            &format!(
+                "consent required: agent login for {id} needs a `login` action grant — \
+                 `account grant {id} --agent {agent_id} --actions login` ({reason})"
+            ),
+            "CONSENT_REQUIRED",
+            Some(serde_json::json!({
+                "error_code": "CONSENT_REQUIRED",
+                "request_id": null,
+                "ttl": null,
+                "account": id,
+                "action": "login",
+            })),
+            json,
+        );
+    }
     match outcome {
         Ok(outcome) => {
             if json {
@@ -964,6 +1109,7 @@ async fn account_login_import(
     cookies: Option<&Path>,
     allow_private: bool,
     json: bool,
+    audit: &AuditContext,
 ) -> i32 {
     let state = match load_import_state(storage_state, cookies) {
         Ok(s) => s,
@@ -973,7 +1119,7 @@ async fn account_login_import(
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
     };
-    let (_manager, _browser, orch) = match login_stack(&registry, allow_private).await {
+    let (_manager, _browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
         Ok(s) => s,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
     };
@@ -1020,12 +1166,17 @@ async fn account_login_import(
 /// CDP serve, one `{ws_url, viewer_token, login_id}` block on stdout, then
 /// block until the window ends; the final outcome follows as a second JSON
 /// line.
-async fn account_login_host(id: &str, timeout: Option<u64>, allow_private: bool) -> i32 {
+async fn account_login_host(
+    id: &str,
+    timeout: Option<u64>,
+    allow_private: bool,
+    audit: &AuditContext,
+) -> i32 {
     let registry = match oxi_accounts_registry() {
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", true),
     };
-    let (_manager, browser, orch) = match login_stack(&registry, allow_private).await {
+    let (_manager, browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
         Ok(s) => s,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", true),
     };
@@ -1098,12 +1249,17 @@ screenshot [file] | status | done | abort";
 /// the account context. Typed values go straight from stdin into the page —
 /// responses carry status only, never the values; `screenshot` writes a
 /// 0600 file and prints the path only (audited).
-async fn account_login_wizard(id: &str, timeout: Option<u64>, allow_private: bool) -> i32 {
+async fn account_login_wizard(
+    id: &str,
+    timeout: Option<u64>,
+    allow_private: bool,
+    audit: &AuditContext,
+) -> i32 {
     let registry = match oxi_accounts_registry() {
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", false),
     };
-    let (_manager, browser, orch) = match login_stack(&registry, allow_private).await {
+    let (_manager, browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
         Ok(s) => s,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", false),
     };
@@ -1280,7 +1436,7 @@ async fn screenshot_to_file(
     Ok(())
 }
 
-fn account_logout(id: &str, json: bool) -> i32 {
+fn account_logout(id: &str, json: bool, audit: &AuditContext) -> i32 {
     let registry = match oxi_accounts_registry() {
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
@@ -1292,7 +1448,7 @@ fn account_logout(id: &str, json: bool) -> i32 {
             json,
         );
     }
-    let manager = AccountManager::new(registry.clone());
+    let manager = AccountManager::new(registry.clone()).with_lock_policy(audit.lock.clone());
     match manager.logout(id) {
         Ok(record) => {
             if json {
@@ -1305,7 +1461,7 @@ fn account_logout(id: &str, json: bool) -> i32 {
             }
             0
         }
-        Err(e) => print_error(&e.to_string(), "RUNTIME_ERROR", json),
+        Err(e) => print_error(&e.to_string(), crate::output::core_error_code(&e), json),
     }
 }
 
@@ -1404,6 +1560,7 @@ fn account_grant(
     actions: &[String],
     ttl: Option<u64>,
     max_uses: Option<u64>,
+    ref_tag: Option<&str>,
     json: bool,
 ) -> i32 {
     let registry = match oxi_accounts_registry() {
@@ -1456,7 +1613,7 @@ fn account_grant(
     // The scope-root origin — the same key `createBrowserContext {oxiAccount}`
     // checks against (target.rs `create_account_context`).
     let scope_origin = format!("https://{}", record.scope);
-    let rec = ConsentRecord::new(
+    let mut rec = ConsentRecord::new(
         ConsentSubject::Account {
             account: id.to_string(),
             agent: agent.to_string(),
@@ -1466,6 +1623,7 @@ fn account_grant(
         ttl,
         max_uses,
     );
+    rec.ref_tag = ref_tag.map(str::to_string);
     let consents = match ConsentStore::open_default() {
         Ok(s) => s,
         Err(e) => {
@@ -1481,13 +1639,15 @@ fn account_grant(
     }
     audit::record(AuditEvent {
         action: Some("account_grant".to_string()),
+        ref_tag: ref_tag.map(str::to_string),
         ..audit::event(
             AuditEventKind::AccountState,
             AuditDecision::Allow,
             format!(
-                "grant account={id} agent={agent} actions={} expires={}",
+                "grant account={id} agent={agent} actions={} expires={} consent={}",
                 normalized.join("|"),
-                rec.expires_at.to_rfc3339()
+                rec.expires_at.to_rfc3339(),
+                rec.consent_id
             ),
         )
     });
@@ -1500,6 +1660,7 @@ fn account_grant(
             "actions": normalized,
             "expires_at": rec.expires_at.to_rfc3339(),
             "max_uses": rec.max_uses,
+            "ref": ref_tag,
         }))
         .print_json();
     } else {
@@ -1513,7 +1674,7 @@ fn account_grant(
     0
 }
 
-fn account_revoke(id: &str, agent: &str, json: bool) -> i32 {
+fn account_revoke(id: &str, agent: &str, ref_tag: Option<&str>, json: bool) -> i32 {
     let registry = match oxi_accounts_registry() {
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
@@ -1546,6 +1707,7 @@ fn account_revoke(id: &str, agent: &str, json: bool) -> i32 {
     }
     audit::record(AuditEvent {
         action: Some("account_revoke".to_string()),
+        ref_tag: ref_tag.map(str::to_string),
         ..audit::event(
             AuditEventKind::AccountState,
             AuditDecision::Deny,
@@ -1563,16 +1725,466 @@ fn account_revoke(id: &str, agent: &str, json: bool) -> i32 {
     0
 }
 
+/// `account grants <id>` — the consent-ledger view for one account:
+/// live (unrevoked) records with agent, actions, budgets, and the
+/// correlation tag. Revoked grants live on in the audit log only.
+fn account_grants(id: &str, agent_filter: Option<&str>, json: bool) -> i32 {
+    let registry = match oxi_accounts_registry() {
+        Ok(r) => r,
+        Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
+    };
+    if registry.get(id).is_err() {
+        return print_error(
+            &format!("account {id:?} not found"),
+            "ACCOUNT_NOT_FOUND",
+            json,
+        );
+    }
+    let consents = match ConsentStore::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            return print_error(
+                &format!("cannot open consent store: {e}"),
+                "RUNTIME_ERROR",
+                json,
+            );
+        }
+    };
+    let now = chrono::Utc::now();
+    let grants: Vec<ConsentRecord> = match consents.list_for_account(id) {
+        Ok(g) => g
+            .into_iter()
+            .filter(|rec| match agent_filter {
+                Some(agent) => matches!(
+                    &rec.subject,
+                    ConsentSubject::Account { agent: a, .. } if a == agent
+                ),
+                None => true,
+            })
+            .collect(),
+        Err(e) => return print_error(&format!("cannot read consent store: {e}"), "RUNTIME_ERROR", json),
+    };
+    if json {
+        let rows: Vec<serde_json::Value> = grants
+            .iter()
+            .map(|rec| {
+                serde_json::json!({
+                    "consent_id": rec.consent_id,
+                    "agent": match &rec.subject {
+                        ConsentSubject::Account { agent, .. } => agent.clone(),
+                        _ => String::new(),
+                    },
+                    "actions": rec.actions,
+                    "origin": rec.origin,
+                    "granted_at": rec.granted_at.to_rfc3339(),
+                    "expires_at": rec.expires_at.to_rfc3339(),
+                    "uses": rec.uses,
+                    "max_uses": rec.max_uses,
+                    "active": rec.active_at(now),
+                    "ref": rec.ref_tag,
+                })
+            })
+            .collect();
+        CliResponse::success(serde_json::json!({
+            "account": id,
+            "grants": rows,
+        }))
+        .print_json();
+    } else {
+        if grants.is_empty() {
+            println!("no live grants for {id}");
+        }
+        for rec in &grants {
+            let agent = match &rec.subject {
+                ConsentSubject::Account { agent, .. } => agent,
+                _ => continue,
+            };
+            println!(
+                "{} agent={agent} actions=[{}] uses={}/{} expires={}{}{}",
+                rec.consent_id,
+                rec.actions.join(","),
+                rec.uses,
+                rec.max_uses,
+                rec.expires_at.to_rfc3339(),
+                if rec.active_at(now) { "" } else { " [inactive]" },
+                rec.ref_tag
+                    .as_deref()
+                    .map(|r| format!(" ref={r}"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    0
+}
+
+/// `account exec` — one-shot volatile grant around a child process
+/// (roadmap item 1): grant → run (stdio passthrough) → tombstone on any
+/// exit. The child's exit code is propagated (signals map to 128+N on unix).
+///
+/// Crash bound: if this wrapper is SIGKILLed before the tombstone lands,
+/// the grant survives only until its TTL (default 1 h, cap 24 h) — the
+/// reason exec TTLs are far shorter than interactive grants.
+fn account_exec(
+    id: &str,
+    agent: &str,
+    actions: &[String],
+    ttl: Option<u64>,
+    max_uses: Option<u64>,
+    ref_tag: Option<&str>,
+    cmd: Vec<String>,
+) -> i32 {
+    let registry = match oxi_accounts_registry() {
+        Ok(r) => r,
+        Err(e) => return print_error(&e, "RUNTIME_ERROR", false),
+    };
+    let record = match registry.get(id) {
+        Ok(r) => r,
+        Err(_) => {
+            return print_error(
+                &format!("account {id:?} not found"),
+                "ACCOUNT_NOT_FOUND",
+                false,
+            );
+        }
+    };
+    let mut normalized: Vec<&str> = Vec::new();
+    for a in actions {
+        let a = a.trim().to_ascii_lowercase();
+        if !ACCOUNT_GRANT_ACTIONS.contains(&a.as_str()) {
+            return print_error(
+                &format!(
+                    "unknown action {a:?} — allowed: {}",
+                    ACCOUNT_GRANT_ACTIONS.join("|")
+                ),
+                "INPUT_VALIDATION",
+                false,
+            );
+        }
+        if !normalized.iter().any(|x| *x == a) {
+            normalized.push(ACCOUNT_GRANT_ACTIONS.iter().find(|x| **x == a).copied().unwrap());
+        }
+    }
+    if normalized.is_empty() {
+        return print_error("at least one action required", "INPUT_VALIDATION", false);
+    }
+    let ttl_secs = ttl.unwrap_or(3600);
+    if ttl_secs == 0 || ttl_secs > 86400 {
+        return print_error(
+            "exec --ttl must be 1..=86400 seconds",
+            "INPUT_VALIDATION",
+            false,
+        );
+    }
+    let max_uses = max_uses.unwrap_or(1);
+
+    let scope_origin = format!("https://{}", record.scope);
+    let mut rec = ConsentRecord::new(
+        ConsentSubject::Account {
+            account: id.to_string(),
+            agent: agent.to_string(),
+        },
+        &scope_origin,
+        &normalized,
+        chrono::Duration::seconds(ttl_secs as i64),
+        max_uses,
+    );
+    rec.ref_tag = ref_tag.map(str::to_string);
+    let consents = match ConsentStore::open_default() {
+        Ok(s) => s,
+        Err(e) => {
+            return print_error(
+                &format!("cannot open consent store: {e}"),
+                "RUNTIME_ERROR",
+                false,
+            )
+        }
+    };
+    if let Err(e) = consents.grant(rec.clone()) {
+        return print_error(&format!("grant failed: {e}"), "RUNTIME_ERROR", false);
+    }
+    audit::record(AuditEvent {
+        action: Some("account_grant".to_string()),
+        ref_tag: ref_tag.map(str::to_string),
+        ..audit::event(
+            AuditEventKind::AccountState,
+            AuditDecision::Allow,
+            format!(
+                "exec grant account={id} agent={agent} actions={} expires={} consent={}",
+                normalized.join("|"),
+                rec.expires_at.to_rfc3339(),
+                rec.consent_id
+            ),
+        )
+    });
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "exec": "grant", "consent_id": rec.consent_id, "account": id,
+            "agent": agent, "actions": normalized, "ttl": ttl_secs,
+            "max_uses": max_uses, "ref": ref_tag,
+        })
+    );
+
+    let mut child = match std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .env("OXIBROWSER_ACCOUNT", id)
+        .env("OXIBROWSER_AGENT_ID", agent)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let reason = "exec_spawn_failed";
+            let _ = consents.revoke_by_id(&rec.consent_id, reason);
+            audit::record(AuditEvent {
+                action: Some("account_revoke".to_string()),
+                ref_tag: ref_tag.map(str::to_string),
+                ..audit::event(
+                    AuditEventKind::AccountState,
+                    AuditDecision::Deny,
+                    format!(
+                        "exec revoke account={id} agent={agent} reason={reason} consent={}",
+                        rec.consent_id
+                    ),
+                )
+            });
+            return print_error(
+                &format!("cannot spawn {:?}: {e}", cmd[0]),
+                "RUNTIME_ERROR",
+                false,
+            );
+        }
+    };
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            let reason = "exec_wait_failed";
+            let _ = consents.revoke_by_id(&rec.consent_id, reason);
+            audit::record(AuditEvent {
+                action: Some("account_revoke".to_string()),
+                ref_tag: ref_tag.map(str::to_string),
+                ..audit::event(
+                    AuditEventKind::AccountState,
+                    AuditDecision::Deny,
+                    format!(
+                        "exec revoke account={id} agent={agent} reason={reason} consent={}",
+                        rec.consent_id
+                    ),
+                )
+            });
+            return print_error(&format!("wait failed: {e}"), "RUNTIME_ERROR", false);
+        }
+    };
+
+    // Tombstone on ANY exit — normal, non-zero, or signal. Best effort: a
+    // failed append leaves the TTL as the only bound (documented).
+    let (reason, code) = match status.code() {
+        Some(c) => (format!("exec_exit:{c}"), c),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                let sig = status.signal().unwrap_or(0);
+                (format!("exec_signal:{sig}"), 128 + sig)
+            }
+            #[cfg(not(unix))]
+            ("exec_exit:unknown".to_string(), 1)
+        }
+    };
+    if let Err(e) = consents.revoke_by_id(&rec.consent_id, &reason) {
+        eprintln!(
+            "{}",
+            serde_json::json!({"exec": "tombstone_failed", "consent_id": rec.consent_id, "error": e.to_string()})
+        );
+    }
+    audit::record(AuditEvent {
+        action: Some("account_revoke".to_string()),
+        ref_tag: ref_tag.map(str::to_string),
+        ..audit::event(
+            AuditEventKind::AccountState,
+            AuditDecision::Deny,
+            format!(
+                "exec revoke account={id} agent={agent} reason={reason} consent={}",
+                rec.consent_id
+            ),
+        )
+    });
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "exec": "exit", "consent_id": rec.consent_id, "reason": reason, "code": code,
+        })
+    );
+    code
+}
+
+/// `account capture <id> --ws <URL>` — send `OXI.captureSession` to the
+/// serve instance that owns the account's live context (roadmap item 3).
+/// The freshest cookies are sealed before the operator tears the child
+/// down. Minimal JSON-RPC-over-WS client; the envelope is written by the
+/// server side (audited there as `session_capture`).
+async fn account_capture(id: &str, ws_url: &str, json: bool) -> i32 {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (mut ws, _resp) = match tokio_tungstenite::connect_async(ws_url).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return print_error(
+                &format!("cannot connect to {ws_url}: {e}"),
+                "NETWORK_ERROR",
+                json,
+            )
+        }
+    };
+    let request = serde_json::json!({
+        "id": 1,
+        "method": "OXI.captureSession",
+        "params": { "accountId": id },
+    });
+    if let Err(e) = ws.send(Message::Text(request.to_string().into())).await {
+        return print_error(&format!("send failed: {e}"), "NETWORK_ERROR", json);
+    }
+    loop {
+        let msg = match ws.next().await {
+            Some(Ok(m)) => m,
+            Some(Err(e)) => {
+                return print_error(&format!("connection error: {e}"), "NETWORK_ERROR", json)
+            }
+            None => return print_error("connection closed before response", "NETWORK_ERROR", json),
+        };
+        let text = match msg {
+            Message::Text(t) => t,
+            Message::Close(_) => {
+                return print_error("connection closed before response", "NETWORK_ERROR", json)
+            }
+            _ => continue,
+        };
+        let value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue, // events and notifications — skip
+        };
+        if value.get("id").and_then(|v| v.as_u64()) != Some(1) {
+            continue;
+        }
+        if let Some(err) = value.get("error") {
+            return print_error(
+                &format!(
+                    "capture failed: {}",
+                    err.get("message").cloned().unwrap_or_default()
+                ),
+                "RUNTIME_ERROR",
+                json,
+            );
+        }
+        let result = value.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        if json {
+            CliResponse::success(result).print_json();
+        } else {
+            let state = result.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+            let cookies = result
+                .pointer("/sessionSummary/cookie_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            println!("account {id}: captured (state {state}, {cookies} cookies)");
+        }
+        return 0;
+    }
+}
+
+/// `account irreversible <id> [--add …] [--clear]` — manage the per-account
+/// irreversible-pattern injection (item 16): extra deny-biased patterns
+/// layered on the built-in defaults, matched against click/fill descriptors
+/// in this account's contexts.
+fn account_irreversible(id: &str, add: &[String], clear: bool, json: bool, audit: &AuditContext) -> i32 {
+    if add.is_empty() && !clear {
+        return print_error(
+            "nothing to do — use --add <patterns> and/or --clear",
+            "INPUT_VALIDATION",
+            json,
+        );
+    }
+    let registry = match oxi_accounts_registry() {
+        Ok(r) => r,
+        Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
+    };
+    if !registry.exists(id) {
+        return print_error(
+            &format!("account {id:?} not found"),
+            "ACCOUNT_NOT_FOUND",
+            json,
+        );
+    }
+    // Read-modify-write under the account's advisory lock (FM-L7): a
+    // concurrent capture must not be clobbered by this record overwrite.
+    let manager = AccountManager::new(registry).with_lock_policy(audit.lock.clone());
+    let record = match manager.update_record_locked(id, |record| {
+        let mut injected = record.irreversible_patterns.take().unwrap_or_default();
+        for pattern in add {
+            let pattern = pattern.trim().to_ascii_lowercase();
+            if pattern.is_empty() {
+                continue;
+            }
+            if !injected.contains(&pattern) {
+                injected.push(pattern);
+            }
+        }
+        if clear {
+            injected.clear();
+        }
+        record.irreversible_patterns = if injected.is_empty() {
+            None
+        } else {
+            Some(injected)
+        };
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            return print_error(&e.to_string(), crate::output::core_error_code(&e), json);
+        }
+    };
+    audit_sensitive(
+        "irreversible_patterns",
+        &format!(
+            "account={id} patterns={} clear={clear}",
+            record
+                .irreversible_patterns
+                .as_ref()
+                .map(|p| p.join("|"))
+                .unwrap_or_default()
+        ),
+    );
+    if json {
+        CliResponse::success(serde_json::json!({
+            "account": id,
+            "patterns": record.irreversible_patterns,
+            "defaults": oxibrowser_core::account::DEFAULT_IRREVERSIBLE_PATTERNS,
+        }))
+        .print_json();
+    } else {
+        println!(
+            "account {id}: injected patterns: {} (built-in defaults still apply)",
+            record
+                .irreversible_patterns
+                .as_ref()
+                .map(|p| p.join(", "))
+                .unwrap_or_else(|| "(none)".into())
+        );
+    }
+    0
+}
+
 // ---------------------------------------------------------------------------
 // account context binding (fetch/serve --account)
 // ---------------------------------------------------------------------------
 
 /// Create a context bound to `id`: credential mode on, stored envelope
 /// restored (fingerprint-gated, fail-closed — FM-L2), audited as
-/// `session_restore`. Shared by `fetch --account` and `serve --account`.
+/// `session_restore`. `ref_tag` (`--ref`) is stamped on the audit events.
+/// Shared by `fetch --account` and `serve --account`.
 pub(crate) async fn bind_account_context(
     browser: &Arc<Browser>,
     id: &str,
+    ref_tag: Option<&str>,
 ) -> Result<Arc<oxibrowser_core::context::BrowserContext>, String> {
     let registry = oxi_accounts_registry()?;
     let record = registry
@@ -1598,7 +2210,10 @@ pub(crate) async fn bind_account_context(
         .new_session_in(&ctx)
         .await
         .map_err(|e| format!("session init failed: {e}"))?;
-    let manager = AccountManager::new(registry.clone());
+    let manager = match ref_tag {
+        Some(tag) => AccountManager::new(registry.clone()).with_correlation(tag),
+        None => AccountManager::new(registry.clone()),
+    };
     let mut guard = session.write().await;
     let current = FingerprintMeta {
         user_agent: guard.effective_ua(),
@@ -1824,12 +2439,27 @@ fn credential_get(id: &str, field: &str, audit: &AuditContext) -> i32 {
         Field::Password => CredentialAction::Login,
     };
     let req = UseRequest::new(CredentialId(id.to_string()), top_level, action);
+    let consent_details = |request_id: Option<String>, ttl: Option<u64>| {
+        serde_json::json!({
+            "error_code": "CONSENT_REQUIRED",
+            "request_id": request_id,
+            "ttl": ttl,
+            "account": id,
+            "action": action.as_str(),
+            "origin": handle.scope,
+        })
+    };
     match engine.authorize_use(&req) {
         Decision::Allow => {}
         Decision::Deny { reason } => {
-            return print_error(
-                &format!("credential use denied by policy: {reason}"),
-                "POLICY_DENIED",
+            return print_error_details(
+                &format!(
+                    "consent required: {id} may not be used for `{}` — grant it with \
+                     `credential authorize` ({reason})",
+                    action.as_str()
+                ),
+                "CONSENT_REQUIRED",
+                Some(consent_details(None, None)),
                 json,
             );
         }
@@ -1837,9 +2467,13 @@ fn credential_get(id: &str, field: &str, audit: &AuditContext) -> i32 {
             // The local user IS the confirmation authority; mint + verify.
             let token = engine.issue_confirmation(&req);
             if let Decision::Deny { reason } = engine.verify_confirmation(&token, &req) {
-                return print_error(
+                return print_error_details(
                     &format!("confirmation invalid: {reason}"),
-                    "POLICY_DENIED",
+                    "CONSENT_REQUIRED",
+                    Some(consent_details(
+                        Some(token.request_hash_hex()),
+                        Some(CONFIRMATION_TTL.num_seconds().max(0) as u64),
+                    )),
                     json,
                 );
             }

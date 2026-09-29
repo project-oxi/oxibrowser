@@ -54,6 +54,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "beginLogin" => begin_login(params, ctx).await,
         "loginWithAccount" => login_with_account(params, ctx).await,
         "endLogin" => end_login(params, ctx).await,
+        "captureSession" => capture_session_cmd(params, ctx).await,
         "reportLoginSuccess" => report_login_success(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
@@ -284,6 +285,107 @@ async fn resolve_and_validate(
     Ok((entry, snapshot))
 }
 
+/// Irreversible-action pattern gate (roadmap item 16, upper design §8.2 /
+/// FM-L8). In account-bound contexts, interactions whose descriptor
+/// (selector, page URL, enclosing form action, aria-label, visible text)
+/// matches the built-in + per-account pattern list require the context's
+/// `irreversible` capability — held by CLI-launched contexts (local user
+/// direct) and by `createBrowserContext` contexts whose agent carries an
+/// `irreversible` grant. Best-effort by design; the deny audit line records
+/// the matched pattern.
+async fn irreversible_gate(
+    ctx: &DispatchContext,
+    session: &mut oxibrowser_core::session::Session,
+    selector: &str,
+    enrich_element: bool,
+) -> Result<(), CdpError> {
+    use oxibrowser_core::account::irreversible::matched_pattern;
+    use oxibrowser_core::security::audit::{
+        self, AuditDecision, AuditEvent, AuditEventKind,
+    };
+
+    if !ctx.browser_context.credential_mode() {
+        return Ok(());
+    }
+    let Some(surface) = ctx.logins.clone() else {
+        return Ok(());
+    };
+    let ctx_id = ctx.browser_context.id().as_str();
+    let Some(account_id) = surface.account_for_context(ctx_id) else {
+        return Ok(());
+    };
+    let record = match surface.orchestrator().shared_manager().registry().get(&account_id) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let extra = record.irreversible_patterns.clone().unwrap_or_default();
+    // Only http(s) URLs carry signal: `data:` URLs embed the whole page
+    // source, so every descriptor would match every button label through
+    // the URL component alone.
+    let url = session
+        .current_url()
+        .map(|u| u.to_string())
+        .unwrap_or_default();
+    let url = if url.starts_with("http://") || url.starts_with("https://") {
+        url
+    } else {
+        String::new()
+    };
+    let mut descriptor = format!("{selector}\n{url}");
+    if enrich_element {
+        let sel_json = serde_json::to_string(selector).unwrap_or_default();
+        let js = format!(
+            r#"(function() {{
+                var el = document.querySelector({sel_json});
+                if (!el) return "";
+                var form = el.form || (el.closest ? el.closest("form") : null);
+                return [form ? (form.getAttribute("action") || "") : "",
+                        el.getAttribute("aria-label") || "",
+                        (el.textContent || el.innerText || "").slice(0, 120),
+                        el.id || "",
+                        el.className || ""].join("\n");
+            }})()"#
+        );
+        if let Ok(v) = session.evaluate_js(&js).await
+            && let Some(text) = v.value.as_ref().and_then(|t| t.as_str())
+        {
+            descriptor.push('\n');
+            descriptor.push_str(text);
+        }
+    }
+    let Some(pattern) = matched_pattern(&descriptor, &extra) else {
+        return Ok(());
+    };
+    let allowed = surface.irreversible_allowed(ctx_id);
+    surface
+        .orchestrator()
+        .shared_manager()
+        .record_event(AuditEvent {
+        action: Some("irreversible_gate".to_string()),
+        origin: Some(record.scope.clone()),
+        ..audit::event(
+            AuditEventKind::PolicyViolation,
+            if allowed {
+                AuditDecision::Allow
+            } else {
+                AuditDecision::Deny
+            },
+            format!("account={account_id} pattern={pattern:?} allowed={allowed}"),
+        )
+    });
+    if allowed {
+        return Ok(());
+    }
+    Err(CdpError {
+        code: -32000,
+        message: format!(
+            "irreversibleActionRequiresGrant: pattern '{pattern}' — grant with \
+             `account grant {account_id} --agent <A> --actions irreversible` \
+             and recreate the context"
+        ),
+    })
+}
+
 /// Click JS mirroring `oxibrowser_core::tab::Tab::click` — the core Tab path
 /// isn't reachable from the CDP layer, so the click snippet runs directly via
 /// session evaluate (same pattern as the `Input.*` CdpStubs handlers).
@@ -330,6 +432,7 @@ async fn click_ref(params: Option<Value>, ctx: &DispatchContext) -> DomainResult
         .unwrap_or_else(|| guard.id().to_string());
 
     let (entry, _snapshot) = resolve_and_validate(&mut guard, &session_key, &r#ref).await?;
+    irreversible_gate(ctx, &mut guard, &entry.selector, true).await?;
 
     let js = click_js(&entry.selector);
     let result = guard.evaluate_js(&js).await?;
@@ -364,6 +467,7 @@ async fn fill_ref(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
         .unwrap_or_else(|| guard.id().to_string());
 
     let (entry, _snapshot) = resolve_and_validate(&mut guard, &session_key, &r#ref).await?;
+    irreversible_gate(ctx, &mut guard, &entry.selector, false).await?;
 
     // Credential-mode literal gate (design §6.2): a literal value into an
     // `input[type=password]` bypasses the broker's audited fill path — route
@@ -582,6 +686,33 @@ async fn account_list(_params: Option<Value>, ctx: &DispatchContext) -> DomainRe
         })
         .collect();
     Ok(Some(json!({ "accounts": accounts })))
+}
+
+/// OXI.captureSession — explicit envelope capture of a bound account's live
+/// context (roadmap item 3): the "stop the work" path. The operator
+/// captures the freshest cookies before tearing a child down, instead of
+/// waiting for a detector-gated auto-save. Audited as `session_capture` by
+/// the manager; agent-role only (viewers are outside the allowlist).
+///
+/// Response: `{accountId, state, sessionSummary}`.
+async fn capture_session_cmd(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let surface = missing_login_surface(ctx)?;
+    let params = params.unwrap_or(Value::Null);
+    let account_id = string_param(&params, "accountId")
+        .ok_or_else(|| missing_param("accountId"))?
+        .to_string();
+    let record = surface
+        .capture_bound(&account_id)
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: format!("captureFailed: {e}"),
+        })?;
+    Ok(Some(json!({
+        "accountId": record.account_id,
+        "state": record.state.as_str(),
+        "sessionSummary": record.session_summary,
+    })))
 }
 
 /// OXI.beginLogin — open a login window (§5.1). `mode: "user"` issues a

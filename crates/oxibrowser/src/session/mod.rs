@@ -17,7 +17,12 @@ use std::sync::Arc;
 use tab_manager::TabManager;
 
 /// Run the session REPL. Returns exit code.
-pub async fn run_session(allow_private_ips: bool) -> i32 {
+pub async fn run_session(
+    allow_private_ips: bool,
+    accounts: Option<&str>,
+    ref_tag: Option<&str>,
+    lock_policy: oxibrowser_core::account::LockPolicy,
+) -> i32 {
     let mut config = oxibrowser_core::BrowserConfig::headless();
     if allow_private_ips {
         config.enable_ssrf_filter = false;
@@ -34,8 +39,40 @@ pub async fn run_session(allow_private_ips: bool) -> i32 {
     let browser = Arc::new(browser);
 
     let mut manager = TabManager::new();
-    let mut accounts = executor::AccountRuntime::new(browser.clone());
+    let mut accounts_rt = executor::AccountRuntime::new(browser.clone());
+    accounts_rt.set_account_options(lock_policy, ref_tag.map(str::to_string));
 
+    // `--account id[,…]` (roadmap item 4): bind each account's envelope into
+    // a context; the first is primary — REPL `new` tabs land inside it.
+    if let Some(list) = accounts {
+        let ids: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            let resp =
+                CliResponse::error("--account requires at least one account id", "INPUT_VALIDATION");
+            resp.print_json();
+            return 2;
+        }
+        let mut primary_set = false;
+        for id in ids {
+            match crate::account_cli::bind_account_context(&browser, id, ref_tag).await {
+                Ok(ctx) => {
+                    if !primary_set {
+                        accounts_rt.set_primary_context(ctx);
+                        primary_set = true;
+                    }
+                }
+                Err(e) => {
+                    let resp = CliResponse::error(e, "RUNTIME_ERROR");
+                    resp.print_json();
+                    return 1;
+                }
+            }
+        }
+    }
     // Read from stdin on a blocking thread so we can select with signals
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<String>>(32);
     std::thread::spawn(move || {
@@ -90,7 +127,7 @@ pub async fn run_session(allow_private_ips: bool) -> i32 {
                             break 0;
                         }
 
-                        let resp = executor::execute(cmd, &browser, &mut manager, &mut accounts).await;
+                        let resp = executor::execute(cmd, &browser, &mut manager, &mut accounts_rt).await;
                         resp.print_json();
                     }
                     Some(None) | None => {

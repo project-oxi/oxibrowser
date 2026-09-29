@@ -6,6 +6,7 @@
 pub mod dom_serializer;
 pub mod dom_snapshot;
 pub mod form;
+pub mod idb;
 pub mod input;
 pub mod job_queue;
 pub mod mouse;

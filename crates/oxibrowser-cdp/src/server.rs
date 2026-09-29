@@ -40,6 +40,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 /// Maximum allowed CDP message size (1 MB).
 pub(crate) const MAX_CDP_MESSAGE_SIZE: usize = 1024 * 1024;
 
+
 /// Derive the `Sec-WebSocket-Accept` value from the client's key.
 fn derive_accept_key(client_key: &[u8]) -> String {
     let mut hasher = Sha1::new();
@@ -47,6 +48,46 @@ fn derive_accept_key(client_key: &[u8]) -> String {
     hasher.update(WS_MAGIC_GUID);
     let hash = hasher.finalize();
     base64::engine::general_purpose::STANDARD.encode(hash)
+}
+
+/// Minimal percent-decoding for query-parameter claims (viewer token is
+/// `oxi-viewer-<uuid>` — plain in practice, decoded for correctness).
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                // RFC 3986: both nibbles must be hexdigits — `from_str_radix`
+                // alone would also accept sign prefixes (`%+f`).
+                let hex = bytes
+                    .get(i + 1..i + 3)
+                    .filter(|h| h.iter().all(|b| b.is_ascii_hexdigit()))
+                    .and_then(|h| std::str::from_utf8(h).ok())
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match hex {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// CDP server that listens for HTTP/WebSocket connections.
@@ -254,6 +295,18 @@ impl CdpServer {
         login: Option<Arc<crate::account::LoginSurface>>,
     ) -> anyhow::Result<Response<HttpBody>> {
         match req.uri().path() {
+            "/viewer" => {
+                // Reference viewer (roadmap item 10): the human's mirror —
+                // screencast + input + the viewer-only confirmation cards.
+                // The one-time token is pasted into the page (out-of-band);
+                // the page claims the viewer role via query parameters.
+                Ok(Response::builder()
+                    .header("Content-Type", "text/html; charset=utf-8")
+                    .header("Cache-Control", "no-store")
+                    .body(Full::new(Bytes::from(
+                        include_str!("viewer.html").to_string(),
+                    )))?)
+            }
             "/health" => {
                 let body = serde_json::json!({
                     "status": "ok",
@@ -343,14 +396,26 @@ impl CdpServer {
                 // Role claim (§5.2): `X-Oxi-Role: viewer` + one-time
                 // `X-Oxi-Viewer-Token` upgrades the connection as the
                 // human's mirror; everything else is an agent connection.
+                // Browsers cannot set custom headers on WebSocket — the
+                // reference viewer passes the same claim as query
+                // parameters (`?role=viewer&viewer_token=…`), equivalent to
+                // the headers.
                 let header = |name: &str| {
                     req.headers()
                         .get(name)
                         .and_then(|v| v.to_str().ok())
                         .map(|s| s.trim().to_string())
                 };
-                let role_header = header("x-oxi-role");
-                let viewer_token = header("x-oxi-viewer-token");
+                let query = req.uri().query().unwrap_or_default().to_string();
+                let query_param = |key: &str| {
+                    query.split('&').find_map(|kv| {
+                        let (k, v) = kv.split_once('=')?;
+                        (k == key).then(|| urldecode(v))
+                    })
+                };
+                let role_header = header("x-oxi-role").or_else(|| query_param("role"));
+                let viewer_token = header("x-oxi-viewer-token")
+                    .or_else(|| query_param("viewer_token"));
 
                 let conn_ctx = match (role_header.as_deref(), viewer_token.as_deref()) {
                     (Some("viewer"), Some(token)) => {

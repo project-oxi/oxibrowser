@@ -42,22 +42,56 @@ const MAX_TOTAL_COOKIES: usize = 3000;
 /// Maximum cookie value size in bytes (RFC 6265 §6.1 recommends 4096).
 const MAX_COOKIE_VALUE_SIZE: usize = 4096;
 
+/// Deserialize an epoch-seconds field that may arrive as integer (ours),
+/// float (Playwright `storageState`), or absent/null. Floats truncate
+/// toward zero — sub-second precision is meaningless for cookie expiry.
+/// Negative values (Playwright's `-1` session-cookie convention) map to
+/// `None` = session cookie — otherwise the jar's expiry fold treats them
+/// as long-past and DROPS the cookie on import, silently losing the
+/// session (the exact guide-capture failure this helper exists to fix).
+fn de_epoch_seconds<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => {
+            let secs = n
+                .as_i64()
+                .or_else(|| n.as_f64().map(|f| f.trunc() as i64))
+                .ok_or_else(|| D::Error::custom("epoch seconds must be a number"))?;
+            Ok((secs > 0).then_some(secs))
+        }
+        other => Err(D::Error::custom(format!(
+            "epoch seconds must be a number, got {other:?}"
+        ))),
+    }
+}
+
 /// A parsed cookie entry with its attributes.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CookieEntry {
     pub name: String,
     pub value: String,
     pub path: Option<String>,
     pub domain: Option<String>,
     pub secure: bool,
+    /// Playwright spells this `httpOnly`; the alias keeps both spellings
+    /// deserializable (guide-capture imports, item 11).
+    #[serde(default, rename = "httpOnly", alias = "http_only")]
     pub http_only: bool,
     /// Playwright `storageState` spells this `sameSite`; the alias keeps
     /// older core-serialized snapshots (`same_site`) deserializable. Variant
     /// values serialize as `"Strict"` / `"Lax"` / `"None"` (Playwright casing).
     #[serde(rename = "sameSite", alias = "same_site")]
     pub same_site: Option<SameSite>,
-    /// Raw parsed `Expires` attribute as Unix-epoch seconds.
-    #[serde(default)]
+    /// Raw parsed `Expires` attribute as Unix-epoch seconds. Accepts
+    /// Playwright `storageState` exports, which emit **floating-point**
+    /// epochs (`expires: 1798761600.42`) — truncated to whole seconds.
+    #[serde(default, deserialize_with = "de_epoch_seconds")]
     pub expires: Option<i64>,
     /// Raw parsed `Max-Age` attribute in seconds.
     #[serde(default)]
@@ -486,6 +520,11 @@ impl CookieJar {
     /// `/`, and `max_age`/`expires` are folded into the absolute `expiry` —
     /// an already-expired entry deletes its stored match instead.
     pub fn insert_entry(&mut self, mut entry: CookieEntry) {
+        // Struct-level serde defaults make hand-mangled imports parse with
+        // empty fields — an anonymous cookie is garbage, not state.
+        if entry.name.is_empty() {
+            return;
+        }
         // Enforce value size limit
         if entry.value.len() > MAX_COOKIE_VALUE_SIZE {
             entry.value.truncate(MAX_COOKIE_VALUE_SIZE);

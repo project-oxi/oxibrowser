@@ -503,6 +503,8 @@ enum JsCommand {
     SetPageUrl {
         url: String,
         seed_storage: Option<HashMap<String, String>>,
+        /// IndexedDB seed for the page origin (FM-L5 restore path).
+        seed_idb: Option<std::collections::BTreeMap<String, crate::storage_state::IdbDatabase>>,
         response_tx: Sender<JsResponse>,
     },
     /// Apply a `prefers-color-scheme` override (CDP-style media emulation):
@@ -538,6 +540,11 @@ enum JsCommand {
     /// Set the localStorage sync channel so JS operations propagate to Session.
     SetLocalStorageChannel {
         tx: std::sync::mpsc::Sender<LocalStorageMsg>,
+        response_tx: Sender<JsResponse>,
+    },
+    /// Set the IndexedDB sync channel so JS operations propagate to Session.
+    SetIndexedDbChannel {
+        tx: std::sync::mpsc::Sender<IndexedDbMsg>,
         response_tx: Sender<JsResponse>,
     },
     /// Set the CookieJar so document.cookie can read/write real cookies.
@@ -1234,6 +1241,24 @@ pub enum LocalStorageMsg {
     Drain(std::sync::mpsc::Sender<()>),
 }
 
+/// IndexedDB sync messages (item 12): full-database blobs — last-wins like
+/// the envelope itself, and messages are tiny (token/record JSONs).
+#[derive(Debug)]
+pub enum IndexedDbMsg {
+    /// The current state of `origin`'s database `name` (version + stores).
+    PutDb {
+        origin: String,
+        name: String,
+        version: u64,
+        /// JSON blob of `store → key → record-json`.
+        data: String,
+    },
+    /// `indexedDB.deleteDatabase(name)`.
+    DeleteDb { origin: String, name: String },
+    /// Ordering barrier (mirror of LocalStorageMsg::Drain).
+    Drain(std::sync::mpsc::Sender<()>),
+}
+
 // ---------------------------------------------------------------------------
 // JsRuntime
 // ---------------------------------------------------------------------------
@@ -1654,13 +1679,39 @@ impl JsRuntime {
         url: &str,
         seed_storage: Option<HashMap<String, String>>,
     ) {
+        self.set_page_url_with_storage_seed_idb(url, seed_storage, None);
+    }
+
+    /// [`Self::set_page_url_with_storage_seed`] plus the origin's IndexedDB
+    /// seed (item 12): the JS-side database map is replaced wholesale, the
+    /// same replace-on-navigation contract as localStorage.
+    pub fn set_page_url_with_storage_seed_idb(
+        &mut self,
+        url: &str,
+        seed_storage: Option<HashMap<String, String>>,
+        seed_idb: Option<std::collections::BTreeMap<String, crate::storage_state::IdbDatabase>>,
+    ) {
         let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
         if let Err(e) = self.cmd_tx.send(JsCommand::SetPageUrl {
             url: url.to_string(),
             seed_storage,
+            seed_idb,
             response_tx,
         }) {
             tracing::error!(error = %e, "failed to send SetPageUrl: JS thread has died");
+            return;
+        }
+        let _ = response_rx.recv();
+    }
+
+    /// Set the channel for IndexedDB sync (item 12).
+    pub fn set_indexed_db_channel(&mut self, tx: std::sync::mpsc::Sender<IndexedDbMsg>) {
+        let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
+        if let Err(e) = self
+            .cmd_tx
+            .send(JsCommand::SetIndexedDbChannel { tx, response_tx })
+        {
+            tracing::error!(error = %e, "failed to send SetIndexedDbChannel: JS thread has died");
             return;
         }
         let _ = response_rx.recv();
@@ -2098,6 +2149,8 @@ fn js_thread_loop(
         Arc::new(RwLock::new(None));
     let local_storage_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<LocalStorageMsg>>>> =
         Arc::new(RwLock::new(None));
+    let indexed_db_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<IndexedDbMsg>>>> =
+        Arc::new(RwLock::new(None));
     let cookie_jar_arc: Arc<RwLock<Option<Arc<RwLock<CookieJar>>>>> = Arc::new(RwLock::new(None));
     let dom_snapshot: Arc<RwLock<Option<DomSnapshot>>> = Arc::new(RwLock::new(None));
     // The Blitz-backed render document. `BaseDocument` is effectively `!Send`,
@@ -2292,6 +2345,7 @@ fn js_thread_loop(
             JsCommand::SetPageUrl {
                 url,
                 seed_storage,
+                seed_idb,
                 response_tx,
             } => {
                 set_current_origin(&url);
@@ -2333,6 +2387,29 @@ fn js_thread_loop(
                     seed_storage.unwrap_or_default(),
                     &dom_snapshot_ref,
                     local_storage_tx_arc.clone(),
+                    ls_origin.clone(),
+                );
+                // IndexedDB (item 12): same seeding contract as localStorage —
+                // the origin bucket replaces the JS-side map wholesale.
+                let seed_dbs: std::collections::BTreeMap<String, super::idb::IdbDbState> = seed_idb
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(name, db)| {
+                        (
+                            name,
+                            super::idb::IdbDbState {
+                                version: db.version,
+                                stores: db.stores,
+                                key_paths: db.key_paths,
+                            },
+                        )
+                    })
+                    .collect();
+                let idb_tx = { indexed_db_tx_arc.read().as_ref().cloned() };
+                super::idb::register_indexed_db(
+                    &mut ctx,
+                    seed_dbs,
+                    std::rc::Rc::new(std::cell::RefCell::new(idb_tx)),
                     ls_origin,
                 );
                 let _ = response_tx.send(JsResponse::Done);
@@ -2378,6 +2455,10 @@ fn js_thread_loop(
             }
             JsCommand::SetLocalStorageChannel { tx, response_tx } => {
                 *local_storage_tx_arc.write() = Some(tx);
+                let _ = response_tx.send(JsResponse::Done);
+            }
+            JsCommand::SetIndexedDbChannel { tx, response_tx } => {
+                *indexed_db_tx_arc.write() = Some(tx);
                 let _ = response_tx.send(JsResponse::Done);
             }
             JsCommand::SetFetchChannel {
@@ -3596,6 +3677,7 @@ fn drain_timers(queue: &Rc<TokioJobQueue>, ctx: &mut Context) {
     // timers that the rest of this drain must then process (Phase 3).
     drain_pending_fetch_responses(ctx);
     drain_ws_events(ctx);
+    super::idb::drain_idb_events(ctx);
     let mut iterations = 0u32;
     loop {
         let due = queue.pop_due_timers();

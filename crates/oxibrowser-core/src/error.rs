@@ -86,6 +86,12 @@ pub enum CoreError {
 
     #[error("session store io error: {0}")]
     SessionStoreIo(String),
+
+    /// Another process holds this account's advisory lock (FM-L7 process
+    /// boundary). Retry with `--lock-wait` / `--lock-timeout`, or after the
+    /// holder exits — the kernel releases the lock on holder death.
+    #[error("account is locked by another process: {detail}")]
+    AccountLocked { detail: String },
 }
 
 /// Convenience Result alias.

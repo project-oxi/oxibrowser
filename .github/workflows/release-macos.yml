@@ -1,0 +1,147 @@
+name: Release macOS
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN: oxibrowser
+
+jobs:
+  macos:
+    name: Sign, notarize, publish macOS binary
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - uses: dtolnay/rust-toolchain@1.96
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          brew install python-setuptools 2>/dev/null || true
+          # fontconfig/freetype/expat come from the system/homebrew for Blitz
+
+      - name: Build (aarch64 + x86_64, release)
+        run: |
+          cargo build --release --features browser --target aarch64-apple-darwin
+          cargo build --release --features browser --target x86_64-apple-darwin
+
+      - name: Lipo universal binary
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/$BIN \
+            target/x86_64-apple-darwin/release/$BIN \
+            -output dist/$BIN
+          file dist/$BIN
+
+      - name: Import Developer ID certificate into a temporary keychain
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Never echo the certificate or password. The keychain lives in the
+          # runner's temp dir and is deleted with the job.
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$(uuidgen)" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$(uuidgen)" "$KEYCHAIN_PATH" || true
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$(uuidgen)" "$KEYCHAIN_PATH" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          IMPORTED=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application/{print $2; exit}')
+          if [ -z "$IMPORTED" ]; then
+            echo "no codesigning identity found after import" >&2
+            exit 1
+          fi
+          if [ "$IMPORTED" != "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "imported identity ($IMPORTED) != APPLE_SIGNING_IDENTITY" >&2
+            exit 1
+          fi
+          rm -f "$CERT_PATH"
+
+      - name: Sign (hardened runtime, secure timestamp)
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          codesign --force --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" dist/$BIN
+          codesign --verify --strict --verbose=2 dist/$BIN
+          codesign -dvv dist/$BIN 2>&1 | grep -E 'Identifier|Authority=Developer ID Application|TeamIdentifier' || true
+
+      - name: Zip for notarization
+        run: |
+          ditto -c -k --keepParent dist/$BIN dist/$BIN.zip
+
+      - name: Notarize (notarytool) and staple
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          xcrun notarytool submit dist/$BIN.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          xcrun stapler staple dist/$BIN
+          xcrun stapler validate dist/$BIN
+
+      - name: Gatekeeper assessment
+        run: |
+          spctl -a -t execute -v dist/$BIN
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          shasum -a 256 $BIN > $BIN.sha256
+          shasum -a 256 $BIN.zip > $BIN.zip.sha256
+          cat $BIN.sha256 $BIN.zip.sha256
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: oxibrowser-macos
+          path: |
+            dist/${{ env.BIN }}
+            dist/${{ env.BIN }}.zip
+            dist/${{ env.BIN }}.sha256
+            dist/${{ env.BIN }}.zip.sha256
+
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # The Publish workflow (crates.io + release notes) may still be
+          # running — create the release if it does not exist yet, then
+          # upload with --clobber for idempotent retries.
+          for i in 1 2 3 4 5 6; do
+            if gh release view "$TAG" > /dev/null 2>&1; then break; fi
+            echo "release $TAG not visible yet ($i/6) — waiting"
+            sleep 30
+          done
+          gh release view "$TAG" > /dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --verify-tag \
+              --notes "macOS Developer ID signed + notarized build"
+          gh release upload "$TAG" \
+            dist/$BIN dist/$BIN.zip dist/$BIN.sha256 dist/$BIN.zip.sha256 \
+            --clobber

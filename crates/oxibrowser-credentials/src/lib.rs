@@ -36,7 +36,7 @@ pub use consent::{
 pub use error::CredError;
 pub use keyring::{KeyringKeyProvider, KeyringProvider};
 pub use oxibrowser_core::storage::session_store::KeyProvider;
-pub use policy::{ConfirmationToken, CredentialAction, PolicyEngine, UseRequest};
+pub use policy::{ConfirmationToken, CredentialAction, PolicyEngine, UseRequest, CONFIRMATION_TTL};
 pub use provider::{
     CredentialId, CredentialKind, CredentialMeta, CredentialProvider, CredentialRecord,
     InMemoryProvider, NewCredential, SERVICE_PREFIX,

@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.24.1"
+version = "0.25.0"
 edition = "2024"
 license = "MIT"
 authors = ["project-oxi contributors"]
@@ -53,6 +53,7 @@ boa_gc = "0.20"
 getrandom = "0.3"
 httpdate = "1"
 psl = "2"
+libc = "0.2"
 wasmi = "1.1"
 
 # Rendering stack (Blitz integration) — isolated to oxibrowser-render so the
@@ -67,7 +68,7 @@ peniko = "0.6"
 png = "0.18"
 
 [workspace.metadata.release]
-version = "0.24.1"
+version = "0.25.0"
 
 [profile.release]
 strip = true

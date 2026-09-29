@@ -1,6 +1,6 @@
 [package]
 name = "oxibrowser"
-version = "0.24.1"
+version = "0.25.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -25,6 +25,7 @@ browser = [
     "dep:chrono",
     "dep:rpassword",
     "dep:psl",
+    "dep:tokio-tungstenite",
 ]
 
 [[bin]]
@@ -49,14 +50,15 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 
-oxibrowser-core = { version = "0.24.1", path = "../oxibrowser-core", optional = true }
-oxibrowser-cdp = { version = "0.24.1", path = "../oxibrowser-cdp", optional = true }
-oxibrowser-credentials = { version = "0.24.1", path = "../oxibrowser-credentials", optional = true }
+oxibrowser-core = { version = "0.25.0", path = "../oxibrowser-core", optional = true }
+oxibrowser-cdp = { version = "0.25.0", path = "../oxibrowser-cdp", optional = true }
+oxibrowser-credentials = { version = "0.25.0", path = "../oxibrowser-credentials", optional = true }
 
 # account/credential CLI support (browser feature)
 chrono = { version = "0.4", optional = true }
 rpassword = { version = "7", optional = true }
 psl = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
 

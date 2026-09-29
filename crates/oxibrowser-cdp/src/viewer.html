@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>OxiBrowser Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { color-scheme: dark; font: 13px/1.45 ui-monospace, monospace; }
+  body { margin: 0; background: #101418; color: #d7dde3; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; gap: 8px; align-items: center; padding: 8px 10px; background: #171d24; border-bottom: 1px solid #2a3340; flex-wrap: wrap; }
+  header b { color: #7fd1a8; }
+  input[type=text], input[type=password] { background: #0c1014; color: #d7dde3; border: 1px solid #2a3340; border-radius: 4px; padding: 5px 8px; }
+  #token { width: 220px; }
+  #url { flex: 1; min-width: 200px; }
+  button { background: #1f2a35; color: #d7dde3; border: 1px solid #34404e; border-radius: 4px; padding: 5px 12px; cursor: pointer; }
+  button:hover { background: #27343f; }
+  #stage { flex: 1; overflow: auto; display: flex; align-items: flex-start; justify-content: center; background: #0a0d10; position: relative; }
+  #frame { image-rendering: auto; box-shadow: 0 0 0 1px #2a3340; max-width: 100%; cursor: text; }
+  #state { padding: 4px 10px; background: #171d24; border-top: 1px solid #2a3340; color: #8fa1b3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #cards { position: absolute; top: 10px; right: 10px; width: 300px; display: flex; flex-direction: column; gap: 8px; }
+  .card { background: #1a222b; border: 1px solid #3a4a5c; border-radius: 6px; padding: 10px; box-shadow: 0 4px 14px rgba(0,0,0,.5); }
+  .card h3 { margin: 0 0 6px; font-size: 13px; color: #f0c674; }
+  .card .row { color: #8fa1b3; margin: 2px 0; word-break: break-all; }
+  .card .btns { display: flex; gap: 8px; margin-top: 8px; }
+  .approve { background: #1d3a2a; border-color: #2f5c44; }
+  .deny { background: #3a1d1d; border-color: #5c2f2f; }
+  .stale { opacity: .55; }
+</style>
+</head>
+<body>
+<header>
+  <b>oxi viewer</b>
+  <input id="token" type="password" placeholder="viewer token (oxi-viewer-…)">
+  <button id="connect">connect</button>
+  <button id="disconnect" class="stale">disconnect</button>
+  <span style="flex:1"></span>
+  <input id="url" type="text" placeholder="https://…">
+  <button id="go">go</button>
+</header>
+<div id="stage">
+  <img id="frame" alt="" hidden>
+  <div id="cards"></div>
+</div>
+<div id="state">disconnected — paste the one-time viewer token (CLI `account login --json` stdout) and connect</div>
+<script>
+"use strict";
+// Reference viewer (roadmap item 10): the human's mirror for login windows
+// and the approval surface for confirmation cards. The one-time viewer
+// token stays out-of-band: it is pasted here (or carried in this page's
+// own ?token= by the host that received it from CLI stdout) — it never
+// travels through the agent/CDP channel.
+const $ = (id) => document.getElementById(id);
+const state = $("state"), frame = $("frame"), cards = $("cards");
+let ws = null, nextId = 1, view = null; // view = {w,h} of the last frame
+
+// Host convenience: ?token= prefills (host got it out-of-band from stdout).
+const pageToken = new URLSearchParams(location.search).get("token");
+if (pageToken) $("token").value = pageToken;
+
+const log = (msg) => { state.textContent = msg; console.log(msg); };
+
+function send(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = nextId++;
+    const onMsg = (ev) => {
+      let m; try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.id !== id) return;
+      ws.removeEventListener("message", onMsg);
+      if (m.error) reject(new Error(m.error.message || "cdp error"));
+      else resolve(m.result);
+    };
+    ws.addEventListener("message", onMsg);
+    ws.send(JSON.stringify({ id, method, params: params || {} }));
+  });
+}
+
+async function connect() {
+  const token = $("token").value.trim();
+  if (!token) { log("paste the viewer token first"); return; }
+  // Browser WebSocket cannot set headers — the role claim rides on the
+  // query string (?role=viewer&viewer_token=…), accepted by the server
+  // exactly like the X-Oxi-* headers. `?auth=` in the PAGE url carries the
+  // server auth token (serve --auth-token) into the WS query as `token=`.
+  const auth = new URLSearchParams(location.search).get("auth");
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host +
+              "/ws?" + (auth ? "token=" + encodeURIComponent(auth) + "&" : "") +
+              "role=viewer&viewer_token=" + encodeURIComponent(token);
+  ws = new WebSocket(url);
+  ws.onopen = async () => {
+    log("connected as viewer");
+    $("connect").classList.add("stale"); $("disconnect").classList.remove("stale");
+    try { await send("Page.startScreencast", { format: "png" }); } catch (e) { log(e.message); }
+  };
+  ws.onmessage = (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (!m.method) return;
+    if (m.method === "Page.screencastFrame") onFrame(m.params);
+    else if (m.method === "OXI.confirmationRequired") onCard(m.params);
+    else if (m.method === "OXI.loginStateChanged" || m.method === "OXI.accountStateChanged")
+      log(m.method + " " + JSON.stringify(m.params));
+  };
+  ws.onclose = () => { log("disconnected"); $("connect").classList.remove("stale"); $("disconnect").classList.add("stale"); ws = null; };
+  ws.onerror = () => log("connection error (token used/expired?)");
+}
+function disconnect() { if (ws) ws.close(); }
+
+function onFrame(p) {
+  frame.hidden = false;
+  frame.src = "data:image/png;base64," + p.data;
+  const m = p.metadata || {};
+  view = { w: m.viewportWidth || frame.naturalWidth, h: m.viewportHeight || frame.naturalHeight };
+  // Flow control: ack so the next changed frame can flow.
+  if (ws && p.sessionId) send("Page.screencastFrameAck", { sessionId: p.sessionId }).catch(() => {});
+}
+
+// ── input mapping ─────────────────────────────────────────────────────────
+function toPage(e) {
+  const r = frame.getBoundingClientRect();
+  const sx = (e.clientX - r.left) / r.width, sy = (e.clientY - r.top) / r.height;
+  return { x: Math.round(sx * view.w), y: Math.round(sy * view.h) };
+}
+frame.addEventListener("mousedown", (e) => { e.preventDefault(); mouse(e, "mousePressed", e.button); });
+frame.addEventListener("mouseup",   (e) => mouse(e, "mouseReleased", e.button); });
+frame.addEventListener("click",     (e) => { mouse(e, "mousePressed", 0); mouse(e, "mouseReleased", 0); });
+frame.addEventListener("mousemove", (e) => { if (e.buttons) mouse(e, "mouseMoved", 0); });
+frame.addEventListener("contextmenu", (e) => e.preventDefault());
+async function mouse(e, type, button) {
+  if (!ws || !view) return true;
+  const { x, y } = toPage(e);
+  const btn = ["left", "middle", "right"][button] || "left";
+  const params = { type, x, y, button: btn, clickCount: type.includes("Pressed") ? 1 : 0 };
+  if (type === "mousePressed") params.button = btn;
+  try { await send("Input.dispatchMouseEvent", params); } catch (err) { log(err.message); }
+  return true;
+}
+// Keyboard: route through a focusable proxy so the page gets real keys.
+frame.tabIndex = 0;
+frame.addEventListener("keydown", async (e) => {
+  if (!ws) return;
+  e.preventDefault();
+  const base = { type: "keyDown", key: e.key, code: e.code,
+                 windowsVirtualKeyCode: e.keyCode, nativeVirtualKeyCode: e.keyCode };
+  if (e.key.length === 1) base.text = e.key;
+  try { await send("Input.dispatchKeyEvent", base); } catch (err) { log(err.message); }
+});
+frame.addEventListener("keyup", (e) => {
+  if (!ws) return; e.preventDefault();
+  send("Input.dispatchKeyEvent", { type: "keyUp", key: e.key, code: e.code,
+    windowsVirtualKeyCode: e.keyCode, nativeVirtualKeyCode: e.keyCode }).catch(() => {});
+});
+
+// ── navigation ────────────────────────────────────────────────────────────
+async function go() {
+  if (!ws) { log("connect first"); return; }
+  let u = $("url").value.trim();
+  if (!u) return;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) u = "https://" + u;
+  try { await send("Page.navigate", { url: u }); log("navigating " + u); }
+  catch (err) { log(err.message); }
+}
+
+// ── confirmation cards (viewer-only approval surface) ────────────────────
+function onCard(p) {
+  const el = document.createElement("div");
+  el.className = "card";
+  el.innerHTML = "<h3>confirmation required</h3>" +
+    '<div class="row">action: ' + esc(p.action || "?") + "</div>" +
+    '<div class="row">origin: ' + esc(p.origin || "?") + "</div>" +
+    '<div class="row">request: ' + esc(String(p.requestId || "")) + "</div>" +
+    '<div class="btns"><button class="approve">approve</button><button class="deny">deny</button></div>';
+  const [ok, no] = el.querySelectorAll("button");
+  const answer = async (approved) => {
+    ok.disabled = no.disabled = true;
+    try {
+      await send("OXI.resolveConfirmation", { requestId: p.requestId, approved });
+      log("confirmation " + (approved ? "approved" : "denied") + ": " + p.requestId);
+    } catch (err) { log(err.message); }
+    el.remove();
+  };
+  ok.onclick = () => answer(true);
+  no.onclick = () => answer(false);
+  cards.appendChild(el);
+  log("confirmation required — approve or deny on the card");
+  // Cards time out server-side (timeoutMs) — fade but let the server decide.
+  if (p.timeoutMs) setTimeout(() => el.classList.add("stale"), Math.max(0, p.timeoutMs - 2000));
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+$("connect").onclick = connect;
+$("disconnect").onclick = disconnect;
+$("go").onclick = go;
+$("url").addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+</script>
+</body>
+</html>

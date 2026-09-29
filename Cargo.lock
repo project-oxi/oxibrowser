@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3498,7 +3498,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-cdp"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3526,7 +3526,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-core"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3542,6 +3542,7 @@ dependencies = [
  "getrandom 0.3.4",
  "httpdate",
  "image",
+ "libc",
  "md-5 0.10.6",
  "oxibrowser-render",
  "parking_lot",
@@ -3569,7 +3570,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-credentials"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "base64",
  "chrono",
@@ -3589,7 +3590,7 @@ dependencies = [
 
 [[package]]
 name = "oxibrowser-render"
-version = "0.24.1"
+version = "0.25.0"
 dependencies = [
  "anyrender",
  "anyrender_vello_cpu",

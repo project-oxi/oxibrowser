@@ -30,6 +30,19 @@ impl TabManager {
         Ok(id)
     }
 
+    /// Create a tab inside a specific context (`session --account` primary).
+    pub async fn create_tab_in(
+        &mut self,
+        browser: &Browser,
+        ctx: &std::sync::Arc<oxibrowser_core::context::BrowserContext>,
+    ) -> Result<String, String> {
+        let id = format!("t{}", self.next_id);
+        self.next_id += 1;
+        let tab = browser.new_tab_in(ctx).await.map_err(|e| format!("{e}"))?;
+        self.tabs.insert(id.clone(), tab);
+        Ok(id)
+    }
+
     /// Register an already-created tab (e.g. one created inside an account
     /// context) and return its id.
     pub fn insert_tab(&mut self, tab: Tab) -> String {

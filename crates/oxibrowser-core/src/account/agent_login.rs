@@ -654,7 +654,7 @@ impl AgentLoginEngine {
             // a fresh process). Adopt the orphaned window instead of
             // bricking the account (audit says who and why).
             AccountState::LoggingIn => {
-                self.manager.registry().set_state(
+                self.manager.set_state_locked(
                     account_id,
                     AccountState::NeedsLogin,
                     Some("recovered_orphaned_login_window".to_string()),
@@ -1149,7 +1149,7 @@ impl AgentLoginEngine {
 
     fn enter_logging_in(&self, account_id: &str, record: &AccountRecord) -> Result<()> {
         let from = record.state;
-        let updated = self.manager.registry().set_state(
+        let updated = self.manager.set_state_locked(
             account_id,
             AccountState::LoggingIn,
             Some(format!("login_started:agent:{}", self.agent_id)),
@@ -1194,7 +1194,7 @@ impl AgentLoginEngine {
     /// Failure exit from `logging_in` (§4.2: `Valid` | `NeedsLogin` only).
     fn revert_to_needs_login(&self, account_id: &str, detail: &str) -> Result<AccountRecord> {
         let from = AccountState::LoggingIn;
-        let record = self.manager.registry().set_state(
+        let record = self.manager.set_state_locked(
             account_id,
             AccountState::NeedsLogin,
             Some(detail.to_string()),
@@ -1212,7 +1212,7 @@ impl AgentLoginEngine {
 
     fn mark_challenge(&self, account_id: &str, detail: &str) -> Result<AccountRecord> {
         let from = AccountState::LoggingIn;
-        let record = self.manager.registry().set_state(
+        let record = self.manager.set_state_locked(
             account_id,
             AccountState::Challenge,
             Some(detail.to_string()),

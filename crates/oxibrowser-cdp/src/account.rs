@@ -49,6 +49,11 @@ pub struct LoginSurface {
     browser: Arc<Browser>,
     /// account_id → bound context (`serve --account`, `oxiAccount`).
     bindings: StdMutex<HashMap<String, Arc<BrowserContext>>>,
+    /// context_id → allowed to perform pattern-matched irreversible
+    /// actions (roadmap item 16): CLI-bound contexts (local user direct)
+    /// and `createBrowserContext` contexts whose agent holds an
+    /// `irreversible` grant.
+    irreversible_contexts: StdMutex<HashSet<String>>,
     /// context_id → active takeover (lazy expiry on read).
     takeovers: StdRwLock<HashMap<String, Takeover>>,
     /// One-time viewer tokens: token → context_id. Removed on first use.
@@ -66,6 +71,7 @@ impl LoginSurface {
             orchestrator,
             browser,
             bindings: StdMutex::new(HashMap::new()),
+            irreversible_contexts: StdMutex::new(HashSet::new()),
             takeovers: StdRwLock::new(HashMap::new()),
             viewer_tokens: StdMutex::new(HashMap::new()),
             login_sessions: StdMutex::new(HashMap::new()),
@@ -160,7 +166,9 @@ impl LoginSurface {
     }
 
     /// Bind an account to an existing context (the `serve --account` /
-    /// `Target.createBrowserContext {oxiAccount}` path).
+    /// `Target.createBrowserContext {oxiAccount}` path). No irreversible
+    /// capability — that is granted by [`LoginSurface::mark_irreversible`]
+    /// (grant probe) or [`LoginSurface::bind_direct`] (local user).
     pub fn bind(&self, account_id: &str, ctx: Arc<BrowserContext>) {
         self.bindings
             .lock()
@@ -168,6 +176,43 @@ impl LoginSurface {
             .insert(account_id.to_string(), ctx);
     }
 
+    /// Bind + irreversible capability for CLI-launched contexts
+    /// (`serve/session --account`): the local user authorized the session
+    /// directly, so pattern-matched irreversible actions are allowed.
+    pub fn bind_direct(&self, account_id: &str, ctx: Arc<BrowserContext>) {
+        self.mark_irreversible(ctx.id().as_str());
+        self.bind(account_id, ctx);
+    }
+
+    /// Mark a context as irreversible-capable (the `createBrowserContext`
+    /// grant-probe path — item 16).
+    pub fn mark_irreversible(&self, context_id: &str) {
+        self.irreversible_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(context_id.to_string());
+    }
+
+    /// May interactions in this context execute pattern-matched irreversible
+    /// actions?
+    pub fn irreversible_allowed(&self, context_id: &str) -> bool {
+        self.irreversible_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(context_id)
+    }
+
+    /// Reverse lookup: which account is this context bound to?
+    pub fn account_for_context(&self, context_id: &str) -> Option<String> {
+        let bindings = self
+            .bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        bindings
+            .iter()
+            .find(|(_, ctx)| ctx.id().as_str() == context_id)
+            .map(|(account, _)| account.clone())
+    }
     /// Register the takeover window for an open login (context, deadline,
     /// one-time viewer token).
     fn register_takeover(&self, handle: &LoginHandle, ctx: Arc<BrowserContext>) {
@@ -366,5 +411,57 @@ impl LoginSurface {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(login_id);
+    }
+}
+
+impl LoginSurface {
+    /// Explicit envelope capture of a **bound** account's live context
+    /// (`OXI.captureSession`, roadmap item 3): mint a session inside the
+    /// bound context (it sees the context's live jar + storage), seal the
+    /// envelope via the shared manager, close the session again.
+    ///
+    /// The use case is "stop the work" — the operator (knock) captures the
+    /// freshest cookies right before tearing the child down, instead of
+    /// waiting for a detector-gated auto-save.
+    pub async fn capture_bound(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<oxibrowser_core::account::AccountRecord> {
+        let ctx = {
+            let bindings = self
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bindings.get(account_id).cloned()
+        }
+        .ok_or_else(|| anyhow::anyhow!("noBoundContext: account {account_id} is not bound"))?;
+
+        let session = self
+            .browser
+            .new_session_in(&ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let manager = Arc::clone(&self.orchestrator().shared_manager());
+        let keys = self.orchestrator().shared_keys();
+        let account = account_id.to_string();
+        // Capture reads the keychain + writes the envelope synchronously —
+        // keep it off the tokio worker (same pattern as restore).
+        let capture_session = Arc::clone(&session);
+        let record = tokio::task::spawn_blocking(move || {
+            let guard = capture_session.blocking_read();
+            manager.capture_session(&account, &guard, keys.as_ref())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("capture task failed: {e}"))
+        .and_then(|r| r.map_err(|e| anyhow::anyhow!("{e}")));
+        // The capture session was a camera, not a worker — close it even on
+        // failure (a locked account or keychain error must not leak the
+        // session slot + runtime threads inside the bound context).
+        if let Err(e) = session.write().await.close().await {
+            tracing::warn!(error = %e, "capture session close failed");
+        }
+        self.browser.cleanup_closed_sessions();
+        let record = record?;
+        Ok(record)
     }
 }

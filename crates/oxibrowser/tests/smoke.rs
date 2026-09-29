@@ -37,8 +37,11 @@ impl OxiBrowserProcess {
                 "run",
                 "-p",
                 "oxibrowser",
+                "--features",
+                "browser",
                 "--",
                 "serve",
+                "--allow-private-ips",
                 "--port",
                 &port.to_string(),
             ])

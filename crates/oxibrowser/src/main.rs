@@ -47,6 +47,14 @@ struct Cli {
     /// Applies to `--har` output and CDP network event URLs.
     #[arg(long = "redact-header", global = true, value_name = "NAME")]
     redact_headers: Vec<String>,
+    /// Wait indefinitely for a locked account's advisory lock instead of
+    /// failing fast (FM-L7). Mutually exclusive with --lock-timeout.
+    #[arg(long, global = true, conflicts_with = "lock_timeout")]
+    lock_wait: bool,
+    /// Wait up to SEC seconds for a locked account's advisory lock before
+    /// failing (FM-L7). Mutually exclusive with --lock-wait.
+    #[arg(long, global = true, value_name = "SEC")]
+    lock_timeout: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -118,6 +126,10 @@ enum Commands {
         /// dedicated context, credential mode on).
         #[arg(long, value_name = "ID")]
         account: Option<String>,
+        /// Correlation tag stamped on audit events (`session_restore`,
+        /// `account_use`) — joins runs with the audit ledger.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
         /// Timeout in seconds.
         #[arg(long, default_value_t = 30)]
         timeout: u64,
@@ -177,6 +189,14 @@ enum Commands {
         /// Use for local development only.
         #[arg(long)]
         allow_private_ips: bool,
+        /// Bind to one or more accounts (comma-separated): each gets a
+        /// context with its stored envelope restored (credential mode on);
+        /// the first is primary — new REPL tabs land inside it.
+        #[arg(long, value_name = "IDS")]
+        account: Option<String>,
+        /// Correlation tag stamped on audit events.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
     },
 
     /// Start CDP server for Puppeteer/Playwright.
@@ -216,6 +236,14 @@ enum Commands {
         /// OXI.account* surface (login windows, viewer role).
         #[arg(long, value_name = "IDS")]
         account: Option<String>,
+        /// Correlation tag stamped on audit events (`session_restore`,
+        /// `account_use`) — joins runs with the audit ledger.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
+        /// Acting agent identity for `--mcp` (ledger + escalation
+        /// annotations; default "main").
+        #[arg(long, value_name = "ID")]
+        as_agent: Option<String>,
     },
 
     /// Print CLI schema as JSON (for agents).
@@ -265,8 +293,10 @@ enum Commands {
 
     /// Print version information.
     Version {
-        /// Output as JSON.
-        #[arg(long, hide = true)]
+        /// Output as JSON (includes install path and effective keychain
+        /// service prefix — operational self-verification for hosts that
+        /// pin binaries, e.g. knock).
+        #[arg(long)]
         json: bool,
     },
 
@@ -322,9 +352,24 @@ async fn main() {
         oxibrowser_core::security::redact::set_extra_sensitive_headers(cli.redact_headers.clone());
     }
 
+    // Account advisory-lock policy from `--lock-wait` / `--lock-timeout`
+    // (FM-L7). Default: fail fast.
+    #[cfg(feature = "browser")]
+    let lock_policy = if cli.lock_wait {
+        oxibrowser_core::account::LockPolicy::Block
+    } else {
+        match cli.lock_timeout {
+            Some(secs) => oxibrowser_core::account::LockPolicy::Timeout(
+                std::time::Duration::from_secs(secs),
+            ),
+            None => oxibrowser_core::account::LockPolicy::FailFast,
+        }
+    };
+
     #[cfg(feature = "browser")]
     let audit_ctx = account_cli::AuditContext {
         path: effective_audit_path(&cli),
+        lock: lock_policy.clone(),
     };
 
     let exit_code = match cli.command {
@@ -349,6 +394,7 @@ async fn main() {
             allow_private_ips,
             telemetry,
             account,
+            ref_tag,
             timeout,
         } => {
             run_fetch(
@@ -372,6 +418,7 @@ async fn main() {
                 allow_private_ips,
                 telemetry,
                 account.as_deref(),
+                ref_tag.as_deref(),
                 timeout,
             )
             .await
@@ -407,7 +454,15 @@ async fn main() {
         Commands::Run {
             script, timeout, ..
         } => run_script(&script, timeout).await,
-        Commands::Session { allow_private_ips } => session::run_session(allow_private_ips).await,
+        Commands::Session { allow_private_ips, account, ref_tag } => {
+            session::run_session(
+                allow_private_ips,
+                account.as_deref(),
+                ref_tag.as_deref(),
+                lock_policy.clone(),
+            )
+            .await
+        }
         Commands::Serve {
             host,
             port,
@@ -417,9 +472,19 @@ async fn main() {
             auth_token,
             mcp,
             account,
+            ref_tag,
+            as_agent,
         } => {
             if mcp {
-                mcp::run_mcp_stdio(cookie_file.as_deref(), allow_private_ips, proxy).await
+                mcp::run_mcp_stdio(
+                    cookie_file.as_deref(),
+                    allow_private_ips,
+                    proxy,
+                    account.as_deref(),
+                    as_agent.as_deref(),
+                    ref_tag.as_deref(),
+                )
+                .await
             } else {
                 run_serve(
                     &host,
@@ -429,6 +494,8 @@ async fn main() {
                     proxy,
                     auth_token,
                     account.as_deref(),
+                    ref_tag.as_deref(),
+                    audit_ctx.lock.clone(),
                     audit_ctx.path.clone(),
                 )
                 .await
@@ -471,14 +538,31 @@ async fn main() {
             }
         }
         Commands::Version { json } => {
+            let install_path = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            // Env override keeps parallel installs isolated without a CLI
+            // flag on every credential call (roadmap item 15). The default
+            // mirrors `oxibrowser_credentials::provider::SERVICE_PREFIX`
+            // (the credentials crate is browser-gated; version is not).
+            let keychain_prefix = std::env::var("OXIBROWSER_KEYCHAIN_PREFIX")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "com.oxibrowser.agent".to_string());
             if json {
-                let resp = output::CliResponse::success(
-                    serde_json::json!({"version": env!("CARGO_PKG_VERSION"), "name": "oxibrowser"}),
-                );
+                let resp = output::CliResponse::success(serde_json::json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "name": "oxibrowser",
+                    "install_path": install_path,
+                    "keychain_service_prefix": keychain_prefix,
+                }));
                 resp.print_json();
                 0
             } else {
-                println!("oxibrowser {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "oxibrowser {} ({install_path}, keychain {keychain_prefix})",
+                    env!("CARGO_PKG_VERSION")
+                );
                 0
             }
         }
@@ -521,19 +605,42 @@ fn effective_audit_path(cli: &Cli) -> Option<PathBuf> {
 
 /// Print an error and return the exit code.
 pub(crate) fn print_error(msg: &str, error_code: &str, json: bool) -> i32 {
+    print_error_details(msg, error_code, None, json)
+}
+
+/// [`print_error`] with a structured `details` payload (the
+/// `CONSENT_REQUIRED` contract — see [`output::CliResponse::error_with_details`]).
+/// In `--json` mode the payload rides the stdout envelope; otherwise the
+/// human line goes to stderr followed by one bare JSON object line (also
+/// stderr) so callers can still parse the contract without regexes.
+pub(crate) fn print_error_details(
+    msg: &str,
+    error_code: &str,
+    details: Option<serde_json::Value>,
+    json: bool,
+) -> i32 {
     let code = match error_code {
         "INVALID_URL" | "INVALID_SELECTOR" | "INPUT_VALIDATION" | "PATH_TRAVERSAL"
         | "SSRF_BLOCKED" => 2,
         "TIMEOUT" => 3,
         "NETWORK_ERROR" | "HTTP_ERROR" => 4,
+        "CONSENT_REQUIRED" => 5,
         _ => 1,
     };
 
     if json {
-        let resp = output::CliResponse::error(msg, error_code);
+        let resp = match details {
+            Some(details) => output::CliResponse::error_with_details(msg, error_code, details),
+            None => output::CliResponse::error(msg, error_code),
+        };
         resp.print_json();
     } else {
         eprintln!("Error: {msg}");
+        if let Some(details) = details {
+            if let Ok(line) = serde_json::to_string(&details) {
+                eprintln!("{line}");
+            }
+        }
     }
     code
 }
@@ -564,6 +671,7 @@ async fn run_fetch(
     allow_private_ips: bool,
     telemetry: bool,
     account: Option<&str>,
+    ref_tag: Option<&str>,
     timeout: u64,
 ) -> i32 {
     let start = Instant::now();
@@ -602,7 +710,7 @@ async fn run_fetch(
     // `--account`: restore the envelope into a bound context and take the
     // tab path (the only one that can run inside a non-default context).
     let account_ctx = match account {
-        Some(id) => match account_cli::bind_account_context(&browser, id).await {
+        Some(id) => match account_cli::bind_account_context(&browser, id, ref_tag).await {
             Ok(ctx) => Some(ctx),
             Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
         },
@@ -1485,6 +1593,8 @@ async fn run_serve(
     proxy: Option<String>,
     auth_token: Option<String>,
     accounts: Option<&str>,
+    ref_tag: Option<&str>,
+    lock_policy: oxibrowser_core::account::LockPolicy,
     audit_path: Option<std::path::PathBuf>,
 ) -> i32 {
     let addr: SocketAddr = match format!("{host}:{port}").parse() {
@@ -1550,7 +1660,8 @@ async fn run_serve(
             }
         };
         let (_manager, _login_browser, orch) =
-            match account_cli::login_stack(&registry, allow_private_ips).await {
+            match account_cli::login_stack(&registry, allow_private_ips, ref_tag, &lock_policy).await
+            {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("Error: {e}");
@@ -1560,9 +1671,9 @@ async fn run_serve(
         let surface = oxibrowser_cdp::LoginSurface::new(orch, browser.clone());
         let mut primary = None;
         for id in ids {
-            match account_cli::bind_account_context(&browser, id).await {
+            match account_cli::bind_account_context(&browser, id, ref_tag).await {
                 Ok(ctx) => {
-                    surface.bind(id, Arc::clone(&ctx));
+                    surface.bind_direct(id, Arc::clone(&ctx));
                     if primary.is_none() {
                         primary = Some(ctx);
                     }
@@ -1586,6 +1697,7 @@ async fn run_serve(
     {
         let broker = match account_cli::serve_credential_broker(account_cli::AuditContext {
             path: audit_path.clone(),
+            lock: lock_policy.clone(),
         }) {
             Ok(b) => b,
             Err(e) => {

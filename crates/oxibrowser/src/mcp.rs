@@ -119,8 +119,9 @@ fn initialize_result(params: &Value) -> Value {
 // Tool definitions
 // ---------------------------------------------------------------------------
 
-/// The 9 browser tools as a JSON array of MCP tool descriptors
-/// (`name`, `description`, `inputSchema`).
+/// The tool surface as a JSON array of MCP tool descriptors
+/// (`name`, `description`, `inputSchema`): 9 browser tools + 3 account
+/// tools (roadmap item 4 / upper design §7.4 M9).
 fn tool_definitions() -> Value {
     let schema_object = |properties: Value, required: &[&str]| {
         let mut schema = json!({ "type": "object", "properties": properties });
@@ -208,6 +209,35 @@ fn tool_definitions() -> Value {
             "description": "Close the current tab. The next tool call opens a fresh one.",
             "inputSchema": schema_object(json!({}), &[]),
         },
+        {
+            "name": "account_list",
+            "description": "List registered accounts (metadata + state only — no secrets, \
+                            no session values). Read-only.",
+            "inputSchema": schema_object(json!({}), &[]),
+        },
+        {
+            "name": "account_status",
+            "description": "One account's state, detail, and session horizon. Read-only \
+                            (network probing stays on the CLI: `account status --probe`).",
+            "inputSchema": schema_object(
+                json!({ "account_id": { "type": "string", "description": "Account slug." } }),
+                &["account_id"],
+            ),
+        },
+        {
+            "name": "login_request",
+            "description": "Request a human login escalation for an account (stale, \
+                            needs_login, or challenge). Returns the exact CLI commands \
+                            the operator should run — the MCP server cannot open a \
+                            viewer window itself.",
+            "inputSchema": schema_object(
+                json!({
+                    "account_id": { "type": "string", "description": "Account slug." },
+                    "reason": { "type": "string", "description": "Why the agent needs the login." },
+                }),
+                &["account_id"],
+            ),
+        },
     ])
 }
 
@@ -220,14 +250,47 @@ fn string_arg(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-/// Return the reused tab, creating one on first use (or after a close).
-async fn reused_tab(browser: &Browser, tab_slot: &Mutex<Option<Tab>>) -> Result<Tab, String> {
+/// Account plane for the MCP surface (roadmap item 4): registry handle for
+/// the account tools, the acting agent id (`serve --mcp --as-agent`), and
+/// the primary bound context browser tools create tabs in
+/// (`serve --mcp --account id[,…]`).
+struct McpAccounts {
+    registry: Option<oxibrowser_core::account::AccountRegistry>,
+    agent: Option<String>,
+    primary: Option<std::sync::Arc<oxibrowser_core::context::BrowserContext>>,
+}
+
+impl McpAccounts {
+    fn empty() -> Self {
+        McpAccounts { registry: None, agent: None, primary: None }
+    }
+
+    fn registry(&self) -> Result<&oxibrowser_core::account::AccountRegistry, String> {
+        self.registry.as_ref().ok_or_else(|| {
+            "accountsUnavailable: account registry could not be opened".to_string()
+        })
+    }
+}
+
+/// Return the reused tab, creating one on first use (or after a close) —
+/// inside the primary bound account context when one exists.
+async fn reused_tab(
+    browser: &Browser,
+    tab_slot: &Mutex<Option<Tab>>,
+    primary: Option<&std::sync::Arc<oxibrowser_core::context::BrowserContext>>,
+) -> Result<Tab, String> {
     let mut guard = tab_slot.lock().await;
     if guard.as_ref().is_none_or(Tab::is_closed) {
-        let tab = browser
-            .new_tab()
-            .await
-            .map_err(|e| format!("new_tab failed: {e}"))?;
+        let tab = match primary {
+            Some(ctx) => browser
+                .new_tab_in(ctx)
+                .await
+                .map_err(|e| format!("new_tab failed: {e}"))?,
+            None => browser
+                .new_tab()
+                .await
+                .map_err(|e| format!("new_tab failed: {e}"))?,
+        };
         *guard = Some(tab);
     }
     Ok(guard.as_ref().expect("tab just created").clone())
@@ -238,9 +301,65 @@ async fn reused_tab(browser: &Browser, tab_slot: &Mutex<Option<Tab>>) -> Result<
 async fn call_tool(
     browser: &Browser,
     tab_slot: &Mutex<Option<Tab>>,
+    accounts: &McpAccounts,
     name: &str,
     args: &Value,
 ) -> Result<Value, String> {
+    // Account-plane tools (roadmap item 4): read-only registry views + the
+    // human-escalation request. They never touch the tab.
+    match name {
+        "account_list" => {
+            let records = accounts.registry()?.list().map_err(|e| e.to_string())?;
+            let rows: Vec<Value> = records
+                .iter()
+                .map(|r| {
+                    json!({
+                        "account_id": r.account_id,
+                        "scope": r.scope,
+                        "state": r.state.as_str(),
+                        "state_detail": r.state_detail,
+                        "login_hint": r.identity.login_hint,
+                    })
+                })
+                .collect();
+            return Ok(json!({ "accounts": rows }));
+        }
+        "account_status" => {
+            let id = string_arg(args, "account_id")
+                .ok_or("missing required argument: account_id")?;
+            let r = accounts
+                .registry()?
+                .get(&id)
+                .map_err(|e| format!("accountNotFound: {e}"))?;
+            return Ok(json!({
+                "account_id": r.account_id,
+                "scope": r.scope,
+                "state": r.state.as_str(),
+                "state_detail": r.state_detail,
+                "session_summary": r.session_summary,
+            }));
+        }
+        "login_request" => {
+            let id = string_arg(args, "account_id")
+                .ok_or("missing required argument: account_id")?;
+            let reason = string_arg(args, "reason");
+            let r = accounts
+                .registry()?
+                .get(&id)
+                .map_err(|e| format!("accountNotFound: {e}"))?;
+            return Ok(json!({
+                "account_id": r.account_id,
+                "state": r.state.as_str(),
+                "action_required": "human_login",
+                "command": format!("oxibrowser account login {id}"),
+                "host_command": format!("oxibrowser account login {id} --json"),
+                "agent": accounts.agent,
+                "reason": reason,
+            }));
+        }
+        _ => {}
+    }
+
     if name == "browser_close" {
         if let Some(tab) = tab_slot.lock().await.take() {
             tab.close().await.map_err(|e| e.to_string())?;
@@ -248,7 +367,7 @@ async fn call_tool(
         return Ok(json!({ "closed": true }));
     }
 
-    let tab = reused_tab(browser, tab_slot).await?;
+    let tab = reused_tab(browser, tab_slot, accounts.primary.as_ref()).await?;
     match name {
         "browser_navigate" => {
             let url = string_arg(args, "url").ok_or("missing required argument: url")?;
@@ -370,6 +489,7 @@ async fn handle_line(
     line: &str,
     browser: &Browser,
     tab_slot: &Mutex<Option<Tab>>,
+    accounts: &McpAccounts,
 ) -> Option<String> {
     match parse_envelope(line) {
         Envelope::Malformed => Some(rpc_error(Value::Null, -32700, "Parse error").to_string()),
@@ -387,7 +507,7 @@ async fn handle_line(
                         .get("arguments")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
-                    match call_tool(browser, tab_slot, name, &arguments).await {
+                    match call_tool(browser, tab_slot, accounts, name, &arguments).await {
                         Ok(result) => rpc_result(
                             id,
                             json!({ "content": [{ "type": "text", "text": result.to_string() }] }),
@@ -419,6 +539,9 @@ pub async fn run_mcp_stdio(
     cookie_file: Option<&str>,
     allow_private_ips: bool,
     proxy: Option<String>,
+    accounts: Option<&str>,
+    agent: Option<&str>,
+    ref_tag: Option<&str>,
 ) -> i32 {
     let mut config = oxibrowser_core::BrowserConfig::headless();
     if let Some(path) = cookie_file {
@@ -440,7 +563,40 @@ pub async fn run_mcp_stdio(
         }
     };
 
-    info!("MCP stdio server ready (9 tools)");
+    // Account plane (roadmap item 4): `--account id[,…]` binds each account's
+    // envelope into a context (credential mode on); the first is primary and
+    // hosts the browser tools' tab. `--as-agent` is the ledger identity.
+    let mut mcp_accounts = McpAccounts {
+        registry: crate::account_cli::oxi_accounts_registry().ok(),
+        agent: agent.map(str::to_string),
+        primary: None,
+    };
+    if let Some(list) = accounts {
+        let ids: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if ids.is_empty() {
+            eprintln!("Error: --account requires at least one account id");
+            return 2;
+        }
+        for id in ids {
+            match crate::account_cli::bind_account_context(&browser, id, ref_tag).await {
+                Ok(ctx) => {
+                    if mcp_accounts.primary.is_none() {
+                        mcp_accounts.primary = Some(ctx);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    return 1;
+                }
+            }
+        }
+    }
+
+    info!("MCP stdio server ready (12 tools)");
 
     // Lazily-created, reused tab (see `reused_tab`).
     let tab_slot: Mutex<Option<Tab>> = Mutex::new(None);
@@ -480,7 +636,9 @@ pub async fn run_mcp_stdio(
                         if line.is_empty() {
                             continue;
                         }
-                        if let Some(response) = handle_line(line, &browser, &tab_slot).await {
+                        if let Some(response) =
+                            handle_line(line, &browser, &tab_slot, &mcp_accounts).await
+                        {
                             println!("{response}");
                             use std::io::Write;
                             let _ = std::io::stdout().flush();
@@ -600,10 +758,10 @@ mod tests {
     // ── Tool definitions ───────────────────────────────────────────────────
 
     #[test]
-    fn tools_list_exposes_nine_documented_tools() {
+    fn tools_list_exposes_all_documented_tools() {
         let tools = tool_definitions();
         let arr = tools.as_array().expect("tool array");
-        assert_eq!(arr.len(), 9);
+        assert_eq!(arr.len(), 12);
         for tool in arr {
             assert!(
                 tool["name"].as_str().is_some_and(|n| !n.is_empty()),
@@ -623,6 +781,9 @@ mod tests {
             "browser_screenshot",
             "browser_wait",
             "browser_close",
+            "account_list",
+            "account_status",
+            "login_request",
         ] {
             assert!(names.contains(&expected), "missing tool {expected}");
         }
@@ -681,6 +842,7 @@ mod gate_tests {
         call_tool(
             &browser,
             &tab_slot,
+            &McpAccounts::empty(),
             "browser_navigate",
             &json!({ "url": FORM_HTML }),
         )
@@ -690,6 +852,7 @@ mod gate_tests {
         let err = call_tool(
             &browser,
             &tab_slot,
+            &McpAccounts::empty(),
             "browser_fill",
             &json!({ "selector": "#pw", "value": "hunter2" }),
         )
@@ -704,6 +867,7 @@ mod gate_tests {
         let ok = call_tool(
             &browser,
             &tab_slot,
+            &McpAccounts::empty(),
             "browser_fill",
             &json!({ "selector": "#user", "value": "user@example.com" }),
         )
@@ -715,6 +879,7 @@ mod gate_tests {
         let ok = call_tool(
             &browser,
             &tab_slot,
+            &McpAccounts::empty(),
             "browser_fill",
             &json!({ "selector": "#pw", "value": "hunter2" }),
         )

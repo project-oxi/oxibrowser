@@ -352,6 +352,7 @@ async fn create_account_context(
         err("accountsUnavailable: no login surface configured on this server".to_string())
     })?;
     let manager = surface.orchestrator().shared_manager();
+    let correlation = manager.correlation().map(str::to_string);
     let record = manager
         .registry()
         .get(account_id)
@@ -378,6 +379,7 @@ async fn create_account_context(
             agent_id,
             false,
             format!("no navigate/interact grant at {scope_origin}"),
+            correlation.as_deref(),
         );
         return Err(err(
             "accountAccessDenied: consentRequired — no active account grant for this origin"
@@ -449,7 +451,19 @@ async fn create_account_context(
             "context={} restored_cookies={restored}",
             context.id().as_str()
         ),
+        correlation.as_deref(),
     );
+    // Irreversible capability (item 16): non-consuming probe — contexts
+    // whose agent holds an `irreversible` grant may execute pattern-matched
+    // destructive/payment actions; others are gated at OXI.clickRef/fillRef.
+    if broker
+        .engine
+        .consents
+        .active_account_any(account_id, agent_id, &scope_origin, &["irreversible"])
+        .is_some()
+    {
+        surface.mark_irreversible(context.id().as_str());
+    }
     surface.bind(account_id, Arc::clone(&context));
 
     Ok(Some(json!({
@@ -458,16 +472,20 @@ async fn create_account_context(
 }
 
 /// `account_use` audit line — allow or deny, agent id in the reason only.
+/// `ref_tag` is the correlation tag configured on the account manager
+/// (`--ref`), when one exists.
 fn audit_account_use(
     broker: &crate::credential::CredentialBroker,
     account_id: &str,
     agent_id: &str,
     allowed: bool,
     detail: String,
+    ref_tag: Option<&str>,
 ) {
     use oxibrowser_core::security::audit::{self, AuditDecision, AuditEvent, AuditEventKind};
     let event = AuditEvent {
         action: Some("account_use".to_string()),
+        ref_tag: ref_tag.map(str::to_string),
         ..audit::event(
             AuditEventKind::AccountUse,
             if allowed {

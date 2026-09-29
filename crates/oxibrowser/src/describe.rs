@@ -25,7 +25,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "commands": ["new","goto","back","forward","reload","click","fill","press","type","select","check","uncheck","scroll","eval","extract","content","screenshot","wait","save-state","load-state","close","list","help","exit"]
             },
             "serve": {
-                "flags": ["host","port","cookie-file","allow-private-ips","proxy","auth-token","mcp"]
+                "flags": ["host","port","cookie-file","allow-private-ips","proxy","auth-token","mcp","account","ref","as-agent"]
             },
             "describe": {
                 "args": ["command?"],
@@ -124,7 +124,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 },
                 "session": {
                     "description": "Start interactive session (stdin/stdout JSON REPL). Agent launches as subprocess.",
-                    "usage": "oxibrowser session [--json]",
+                    "usage": "oxibrowser session [--allow-private-ips] [--account <IDS>] [--ref <TAG>]",
                     "session_commands": {
                         "new": {"description": "Create new tab → tab_id"},
                         "goto": {"args": ["tab_id", "url"], "flags": ["wait"], "description": "Navigate tab"},
@@ -162,7 +162,10 @@ pub fn describe_all(compact: bool) -> CliResponse {
                         "allow-private-ips": {"type": "bool", "description": "Disable the SSRF filter (localhost targets)"},
                         "proxy": {"type": "string", "description": "HTTP/HTTPS/SOCKS proxy for all requests"},
                         "auth-token": {"type": "string", "description": "WebSocket auth token (required for non-loopback bind)"},
-                        "mcp": {"type": "bool", "description": "Serve as a stdio MCP server (JSON-RPC 2.0) instead of CDP"}
+                        "mcp": {"type": "bool", "description": "Serve as a stdio MCP server (JSON-RPC 2.0) instead of CDP; adds account tools (account_list/account_status/login_request) and binds --account contexts for browser tools"},
+                        "account": {"type": "string", "description": "Bind account ids (comma list): CDP contexts per account, or the MCP browser tools' primary context"},
+                        "ref": {"type": "string", "description": "Correlation tag stamped on audit events"},
+                        "as-agent": {"type": "string", "description": "[mcp] Acting agent identity for the ledger and escalations"}
                     }
                 },
                 "describe": {
@@ -182,7 +185,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 },
                 "account": {
                     "description": "Account registry and login-state management (per-site account sandboxes)",
-                    "usage": "oxibrowser account <add|list|status|rm> [args] [flags]",
+                    "usage": "oxibrowser account <add|list|status|rm|login|logout|grant|revoke|exec|grants|capture|irreversible|export-state> [args] [flags]",
                     "subcommands": {
                         "add": {
                             "usage": "oxibrowser account add --site <domain> [--id <slug>] [--login <hint>] [--display <name>] [--json]",
@@ -199,6 +202,30 @@ pub fn describe_all(compact: bool) -> CliResponse {
                         "rm": {
                             "usage": "oxibrowser account rm <id> [--json]",
                             "description": "Revoke: record + session envelopes deleted (keychain credentials kept)"
+                        },
+                        "grant": {
+                            "usage": "oxibrowser account grant <id> --agent <A> [--actions navigate,interact] [--ttl SEC] [--max-uses N] [--ref TAG] [--json]",
+                            "description": "Agent-scoped consent grant; --ref is the correlation tag stored on the grant and audit lines"
+                        },
+                        "revoke": {
+                            "usage": "oxibrowser account revoke <id> --agent <A> [--ref TAG] [--json]",
+                            "description": "Tombstone all of an agent's grants for the account"
+                        },
+                        "grants": {
+                            "usage": "oxibrowser account grants <id> [--agent A] [--json]",
+                            "description": "Live grants: consent_id, agent, actions, uses/max_uses, expiry, active, ref"
+                        },
+                        "exec": {
+                            "usage": "oxibrowser account exec <id> --agent <A> [--actions …] [--ttl SEC] [--max-uses N] [--ref TAG] -- <CMD> [ARGS…]",
+                            "description": "Volatile grant → run child (stdio passthrough, exit code propagated) → tombstone on any exit. Lifecycle JSONL on stderr. OXIBROWSER_ACCOUNT/AGENT_ID env set. Crash bound: TTL (default 3600s)"
+                        },
+                        "capture": {
+                            "usage": "oxibrowser account capture <id> --ws <ws://127.0.0.1:PORT/ws> [--json]",
+                            "description": "Explicitly seal the live context's cookies as the stored envelope (OXI.captureSession) — the stop-the-work path"
+                        },
+                        "irreversible": {
+                            "usage": "oxibrowser account irreversible <id> [--add p1,p2] [--clear] [--json]",
+                            "description": "Per-account irreversible-action patterns extending the built-in deny-biased list (click/fill descriptors in account contexts)"
                         }
                     }
                 },
@@ -276,6 +303,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "data": "object on success",
                 "error": "string on failure",
                 "error_code": "string on failure",
+                "details": "object on failure when structured (e.g. CONSENT_REQUIRED)",
                 "meta": {"tab_id": "string?", "elapsed_ms": "int"}
             },
             "exit_codes": {
@@ -283,7 +311,8 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "1": "runtime error (DOM, JS)",
                 "2": "input validation (bad URL, control chars, path traversal)",
                 "3": "timeout",
-                "4": "network error"
+                "4": "network error",
+                "5": "consent required — the JSON error envelope carries `details` {request_id, ttl, account, action}; request_id/ttl are null unless a confirmation is pending. Resolve via `account grant` / `credential authorize` or the viewer confirmation flow, then retry"
             }
         }))
     }

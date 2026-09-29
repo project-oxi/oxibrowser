@@ -45,6 +45,25 @@ pub struct OriginState {
     pub origin: String,
     #[serde(rename = "localStorage")]
     pub local_storage: Vec<LocalStorageEntry>,
+    /// IndexedDB databases for one origin (roadmap item 12 / FM-L5).
+    /// `BTreeMap<store_name, BTreeMap<key, value_json>>` — values are the
+    /// JSON-serialized records. Absent/empty → omitted, so plain Playwright
+    /// `storageState` exports stay byte-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_db: Option<Vec<IdbDatabase>>,
+}
+
+/// One IndexedDB database: version + object stores.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdbDatabase {
+    pub name: String,
+    pub version: u64,
+    /// `store → key → record-json`.
+    pub stores: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
+    /// Per-store keyPath (item 12): puts without an explicit key derive
+    /// theirs from the record field. Absent → out-of-line string keys.
+    #[serde(default)]
+    pub key_paths: std::collections::BTreeMap<String, Option<String>>,
 }
 
 impl StorageState {
@@ -97,6 +116,32 @@ impl StorageState {
 mod tests {
     use super::*;
 
+    /// Playwright exports `expires` as a **float** (and `-1.0` for session
+    /// cookies); genuine exports must import without ceremony (guide
+    /// capture, roadmap item 11).
+    #[test]
+    fn playwright_float_epochs_parse() {
+        let json = r#"{
+            "cookies": [
+                {"name": "session", "value": "abc", "domain": "example.com",
+                 "path": "/", "expires": 1798761600.42, "httpOnly": true, "secure": true},
+                {"name": "sid", "value": "x", "domain": "example.com",
+                 "path": "/", "expires": -1.0}
+            ],
+            "origins": [
+                {"origin": "https://example.com",
+                 "localStorage": [{"name": "theme", "value": "dark"}]}
+            ]
+        }"#;
+        let st: StorageState = serde_json::from_str(json).unwrap();
+        assert_eq!(st.cookies.len(), 2);
+        assert_eq!(st.cookies[0].expires, Some(1798761600)); // truncated
+        // Playwright's `-1` session marker maps to None — a numeric fold
+        // would treat it as long-past and DROP the cookie at insert.
+        assert_eq!(st.cookies[1].expires, None);
+        assert_eq!(st.origins[0].local_storage[0].value, "dark");
+    }
+
     /// `CookieEntry::same_site` must round-trip through the Playwright
     /// spelling (`"Lax"` / `"Strict"` / `"None"`): serde's derived unit-variant
     /// representation is the variant name, which already matches.
@@ -132,6 +177,7 @@ mod tests {
                     name: "k".into(),
                     value: "v".into(),
                 }],
+                indexed_db: None,
             }],
         };
         let json = serde_json::to_string(&st).unwrap();

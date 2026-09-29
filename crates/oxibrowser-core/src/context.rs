@@ -101,6 +101,9 @@ pub struct BrowserContext {
     /// sessions of this context; writes from one session are visible to the
     /// others at the same origin.
     local_storage: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    /// Origin-keyed IndexedDB (`origin → {db → IdbDatabase}`), the FM-L5
+    /// storage plane (item 12): IDB-auth sites survive envelope restore.
+    indexed_db: Arc<RwLock<HashMap<String, HashMap<String, crate::storage_state::IdbDatabase>>>>,
     /// Egress client (dedicated when a proxy was set, else the browser's).
     http_client: Arc<HttpClient>,
     /// Credential mode (M4, design §6.2): when set, storage-exporting CDP
@@ -122,6 +125,7 @@ impl BrowserContext {
             label,
             cookie_jar,
             local_storage: Arc::new(RwLock::new(HashMap::new())),
+            indexed_db: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             credential_mode: AtomicBool::new(false),
         }
@@ -164,6 +168,39 @@ impl BrowserContext {
     /// Clear every storage bucket in this context (all origins).
     pub fn clear_storage(&self) {
         self.local_storage.write().clear();
+    }
+
+    /// Handle-cloned Arc to the context's origin-keyed IndexedDB map.
+    pub fn indexed_db_map(
+        &self,
+    ) -> Arc<RwLock<HashMap<String, HashMap<String, crate::storage_state::IdbDatabase>>>> {
+        self.indexed_db.clone()
+    }
+
+    /// Read-clone of one origin's IndexedDB databases (empty when absent).
+    pub fn indexed_db_bucket(
+        &self,
+        origin: &str,
+    ) -> HashMap<String, crate::storage_state::IdbDatabase> {
+        self.indexed_db
+            .read()
+            .get(origin)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Merge one origin's IndexedDB databases into the context bucket
+    /// (envelope import path).
+    pub fn merge_indexed_db(
+        &self,
+        origin: &str,
+        dbs: HashMap<String, crate::storage_state::IdbDatabase>,
+    ) {
+        self.indexed_db
+            .write()
+            .entry(origin.to_string())
+            .or_default()
+            .extend(dbs);
     }
 
     /// Enable or disable credential mode (M4, design §6.2). Flipping the flag

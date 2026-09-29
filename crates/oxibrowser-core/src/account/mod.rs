@@ -23,12 +23,16 @@
 
 pub mod agent_login;
 pub mod detector;
+pub mod irreversible;
+pub mod lock;
 pub mod manager;
 pub mod orchestrator;
 pub mod probe;
+pub mod probes;
 pub mod record;
 pub mod registry;
-
+pub use irreversible::DEFAULT_IRREVERSIBLE_PATTERNS;
+pub use probes::curated_for;
 pub use agent_login::{
     AgentLoginEngine, AgentLoginOutcome, AgentLoginProgress, CredentialSource, FieldInput,
     LoginForm, MfaForbidden, MfaStep, ResolvedLogin, SourceError,
@@ -37,6 +41,7 @@ pub use agent_login::{
 pub use detector::{
     Detection, DetectionInput, LoginDetector, PreLoginSnapshot, Signal, SignalKind,
 };
+pub use lock::{AccountLockGuard, LockPolicy};
 pub use manager::AccountManager;
 pub use orchestrator::{
     AccountEvent, CompleteVerdict, EndOutcome, ImportOutcome, LoginEndState, LoginHandle,

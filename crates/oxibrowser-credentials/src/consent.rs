@@ -92,6 +92,11 @@ pub struct ConsentRecord {
     pub expires_at: Timestamp,
     pub max_uses: u64,
     pub uses: u64,
+    /// Caller-supplied correlation tag (`--ref`) — joins the grant with
+    /// `audit.jsonl` lines and external task/run receipts. Absent on
+    /// pre-schema grants.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_tag: Option<String>,
 }
 
 impl ConsentRecord {
@@ -116,6 +121,7 @@ impl ConsentRecord {
             expires_at: now + ttl,
             max_uses,
             uses: 0,
+            ref_tag: None,
         }
     }
 
@@ -236,6 +242,29 @@ impl ConsentStore {
             },
             origin,
             action,
+        )
+    }
+
+    /// Revoke one grant by `consent_id` (tombstone with a free-form reason —
+    /// `account exec` uses `exec_exit` / `exec_signal`). Idempotent — an
+    /// unknown id appends nothing.
+    pub fn revoke_by_id(&self, consent_id: &str, reason: &str) -> std::io::Result<()> {
+        let exists = self
+            .replay()?
+            .into_iter()
+            .any(|rec| rec.consent_id == consent_id);
+        if !exists {
+            return Ok(());
+        }
+        let tombstone = RevokeTombstone {
+            version: 1,
+            revoke: consent_id.to_string(),
+            revoked_at: Utc::now(),
+            reason: reason.to_string(),
+        };
+        self.append_line(
+            &serde_json::to_string(&tombstone)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         )
     }
 
@@ -375,6 +404,23 @@ impl ConsentStore {
             .replay()?
             .into_iter()
             .find(|rec| rec.consent_id == consent_id))
+    }
+
+    /// All live (unrevoked) grants for one account id, in file order —
+    /// the `account grants <id>` listing. Expired or exhausted records are
+    /// included so callers can render them as such; revoked ones are gone
+    /// (their history lives in the audit log).
+    pub fn list_for_account(&self, account: &str) -> std::io::Result<Vec<ConsentRecord>> {
+        Ok(self
+            .replay()?
+            .into_iter()
+            .filter(|rec| {
+                matches!(
+                    &rec.subject,
+                    ConsentSubject::Account { account: a, .. } if a == account
+                )
+            })
+            .collect())
     }
 
     /// Replay the file: last record per `consent_id` wins, tombstones remove,
@@ -542,6 +588,54 @@ mod tests {
         );
         // The counter moved via an appended record.
         assert_eq!(s.get(&rec.consent_id).unwrap().unwrap().uses, 1);
+    }
+
+    #[test]
+    fn list_for_account_filters_subject_and_keeps_ref() {
+        let s = store();
+        let mut rec = ConsentRecord::new(
+            ConsentSubject::Account {
+                account: "gh-work".into(),
+                agent: "omp".into(),
+            },
+            "https://github.com",
+            &["navigate", "interact"],
+            DEFAULT_CONSENT_TTL,
+            5,
+        );
+        rec.ref_tag = Some("task-7".into());
+        s.grant(rec.clone()).unwrap();
+        // Different account, same agent — must not leak into the listing.
+        s.grant(ConsentRecord::new(
+            ConsentSubject::Account {
+                account: "gh-personal".into(),
+                agent: "omp".into(),
+            },
+            "https://github.com",
+            &["navigate"],
+            DEFAULT_CONSENT_TTL,
+            5,
+        ))
+        .unwrap();
+        // Credential-plane grant — also out of scope for account listings.
+        grant_credential(&s, "dash", &["login"], DEFAULT_CONSENT_TTL, 5);
+
+        let list = s.list_for_account("gh-work").unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].consent_id, rec.consent_id);
+        assert_eq!(list[0].ref_tag.as_deref(), Some("task-7"));
+
+        // Use accounting re-appends the record; the ref must survive.
+        s.consume(&rec.consent_id).unwrap();
+        let after = s.list_for_account("gh-work").unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].uses, 1);
+        assert_eq!(after[0].ref_tag.as_deref(), Some("task-7"));
+
+        // Revocation removes the grant from the live listing.
+        s.revoke_account("gh-work", "omp", "https://github.com", "navigate")
+            .unwrap();
+        assert!(s.list_for_account("gh-work").unwrap().is_empty());
     }
 
     #[test]

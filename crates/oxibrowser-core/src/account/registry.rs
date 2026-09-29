@@ -56,10 +56,17 @@ impl AccountRegistry {
         self.base_dir.join(account_id)
     }
 
+    /// Per-account advisory lock file (FM-L7 process boundary) — flock(2)
+    /// target; content never meaningful.
+    pub fn lock_path(&self, account_id: &str) -> PathBuf {
+        self.account_dir(account_id).join("lock")
+    }
+
     /// Per-account `sessions/` root (§6.1).
     pub fn sessions_dir(&self, account_id: &str) -> PathBuf {
         self.account_dir(account_id).join("sessions")
     }
+
 
     /// Path of the account's `account.json`.
     pub fn record_path(&self, account_id: &str) -> PathBuf {

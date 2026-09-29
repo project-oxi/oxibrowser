@@ -210,6 +210,11 @@ pub struct Session {
     /// Handle to the JS→sync-thread localStorage channel, used to drain
     /// pending writes (barrier) before snapshotting a bucket for navigation.
     ls_tx: std::sync::mpsc::Sender<LocalStorageMsg>,
+    /// Origin-keyed IndexedDB, **shared with the parent
+    /// [`BrowserContext`]** — the FM-L5 storage plane (item 12).
+    indexed_db: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, crate::storage_state::IdbDatabase>>>>,
+    /// Handle to the JS→sync-thread IndexedDB channel (drain barrier).
+    idb_tx: std::sync::mpsc::Sender<crate::js::runtime::IndexedDbMsg>,
     /// Origin of the most recently imported storage state; used to route
     /// direct `get_local_storage`/`set_local_storage` calls when no page is
     /// open (single-origin compat, design M6′).
@@ -224,6 +229,7 @@ pub struct Session {
     /// LocalStorage sync handler task handle (for cleanup).
     #[allow(dead_code)]
     local_storage_task: Option<std::thread::JoinHandle<()>>,
+    indexed_db_task: Option<std::thread::JoinHandle<()>>,
     /// WebSocket bridge task handle (for cleanup).
     #[allow(dead_code)]
     ws_task: Option<std::thread::JoinHandle<()>>,
@@ -851,6 +857,57 @@ fn handle_local_storage_sync(
     }
 }
 
+/// IndexedDB counterpart of [`handle_local_storage_sync`] — whole-database
+/// blobs, last-wins (item 12).
+fn handle_indexed_db_sync(
+    idb_rx: std::sync::mpsc::Receiver<crate::js::runtime::IndexedDbMsg>,
+    indexed_db: Arc<
+        parking_lot::RwLock<HashMap<String, HashMap<String, crate::storage_state::IdbDatabase>>>,
+    >,
+) {
+    while let Ok(msg) = idb_rx.recv() {
+        match msg {
+            crate::js::runtime::IndexedDbMsg::Drain(ack) => {
+                let _ = ack.send(());
+            }
+            crate::js::runtime::IndexedDbMsg::PutDb { origin, name, version, data } => {
+                #[derive(serde::Deserialize, Default)]
+                struct Blob {
+                    #[serde(default)]
+                    stores: std::collections::BTreeMap<
+                        String,
+                        std::collections::BTreeMap<String, String>,
+                    >,
+                    #[serde(default)]
+                    key_paths: std::collections::BTreeMap<String, Option<String>>,
+                }
+                let blob = serde_json::from_str::<Blob>(&data).unwrap_or_default();
+                let stores = blob.stores;
+                indexed_db
+                    .write()
+                    .entry(origin)
+                    .or_default()
+                    .insert(
+                        name.clone(),
+                        crate::storage_state::IdbDatabase {
+                            name,
+                            version,
+                            stores,
+                            key_paths: blob.key_paths,
+                        },
+                    );
+            }
+            crate::js::runtime::IndexedDbMsg::DeleteDb { origin, name } => {
+                indexed_db
+                    .write()
+                    .entry(origin)
+                    .or_default()
+                    .remove(&name);
+            }
+        }
+    }
+}
+
 /// RAII guard for the Session in-flight request counter.
 ///
 /// Increments on construction; decrements on drop. Using a guard instead of
@@ -898,11 +955,14 @@ impl Session {
 
         // Create localStorage sync channel
         let (ls_tx, ls_rx) = std::sync::mpsc::channel::<LocalStorageMsg>();
+        // Create IndexedDB sync channel (item 12)
+        let (idb_tx, idb_rx) = std::sync::mpsc::channel::<crate::js::runtime::IndexedDbMsg>();
 
         // Create JS runtime and wire up fetch channels
         let mut js_runtime = JsRuntime::with_config(js_config);
         js_runtime.set_fetch_channel(fetch_tx, fetch_resp_rx);
         js_runtime.set_local_storage_channel(ls_tx.clone());
+        js_runtime.set_indexed_db_channel(idb_tx.clone());
         // Dialog gate: shared cell for blocking alert/confirm/prompt, resolved
         // by the CDP layer via Page.handleJavaScriptDialog.
         let dialog_gate: crate::js::DialogGate = Arc::new(parking_lot::Mutex::new(None));
@@ -962,6 +1022,13 @@ impl Session {
         let local_storage_task = Some(std::thread::spawn(move || {
             handle_local_storage_sync(ls_rx, ls_arc_clone);
         }));
+        // IndexedDB sync thread (item 12): same shape as the localStorage
+        // handler — the map is the context's origin-keyed IDB map.
+        let indexed_db_arc = context.indexed_db_map();
+        let idb_arc_clone = indexed_db_arc.clone();
+        let indexed_db_task = Some(std::thread::spawn(move || {
+            handle_indexed_db_sync(idb_rx, idb_arc_clone);
+        }));
 
         if let Err(e) = js_runtime.set_cookie_jar(cookie_jar.clone()) {
             tracing::warn!("failed to set cookie jar: {}", e);
@@ -980,11 +1047,14 @@ impl Session {
             local_storage: local_storage_arc,
             current_origin,
             ls_tx,
+            indexed_db: indexed_db_arc,
+            idb_tx,
             last_import_origin: None,
             response_bodies: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             js_runtime,
             fetch_task,
             local_storage_task,
+            indexed_db_task,
             ws_task,
             closed: AtomicBool::new(false),
             dialog_gate,
@@ -1958,7 +2028,34 @@ impl Session {
                 .cloned()
                 .unwrap_or_default(),
         );
-        self.js_runtime.set_page_url_with_storage_seed(&url, seed);
+        // IndexedDB: the same drain-then-seed contract (item 12) — pending
+        // JS writes land before the bucket snapshot, and the JS-side map is
+        // replaced by this origin's databases.
+        let (idb_ack_tx, idb_ack_rx) = std::sync::mpsc::channel();
+        if self
+            .idb_tx
+            .send(crate::js::runtime::IndexedDbMsg::Drain(idb_ack_tx))
+            .is_ok()
+            && idb_ack_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err()
+        {
+            tracing::warn!(
+                "IndexedDB drain barrier timed out; navigation seed may miss pending JS writes"
+            );
+        }
+        let seed_idb = Some(
+            self.indexed_db
+                .read()
+                .get(&page_origin)
+                .cloned()
+                .unwrap_or_default(),
+        );
+        self.js_runtime.set_page_url_with_storage_seed_idb(
+            &url,
+            seed,
+            seed_idb.map(|m| m.into_iter().collect()),
+        );
         // Build/replace the render document AND execute the page's `<script>`
         // tags (Phase 1 keystone).
         let viewport = current_viewport_override()
@@ -2422,20 +2519,30 @@ impl Session {
             Some(url) if matches!(url.origin(), url::Origin::Tuple(..)) => {
                 let origin_key = storage_origin_of(url);
                 let map = self.local_storage.read();
-                match map.get(&origin_key) {
-                    Some(bucket) if !bucket.is_empty() => {
-                        vec![crate::storage_state::OriginState {
-                            origin: origin_key,
-                            local_storage: bucket
-                                .iter()
-                                .map(|(k, v)| crate::storage_state::LocalStorageEntry {
-                                    name: k.clone(),
-                                    value: v.clone(),
-                                })
-                                .collect(),
-                        }]
-                    }
-                    _ => Vec::new(),
+                let idb = self.indexed_db.read();
+                let bucket = map.get(&origin_key);
+                let dbs = idb.get(&origin_key);
+                if bucket.is_none() && dbs.is_none() {
+                    Vec::new()
+                } else {
+                    vec![crate::storage_state::OriginState {
+                        origin: origin_key.clone(),
+                        local_storage: bucket
+                            .map(|b| {
+                                b.iter()
+                                    .map(|(k, v)| {
+                                        crate::storage_state::LocalStorageEntry {
+                                            name: k.clone(),
+                                            value: v.clone(),
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        indexed_db: dbs.filter(|d| !d.is_empty()).map(|d| {
+                            d.values().cloned().collect()
+                        }),
+                    }]
                 }
             }
             _ => Vec::new(),
@@ -2475,8 +2582,15 @@ impl Session {
             .collect();
         let origins = {
             let map = self.local_storage.read();
-            map.iter()
-                .filter_map(|(origin, bucket)| {
+            let idb = self.indexed_db.read();
+            // Union of origins holding localStorage or IDB state — an
+            // IDB-only site (FM-L5 pattern) must still export its origin.
+            let mut keys: Vec<String> = map.keys().cloned().collect();
+            keys.extend(idb.keys().cloned());
+            keys.sort();
+            keys.dedup();
+            keys.iter()
+                .filter_map(|origin| {
                     let url = url::Url::parse(origin).ok()?;
                     if !matches!(url.origin(), url::Origin::Tuple(..)) {
                         return None;
@@ -2484,18 +2598,31 @@ impl Session {
                     if crate::network::cookie::registrable_domain(url.host_str()?) != scope {
                         return None;
                     }
-                    if bucket.is_empty() {
+                    let bucket = map.get(origin);
+                    let dbs = idb.get(origin);
+                    if bucket.is_none() && dbs.is_none() {
+                        return None;
+                    }
+                    if bucket.is_none_or(|b| b.is_empty()) && dbs.is_none_or(|d| d.is_empty()) {
                         return None;
                     }
                     Some(crate::storage_state::OriginState {
                         origin: origin.clone(),
                         local_storage: bucket
-                            .iter()
-                            .map(|(k, v)| crate::storage_state::LocalStorageEntry {
-                                name: k.clone(),
-                                value: v.clone(),
+                            .map(|b| {
+                                b.iter()
+                                    .map(|(k, v)| {
+                                        crate::storage_state::LocalStorageEntry {
+                                            name: k.clone(),
+                                            value: v.clone(),
+                                        }
+                                    })
+                                    .collect()
                             })
-                            .collect(),
+                            .unwrap_or_default(),
+                        indexed_db: dbs.filter(|d| !d.is_empty()).map(|d| {
+                            d.values().cloned().collect()
+                        }),
                     })
                 })
                 .collect()
@@ -2529,6 +2656,19 @@ impl Session {
                 let bucket = ls.entry(origin.origin.clone()).or_default();
                 for kv in &origin.local_storage {
                     bucket.insert(kv.name.clone(), kv.value.clone());
+                }
+            }
+        }
+        // IndexedDB (item 12): merge imported databases into the context
+        // buckets — the JS side re-seeds on the next navigation.
+        {
+            let mut idb = self.indexed_db.write();
+            for origin in &st.origins {
+                if let Some(dbs) = &origin.indexed_db {
+                    let bucket = idb.entry(origin.origin.clone()).or_default();
+                    for db in dbs {
+                        bucket.insert(db.name.clone(), db.clone());
+                    }
                 }
             }
         }
@@ -3162,6 +3302,7 @@ mod tests {
                     name: "k".into(),
                     value: "v".into(),
                 }],
+                indexed_db: None,
             }],
         };
         session.import_state(&st).expect("import");
@@ -3247,21 +3388,24 @@ mod tests {
                         name: "ls_login".into(),
                         value: "a".into(),
                     }],
-                },
+                indexed_db: None,
+            },
                 OriginState {
                     origin: "https://example.com".into(),
                     local_storage: vec![LocalStorageEntry {
                         name: "ls_apex".into(),
                         value: "b".into(),
                     }],
-                },
+                indexed_db: None,
+            },
                 OriginState {
                     origin: "https://other.org".into(),
                     local_storage: vec![LocalStorageEntry {
                         name: "ls_other".into(),
                         value: "c".into(),
                     }],
-                },
+                indexed_db: None,
+            },
             ],
         };
         session.import_state(&st).expect("import");
@@ -3320,7 +3464,8 @@ mod tests {
                         name: "token".into(),
                         value: "t0k3n".into(),
                     }],
-                }],
+                indexed_db: None,
+            }],
             })
             .expect("import");
 
@@ -3389,7 +3534,8 @@ mod tests {
                             value: "3".into(),
                         },
                     ],
-                }],
+                indexed_db: None,
+            }],
             })
             .expect("import");
 
@@ -3461,14 +3607,16 @@ mod tests {
                             name: "ka".into(),
                             value: "va".into(),
                         }],
-                    },
+                indexed_db: None,
+            },
                     OriginState {
                         origin: "https://b.test".into(),
                         local_storage: vec![LocalStorageEntry {
                             name: "kb".into(),
                             value: "vb".into(),
                         }],
-                    },
+                indexed_db: None,
+            },
                 ],
             })
             .expect("import");

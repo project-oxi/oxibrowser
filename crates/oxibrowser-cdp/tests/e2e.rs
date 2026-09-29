@@ -2157,7 +2157,7 @@ async fn start_account_server(
         .open_account_context("acc")
         .await
         .unwrap();
-    surface.bind("acc", ctx.clone());
+    surface.bind_direct("acc", ctx.clone());
 
     let mut server_builder = CdpServer::new(addr, browser)
         .with_primary_context(ctx)
@@ -2492,6 +2492,50 @@ async fn test_report_login_success_captures_and_emits_events() {
     server.shutdown();
 }
 
+/// OXI.captureSession — explicit "stop the work" capture of a bound
+/// account context (roadmap item 3): no login window, no detector — the
+/// context's live state is sealed directly and the account flips to valid.
+#[tokio::test]
+async fn test_capture_session_seals_bound_context() {
+    let (server, addr, _surface, _base) = start_account_server("capturesess", None).await;
+
+    // `start_account_server` binds "acc" to a context (serve --account shape).
+    let (mut sink, mut ws) = connect_ws_role(addr, None).await;
+
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        1,
+        "OXI.captureSession",
+        Some(json!({ "accountId": "acc" })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    assert_eq!(resp["result"]["accountId"], "acc", "{resp}");
+    assert_eq!(resp["result"]["state"], "valid", "{resp}");
+    assert!(
+        resp["result"]["sessionSummary"].get("updated_at").is_some(),
+        "{resp}"
+    );
+
+    // The account board reflects the capture.
+    let resp = send_command(&mut sink, &mut ws, 2, "OXI.accountList", Some(json!({}))).await;
+    assert_eq!(resp["result"]["accounts"][0]["state"], "valid", "{resp}");
+
+    // Unknown account → structured error, no state change.
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        3,
+        "OXI.captureSession",
+        Some(json!({ "accountId": "nobody" })),
+    )
+    .await;
+    assert!(resp.get("error").is_some(), "{resp}");
+
+    server.shutdown();
+}
+
 /// endLogin abort reverts the account to needs_login.
 #[tokio::test]
 async fn test_end_login_abort_reverts_to_needs_login() {
@@ -2737,4 +2781,412 @@ async fn test_login_with_account_unattended_captures() {
 
     server.shutdown();
     let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Irreversible-action pattern gate (roadmap item 16): in an account-bound
+/// context without the `irreversible` capability, clickRef on a destructive
+/// control is denied (`irreversibleActionRequiresGrant`) while innocent
+/// controls pass; per-account injected patterns ("purge workspace") gate
+/// too; marking the context capable lets the same click through.
+#[tokio::test]
+async fn test_irreversible_gate_blocks_and_allows() {
+    let port = find_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut config = oxibrowser_core::BrowserConfig::headless();
+    config.enable_ssrf_filter = false;
+    let browser = Arc::new(Browser::new(config).await.unwrap());
+
+    let base = std::env::temp_dir().join(format!("oxi-cdp-e2e-irrev-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let audit = Arc::new(
+        oxibrowser_core::security::audit::AuditLog::open(base.join("audit.jsonl")).unwrap(),
+    );
+    let registry = oxibrowser_core::account::AccountRegistry::open(base.join("accounts")).unwrap();
+    registry
+        .add(oxibrowser_core::account::AccountRecord::new("acc", "example.com").unwrap())
+        .unwrap();
+    // Per-account injection (knock's "확정 게이트"): an extra pattern on top
+    // of the built-in defaults.
+    let mut rec = registry.get("acc").unwrap();
+    rec.irreversible_patterns = Some(vec!["purge workspace".to_string()]);
+    registry.save(&rec).unwrap();
+    let manager = Arc::new(oxibrowser_core::account::AccountManager::with_audit(
+        registry,
+        audit.clone(),
+    ));
+    let orch = Arc::new(oxibrowser_core::account::LoginOrchestrator::new(
+        manager,
+        browser.clone(),
+        Arc::new(oxibrowser_core::storage::session_store::StaticKeyProvider::new([5u8; 32])),
+    ));
+    let surface = oxibrowser_cdp::LoginSurface::new(orch, browser.clone());
+    let (ctx, _session) = surface
+        .orchestrator()
+        .open_account_context("acc")
+        .await
+        .unwrap();
+    // Plain bind: bound but WITHOUT irreversible capability (the agent-path
+    // shape — capability comes only from a grant probe).
+    surface.bind("acc", ctx.clone());
+
+    let server = Arc::new(
+        CdpServer::new(addr, browser.clone())
+            .with_primary_context(ctx.clone())
+            .with_login(surface.clone()),
+    );
+    let s = server.clone();
+    tokio::spawn(async move {
+        let _ = s.start().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut sink, mut ws) = connect_ws_role(addr, None).await;
+    let page = "data:text/html,<html><body>                <button id='del'>Delete Account</button>                <button id='pz'>Purge Workspace</button>                <button id='ok'>Save Draft</button>                </body></html>";
+    let mut next_id = 1u64;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        next_id,
+        "Page.navigate",
+        Some(json!({ "url": page })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    // Poll the snapshot until the buttons expose refs.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (del_ref, pz_ref, ok_ref) = loop {
+        next_id += 1;
+        let resp = send_command(
+            &mut sink,
+            &mut ws,
+            next_id,
+            "OXI.getInteractiveElements",
+            None,
+        )
+        .await;
+        let mut del = None;
+        let mut pz = None;
+        let mut ok = None;
+        if let Some(elements) = resp["result"]["elements"].as_array() {
+            for el in elements {
+                let text = el["text"].as_str().unwrap_or_default();
+                let r#ref = el["ref"].as_str().map(str::to_string);
+                if text.contains("Delete Account") {
+                    del = r#ref;
+                } else if text.contains("Purge Workspace") {
+                    pz = r#ref;
+                } else if text.contains("Save Draft") {
+                    ok = r#ref;
+                }
+            }
+        }
+        if let (Some(d), Some(p), Some(o)) = (del, pz, ok) {
+            break (d, p, o);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "buttons never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    // Destructive (built-in pattern): denied without the capability.
+    next_id += 1;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        next_id,
+        "OXI.clickRef",
+        Some(json!({ "ref": del_ref })),
+    )
+    .await;
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("irreversibleActionRequiresGrant"),
+        "expected irreversible denial, got {resp}"
+    );
+
+    // Injected per-account pattern: denied the same way.
+    next_id += 1;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        next_id,
+        "OXI.clickRef",
+        Some(json!({ "ref": pz_ref })),
+    )
+    .await;
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("irreversibleActionRequiresGrant"),
+        "expected injected-pattern denial, got {resp}"
+    );
+
+    // Innocent control: passes.
+    next_id += 1;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        next_id,
+        "OXI.clickRef",
+        Some(json!({ "ref": ok_ref })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    // The gate decisions are audited.
+    let audit_text = std::fs::read_to_string(base.join("audit.jsonl")).unwrap();
+    assert!(
+        audit_text.contains("irreversible_gate"),
+        "gate decisions must be audited: {audit_text}"
+    );
+
+    // Grant the capability → the same destructive click passes.
+    surface.mark_irreversible(ctx.id().as_str());
+    next_id += 1;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        next_id,
+        "OXI.clickRef",
+        Some(json!({ "ref": del_ref })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    server.shutdown();
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Connect with an explicit URL (query-parameter role claims — the
+/// reference viewer page's path; browsers cannot set WS headers).
+async fn connect_ws_url(
+    url: &str,
+) -> (
+    futures::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tungstenite::Message,
+    >,
+    futures::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+) {
+    let request = url.into_client_request().unwrap();
+    let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    ws.split()
+}
+
+/// Reference viewer (roadmap item 10): `/viewer` serves the page, and the
+/// viewer role can be claimed via **query parameters** — same one-time token
+/// semantics as the header path, enabling the browser-hosted mirror.
+#[tokio::test]
+async fn test_viewer_page_and_query_param_role() {
+    let (server, addr, surface, _base) = start_account_server("viewerq", None).await;
+
+    // The reference page is served, self-contained.
+    let resp = reqwest::get(format!("http://{addr}/viewer")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let html = resp.text().await.unwrap();
+    assert!(html.contains("viewer token"), "viewer page: {:.120}", html);
+    assert!(html.contains("resolveConfirmation"), "approval card wired");
+
+    // Mint a one-time viewer token (out-of-band: orchestrator take).
+    let (mut sink, mut ws) = connect_ws_role(addr, None).await;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        1,
+        "OXI.beginLogin",
+        Some(json!({ "accountId": "acc", "mode": "user" })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    let login_id = resp["result"]["loginId"].as_str().unwrap().to_string();
+    let token = surface
+        .orchestrator()
+        .take_viewer_token(&login_id)
+        .expect("out-of-band viewer token");
+
+    // Viewer role via the query string — the reference page's connect URL.
+    let url = format!("ws://{addr}/ws?role=viewer&viewer_token={token}");
+    let (mut vsink, mut vws) = connect_ws_url(&url).await;
+
+    // Viewer allowlist: navigate passes…
+    let resp = send_command(
+        &mut vsink,
+        &mut vws,
+        1,
+        "Page.navigate",
+        Some(json!({ "url": "about:blank" })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "viewer navigate: {resp}");
+    // …cookies are denied.
+    let resp = send_command(
+        &mut vsink,
+        &mut vws,
+        2,
+        "Network.getCookies",
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["message"], "deniedForViewerRole",
+        "query-param viewer must be gated like the header path: {resp}"
+    );
+
+    // A bad token via query is rejected at upgrade time.
+    let bad = format!("ws://{addr}/ws?role=viewer&viewer_token=oxi-viewer-bogus");
+    assert!(
+        tokio_tungstenite::connect_async(bad.as_str()).await.is_err(),
+        "bogus query token must be rejected"
+    );
+
+    server.shutdown();
+}
+
+/// IndexedDB (roadmap item 12 / FM-L5): a token written through the JS
+/// `indexedDB` API survives navigation — the JS-side map is wiped on every
+/// document injection and re-seeded from the context bucket, which the IDB
+/// sync thread maintains. This is the storage plane IDB-auth sites need.
+#[tokio::test]
+async fn test_indexeddb_persists_across_navigations() {
+    let port = find_available_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut config = oxibrowser_core::BrowserConfig::headless();
+    config.enable_ssrf_filter = false;
+    let browser = Arc::new(Browser::new(config).await.unwrap());
+    let server = Arc::new(CdpServer::new(addr, browser.clone()));
+    let s = server.clone();
+    tokio::spawn(async move {
+        let _ = s.start().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let (mut sink, mut ws) = connect_ws_role(addr, None).await;
+    let page = "data:text/html,<html><body>idb test</body></html>";
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        1,
+        "Page.navigate",
+        Some(json!({ "url": page })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    // Open the database, create the store, put an auth token (the canonical
+    // IDB-auth shape), awaiting the deferred events via promises.
+    let put_js = r#"(async () => {
+        const req = indexedDB.open("auth", 1);
+        req.onupgradeneeded = () => {
+            req.result.createObjectStore("tokens", { keyPath: "id" });
+        };
+        await new Promise((res, rej) => { req.onsuccess = res; req.onerror = rej; });
+        const tx = req.result.transaction("tokens", "readwrite");
+        tx.objectStore("tokens").put({ id: "gcp", token: "tok-123" });
+        await new Promise((res) => { tx.oncomplete = res; });
+        return "put-ok";
+    })()"#;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        2,
+        "Runtime.evaluate",
+        Some(json!({ "expression": put_js, "awaitPromise": true })),
+    )
+    .await;
+    assert!(
+        resp["result"]["result"]["value"] == json!("put-ok"),
+        "put failed: {resp}"
+    );
+
+    // Navigate away — the JS-side IDB map is wiped by re-registration.
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        3,
+        "Page.navigate",
+        Some(json!({ "url": "about:blank" })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    // Navigate back to the same opaque URL — its bucket re-seeds the map.
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        4,
+        "Page.navigate",
+        Some(json!({ "url": page })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+
+    let get_js = r#"(async () => {
+        const req = indexedDB.open("auth");
+        await new Promise((res, rej) => { req.onsuccess = res; req.onerror = rej; });
+        return await new Promise((res) => {
+            const tx = req.result.transaction("tokens", "readonly");
+            const get = tx.objectStore("tokens").get("gcp");
+            get.onsuccess = () => res(get.result ? get.result.token : null);
+        });
+    })()"#;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        5,
+        "Runtime.evaluate",
+        Some(json!({ "expression": get_js, "awaitPromise": true })),
+    )
+    .await;
+    assert!(
+        resp["result"]["result"]["value"] == json!("tok-123"),
+        "token must survive navigation: {resp}"
+    );
+
+    // Finding-1 pin: after restore, a KEYLESS put against the keyPath store
+    // must work (the seeded key_paths must survive the navigation re-seed).
+    let put2_js = r#"(async () => {
+        const req = indexedDB.open("auth");
+        await new Promise((res, rej) => { req.onsuccess = res; req.onerror = rej; });
+        const tx = req.result.transaction("tokens", "readwrite");
+        tx.objectStore("tokens").put({ id: "gcp2", token: "tok-456" });
+        await new Promise((res) => { tx.oncomplete = res; });
+        const get2 = tx.objectStore("tokens").get("gcp2");
+        get2.onsuccess = () => { __idb_put2 = get2.result ? get2.result.token : "MISSING"; };
+        return "queued";
+    })()"#;
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        6,
+        "Runtime.evaluate",
+        Some(json!({ "expression": put2_js, "awaitPromise": true })),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "{resp}");
+    let resp = send_command(
+        &mut sink,
+        &mut ws,
+        7,
+        "Runtime.evaluate",
+        Some(json!({ "expression": "__idb_put2" })),
+    )
+    .await;
+    assert!(
+        resp["result"]["result"]["value"] == json!("tok-456"),
+        "keyless keyPath put after restore: {resp}"
+    );
+
+    server.shutdown();
 }

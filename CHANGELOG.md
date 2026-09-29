@@ -8,6 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-30
+
+Account process-execution model — the account layer becomes drivable by
+external orchestrators (knock-style CLI orchestration), plus the first
+IndexedDB storage plane ([design](docs/designs/2026-09-29-account-process-execution.md)).
+
+### Added
+- **`account exec`** — one-shot volatile grant around a child process:
+  grant → run (stdio passthrough, exit code propagated) → tombstone on any
+  exit; lifecycle JSONL on stderr; `OXIBROWSER_ACCOUNT`/`OXIBROWSER_AGENT_ID`
+  injected; crash bound = TTL (default 1 h, cap 24 h).
+- **Per-account advisory lock** — flock on `~/.oxibrowser/accounts/<id>/lock`
+  guards envelope/registry mutations; `--lock-wait`/`--lock-timeout`;
+  `ACCOUNT_LOCKED` error code.
+- **`account capture` + `OXI.captureSession`** — explicit stop-the-work
+  envelope sealing of a live bound context.
+- **Consent error contract** — exit 5 `CONSENT_REQUIRED` with structured
+  `details {request_id, ttl, account, action}` on every CLI surface.
+- **Audit schema v1** — per-event `schema_version`, globally-unique
+  `event_id`, `--ref` correlation tag (fetch/serve/grant/revoke/exec →
+  audit lines + grant records).
+- **`account grants <id>`** — live consent ledger view.
+- **MCP account surface** — `serve --mcp --account/--as-agent` binds account
+  contexts (previously the flag was silently dropped) and adds
+  `account_list` / `account_status` / `login_request` tools (12 total).
+- **`session --account`** — REPL tabs created inside the primary bound
+  account context.
+- **Reference viewer page** — `GET /viewer`: screencast mirror, input
+  mirroring, and the viewer-only confirmation-approval cards; viewer role
+  claimable via query parameters for browser WebSocket.
+- **Irreversible gate** — deny-biased pattern list (defaults + per-account
+  injection via `account irreversible`), enforced at `OXI.clickRef`/`fillRef`
+  in account contexts.
+- **IndexedDB v1** — JS `indexedDB` subset (open/upgrade/object stores/
+  transaction/put/get/getAll/delete/count) persisted in the session
+  envelope: IDB-auth tokens now survive restore (FM-L5).
+- **Curated probe markers** — `account add` seeds verified URL+marker pairs
+  for known services (GitHub) instead of the scope-root fallback.
+- **Ops** — `version --json` reports install path + effective keychain
+  service prefix; `OXIBROWSER_KEYCHAIN_PREFIX` isolates parallel installs.
+- **macOS release** — Developer ID-signed, Apple-notarized universal binary
+  published on GitHub Releases with SHA-256 checksums.
+
+### Fixed
+- **Playwright `storageState` import** — floating-point `expires` epochs,
+  `httpOnly` casing, and the `-1` session-cookie convention were rejected or
+  silently dropped the cookie on import (guide-capture path, item 11).
+- **`serve --mcp --account`** — clap accepted the flag but the MCP runtime
+  ignored it; accounts now bind for real.
+- **Real-website suite** — updated for example.com's 2025 redesign, retarget
+  the api.github.com root (403 unauthenticated), fix the smoke harness
+  build flags and the session list-order assertion.
+
 ## [0.24.1] - 2026-09-29
 
 Post-release hardening bundle.

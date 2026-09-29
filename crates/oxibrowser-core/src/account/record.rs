@@ -194,6 +194,11 @@ pub struct AccountRecord {
     /// Validation probe; `None` → scope-root fallback (§4.4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeConfig>,
+    /// Per-account irreversible-action patterns (roadmap item 16) —
+    /// extend (not replace) the built-in deny-biased list; knock installs
+    /// service-specific "확정 게이트" here. `None` → defaults only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irreversible_patterns: Option<Vec<String>>,
 }
 
 fn default_version() -> u32 {
@@ -220,6 +225,7 @@ impl AccountRecord {
             credentials: Vec::new(),
             session_summary: SessionSummary::default(),
             probe: None,
+            irreversible_patterns: None,
         })
     }
 

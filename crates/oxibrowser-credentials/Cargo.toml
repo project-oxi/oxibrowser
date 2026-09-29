@@ -1,6 +1,6 @@
 [package]
 name = "oxibrowser-credentials"
-version = "0.24.1"
+version = "0.25.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -13,7 +13,7 @@ rust-version.workspace = true
 description = "Credential broker: keyring-backed secrets, TOTP codes, consent records, and the deny-first use policy"
 
 [dependencies]
-oxibrowser-core = { version = "0.24.1", path = "../oxibrowser-core" }
+oxibrowser-core = { version = "0.25.0", path = "../oxibrowser-core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

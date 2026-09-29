@@ -107,17 +107,18 @@ async fn test_markdown_conversion() {
 
 #[tokio::test]
 #[ignore]
-async fn test_httpbin_get() {
-    // api.github.com returns JSON with API metadata — reliable, unlike httpbin.org
+async fn test_json_endpoint_get() {
+    // api.github.com stopped serving unauthenticated root requests (403,
+    // measured 2026-09-29) — retargeted to a stable minimal JSON endpoint.
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://api.github.com").await.unwrap();
+    let session = browser.new_page("https://api.ipify.org/?format=json").await.unwrap();
 
     let guard = session.read().await;
     let page = guard.page().expect("page should be loaded");
     let content = page.content();
     assert!(
-        content.contains("url") && content.contains("current_user_url"),
-        "api.github.com should return JSON with URL fields, got: {}",
+        content.contains("\"ip\":"),
+        "ipify should return JSON with an ip field, got: {}",
         content.chars().take(200).collect::<String>()
     );
     drop(guard);

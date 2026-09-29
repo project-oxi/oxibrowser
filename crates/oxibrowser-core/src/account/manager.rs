@@ -35,14 +35,21 @@ pub struct AccountManager {
     registry: AccountRegistry,
     /// `None` → the process-global audit log (library default).
     audit: Option<Arc<AuditLog>>,
+    /// Caller-supplied correlation tag (`--ref`) stamped on every event this
+    /// manager emits — the join key with external task/run ledgers.
+    correlation: Option<String>,
+    /// Cross-process advisory-lock policy for envelope/registry mutations
+    /// (FM-L7). Default: fail fast.
+    lock_policy: super::lock::LockPolicy,
 }
-
 impl AccountManager {
     /// Manager over `registry`, auditing to the process-global log.
     pub fn new(registry: AccountRegistry) -> Self {
         AccountManager {
             registry,
             audit: None,
+            correlation: None,
+            lock_policy: super::lock::LockPolicy::default(),
         }
     }
 
@@ -51,7 +58,79 @@ impl AccountManager {
         AccountManager {
             registry,
             audit: Some(audit),
+            correlation: None,
+            lock_policy: super::lock::LockPolicy::default(),
         }
+    }
+
+    /// Stamp a correlation tag (`--ref`) on all subsequent audit events
+    /// (`session_capture` / `session_restore` / `session_discard` /
+    /// `account_state`).
+    pub fn with_correlation(mut self, ref_tag: impl Into<String>) -> Self {
+        self.correlation = Some(ref_tag.into());
+        self
+    }
+
+    /// Set the advisory-lock policy used for envelope/registry mutations
+    /// (`--lock-wait` / `--lock-timeout`).
+    pub fn with_lock_policy(mut self, policy: super::lock::LockPolicy) -> Self {
+        self.lock_policy = policy;
+        self
+    }
+
+    /// Record an audit event through this manager's sink (explicit log or
+    /// the process-global one) — for gate-style emitters outside the
+    /// lifecycle methods (e.g. the CDP irreversible gate). Stamps the
+    /// manager's correlation tag when the caller supplied none.
+    pub fn record_event(&self, mut event: AuditEvent) {
+        if event.ref_tag.is_none() {
+            event.ref_tag = self.correlation.clone();
+        }
+        match &self.audit {
+            Some(log) => {
+                if let Err(e) = log.record(event) {
+                    tracing::warn!(error = %e, "account audit log write failed");
+                }
+            }
+            None => audit::record(event),
+        }
+    }
+
+    /// Read-modify-write the account record under the advisory lock — the
+    /// path for record-field mutations outside the state machine (e.g.
+    /// `account irreversible` pattern injection).
+    pub fn update_record_locked(
+        &self,
+        account_id: &str,
+        f: impl FnOnce(&mut AccountRecord),
+    ) -> Result<AccountRecord> {
+        let _guard = self.lock(account_id)?;
+        let mut record = self.registry.get(account_id)?;
+        f(&mut record);
+        self.registry.save(&record)?;
+        Ok(record)
+    }
+    /// The configured correlation tag, if any.
+    pub fn correlation(&self) -> Option<&str> {
+        self.correlation.as_deref()
+    }
+
+    /// Acquire the account's cross-process advisory lock (FM-L7). Guards
+    /// envelope/registry mutations only; never held across network probes.
+    fn lock(&self, account_id: &str) -> Result<super::lock::AccountLockGuard> {
+        super::lock::acquire(&self.registry.lock_path(account_id), &self.lock_policy)
+    }
+
+    /// State transition under the account lock — the path for engine-driven
+    /// transitions (`enter_logging_in` / revert / challenge).
+    pub fn set_state_locked(
+        &self,
+        account_id: &str,
+        to: AccountState,
+        detail: Option<String>,
+    ) -> Result<AccountRecord> {
+        let _guard = self.lock(account_id)?;
+        self.registry.set_state(account_id, to, detail)
     }
 
     /// The underlying registry.
@@ -69,6 +148,7 @@ impl AccountManager {
         session: &Session,
         keys: &dyn KeyProvider,
     ) -> Result<AccountRecord> {
+        let _guard = self.lock(account_id)?;
         let mut record = self.registry.get(account_id)?;
         let state = session.export_state_for_scope(&record.scope);
         let envelope = SessionEnvelope::new(
@@ -209,6 +289,7 @@ impl AccountManager {
         let outcome = probe.run(session.http_client().as_ref()).await;
         match &outcome.verdict {
             ProbeVerdict::Valid => {
+                let _guard = self.lock(account_id)?;
                 let from = self.registry.get(account_id)?.state;
                 let updated = self.registry.set_state(
                     account_id,
@@ -218,6 +299,7 @@ impl AccountManager {
                 self.emit_state(account_id, from, updated.state, "probe_ok");
             }
             ProbeVerdict::Invalid { reason } => {
+                let _guard = self.lock(account_id)?;
                 self.mark_stale_inner(account_id, reason)?;
             }
             ProbeVerdict::Challenge { challenge } => {
@@ -229,6 +311,7 @@ impl AccountManager {
                     crate::challenge::ChallengeKind::Unknown => "unknown",
                 };
                 let detail = format!("challenge:{}:{}", challenge.vendor.as_str(), kind);
+                let _guard = self.lock(account_id)?;
                 let from = self.registry.get(account_id)?.state;
                 let updated = self.registry.set_state(
                     account_id,
@@ -248,6 +331,7 @@ impl AccountManager {
     /// Mark `valid` (or already-`stale`) account as `stale` with a reason —
     /// probe failure, observed expiry, or server-side invalidation.
     pub fn mark_stale(&self, account_id: &str, detail: impl Into<String>) -> Result<AccountRecord> {
+        let _guard = self.lock(account_id)?;
         self.mark_stale_inner(account_id, &detail.into())
     }
 
@@ -255,6 +339,7 @@ impl AccountManager {
     /// stored envelope, clears the session horizon, and returns the account
     /// to [`AccountState::NeedsLogin`] — credentials are kept (§4.2).
     pub fn logout(&self, account_id: &str) -> Result<AccountRecord> {
+        let _guard = self.lock(account_id)?;
         let record = self.registry.get(account_id)?;
         let store = self.session_store(account_id)?;
         let discarded = store.discard(&record.scope)?;
@@ -347,6 +432,7 @@ impl AccountManager {
         let event = AuditEvent {
             origin,
             action,
+            ref_tag: self.correlation.clone(),
             ..audit::event(kind, decision, reason)
         };
         match &self.audit {

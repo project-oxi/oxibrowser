@@ -30,7 +30,7 @@ fn test_fetch_markdown() {
         resp["data"]["markdown"]
             .as_str()
             .unwrap()
-            .contains("Example Domain")
+            .contains("documentation examples")
     );
     assert_eq!(resp["data"]["status"], 200);
     assert!(resp["meta"]["elapsed_ms"].as_u64().unwrap() > 0);
@@ -45,7 +45,7 @@ fn test_fetch_text() {
         .expect("failed to run oxibrowser");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Example Domain"));
+    assert!(stdout.contains("documentation examples"));
     assert!(stdout.contains("documentation"));
 }
 
@@ -245,6 +245,8 @@ fn test_session_basic() {
     writeln!(stdin, "list").unwrap();
     // close
     writeln!(stdin, "close t1").unwrap();
+    // list again — the tab must now be gone
+    writeln!(stdin, "list").unwrap();
     // exit
     writeln!(stdin, "exit").unwrap();
 
@@ -276,13 +278,24 @@ fn test_session_basic() {
         resp["data"]["markdown"]
             .as_str()
             .unwrap_or("")
-            .contains("Example Domain")
+            .contains("documentation examples")
     );
 
-    // list response
+    // list response (list runs BEFORE close — the tab must still be there)
     let resp: serde_json::Value = serde_json::from_str(lines[3]).expect("list JSON");
     assert_eq!(resp["ok"], true);
-    assert!(resp["data"]["tabs"].as_array().unwrap().is_empty()); // tab was closed before list
+    assert_eq!(
+        resp["data"]["tabs"].as_array().map(|t| !t.is_empty()),
+        Some(true)
+    );
+
+    // second list (after close) — the tab must be gone
+    let resp: serde_json::Value = serde_json::from_str(lines[5]).expect("post-close list JSON");
+    assert_eq!(resp["ok"], true);
+    assert_eq!(
+        resp["data"]["tabs"].as_array().map(|t| t.is_empty()),
+        Some(true)
+    );
 }
 
 #[test]

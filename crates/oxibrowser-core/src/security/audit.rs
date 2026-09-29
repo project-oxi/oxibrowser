@@ -63,14 +63,34 @@ pub struct CredentialRef {
     pub fingerprint: String,
 }
 
+/// Current audit line schema. Stamped on every event at `record` time;
+/// per-event (not a file header) so partial mirrors and rotated files stay
+/// self-describing. Consumers that join or mirror `audit.jsonl` must treat
+/// lines with an unknown `schema_version` as opaque.
+pub const AUDIT_SCHEMA_VERSION: u32 = 1;
+
 /// One audit log line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
+    /// Schema revision of this line (see [`AUDIT_SCHEMA_VERSION`]).
+    #[serde(default)]
+    pub schema_version: u32,
     /// RFC 3339 UTC with millisecond precision.
     pub ts: String,
-    /// Process-local monotonic sequence number.
+    /// Process-local monotonic sequence number. **Not unique across
+    /// processes** — concurrent writers interleave lines with colliding
+    /// `seq` values. Correlation and deduplication must use `event_id`.
     pub seq: u64,
+    /// Globally-unique event id (`evt-<instance>-<seq>`), stamped at
+    /// `record` time. `<instance>` is per-`AuditLog`-open (random-ish
+    /// nanos + pid), so pid reuse cannot collide ids either.
+    #[serde(default)]
+    pub event_id: String,
     pub kind: AuditEventKind,
+    /// Caller-supplied correlation tag (`--ref`) — the join key between the
+    /// audit ledger, consent records, and external task/run receipts.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_tag: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +110,8 @@ pub struct AuditEvent {
 pub struct AuditLog {
     file: parking_lot::Mutex<std::fs::File>,
     seq: AtomicU64,
+    /// Per-open uniqueness domain for `event_id`s (see [`AuditEvent`]).
+    instance: String,
 }
 
 impl AuditLog {
@@ -106,13 +128,20 @@ impl AuditLog {
         Ok(Self {
             file: parking_lot::Mutex::new(file),
             seq: AtomicU64::new(0),
+            instance: instance_id(),
         })
     }
 
     /// Append one event and flush. Errors propagate — callers decide whether
-    /// audit failure is fatal (it is not, in P0).
+    /// audit failure is fatal (it is not, in P0). Stamps `seq`,
+    /// `schema_version`, and (when unset) `event_id`.
     pub fn record(&self, mut event: AuditEvent) -> std::io::Result<()> {
-        event.seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        event.seq = seq;
+        event.schema_version = AUDIT_SCHEMA_VERSION;
+        if event.event_id.is_empty() {
+            event.event_id = format!("evt-{}-{seq}", self.instance);
+        }
         let mut line = serde_json::to_string(&event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push('\n');
@@ -120,6 +149,18 @@ impl AuditLog {
         file.write_all(line.as_bytes())?;
         file.flush()
     }
+}
+
+/// Uniqueness-domain component for [`AuditEvent::event_id`]: hex nanos +
+/// pid, fresh per [`AuditLog::open`]. No randomness dependency needed —
+/// nanosecond wall clock plus pid is collision-free for practical purposes,
+/// and `seq` disambiguates within the open.
+fn instance_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{:x}-{}", nanos, std::process::id())
 }
 
 static AUDIT: OnceLock<Option<AuditLog>> = OnceLock::new();
@@ -180,8 +221,11 @@ pub fn event(
     reason: impl Into<String>,
 ) -> AuditEvent {
     AuditEvent {
+        schema_version: AUDIT_SCHEMA_VERSION,
         ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         seq: 0,
+        event_id: String::new(),
+        ref_tag: None,
         kind,
         session_id: None,
         tab_id: None,
@@ -269,5 +313,43 @@ mod tests {
             AuditDecision::Allow,
             "noop-check",
         ));
+    }
+
+    #[test]
+    fn record_stamps_schema_version_event_id_and_ref() {
+        let dir = std::env::temp_dir().join(format!("oxi-audit-schema-{}", std::process::id()));
+        let path = dir.join("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let log = AuditLog::open(&path).unwrap();
+        let mut with_ref = event(AuditEventKind::AccountUse, AuditDecision::Allow, "r1");
+        with_ref.ref_tag = Some("run-42".into());
+        log.record(with_ref).unwrap();
+        log.record(event(
+            AuditEventKind::SessionRestore,
+            AuditDecision::Allow,
+            "r2",
+        ))
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        // Per-event schema stamp + `ref` join key under its contract name.
+        assert!(lines[0].contains("\"schema_version\":1"), "{}", lines[0]);
+        assert!(lines[0].contains("\"ref\":\"run-42\""), "{}", lines[0]);
+        assert!(!lines[1].contains("\"ref\""), "{}", lines[1]);
+        let first: AuditEvent = serde_json::from_str(lines[0]).unwrap();
+        let second: AuditEvent = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first.schema_version, AUDIT_SCHEMA_VERSION);
+        assert_eq!(first.ref_tag.as_deref(), Some("run-42"));
+        // event ids are stamped and unique within (and across) opens.
+        assert!(!first.event_id.is_empty());
+        assert_ne!(first.event_id, second.event_id);
+        // Pre-schema lines (no schema_version/event_id/ref) still parse.
+        let old = r#"{"ts":"2026-01-01T00:00:00.000Z","seq":3,"kind":"credential_use","decision":"allow","reason":"x"}"#;
+        let parsed: AuditEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.schema_version, 0);
+        assert!(parsed.event_id.is_empty());
+        assert!(parsed.ref_tag.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
