@@ -122,7 +122,6 @@ fn sync_db(tx: &SharedTx, origin: &str, name: &str, state: &IdbDbState) {
     }
 }
 
-
 /// Build a `store` object bound to `(db_name, store_name)`.
 #[allow(clippy::too_many_arguments)]
 fn make_store(
@@ -803,7 +802,8 @@ mod persist_tests {
                 name,
                 version,
                 data,
-            } = msg {
+            } = msg
+            {
                 assert_eq!(origin, "https://shop.io");
                 let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
                 let stores = serde_json::from_value(parsed["stores"].clone()).unwrap();
