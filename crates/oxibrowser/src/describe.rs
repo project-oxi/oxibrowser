@@ -36,9 +36,12 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "flags": ["source","engine","repo","token","json","max-results","timeout"]
             },
             "account": {
-                "subcommands": ["add","list","status","rm"],
+                "subcommands": ["add","list","status","rm","login","logout","grant","revoke","exec","grants","capture","irreversible","export-state"],
                 "add_flags": ["site","id","login","display","json"],
-                "status_flags": ["probe","json"]
+                "status_flags": ["probe","json"],
+                "exec_flags": ["agent","actions","ttl","max-uses","ref"],
+                "grant_flags": ["agent","actions","ttl","max-uses","ref","json"],
+                "note": "exit 5 = CONSENT_REQUIRED (details: request_id/ttl/account/action); run `oxibrowser describe account` for the full surface"
             },
             "credential": {
                 "subcommands": ["put","get","list","rm","totp","onboard"],
