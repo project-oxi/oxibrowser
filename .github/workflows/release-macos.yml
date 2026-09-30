@@ -3,6 +3,11 @@ name: Release macOS
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and attach (e.g. v0.25.0)'
+        required: true
 
 permissions:
   contents: write
@@ -18,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@1.96
         with:
@@ -131,7 +136,7 @@ jobs:
       - name: Attach to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           # The Publish workflow (crates.io + release notes) may still be
           # running — create the release if it does not exist yet, then
