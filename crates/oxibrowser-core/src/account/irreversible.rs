@@ -40,7 +40,12 @@ pub fn matched_pattern<'a>(haystack: &str, extra: &'a [String]) -> Option<&'a st
         .iter()
         .find(|p| hay.contains(*p))
         .map(|p| *p)
-        .or_else(|| extra.iter().find(|p| hay.contains(p.as_str())).map(|p| p.as_str()))
+        .or_else(|| {
+            extra
+                .iter()
+                .find(|p| hay.contains(p.as_str()))
+                .map(|p| p.as_str())
+        })
 }
 
 #[cfg(test)]

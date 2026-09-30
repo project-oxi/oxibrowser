@@ -212,7 +212,9 @@ pub struct Session {
     ls_tx: std::sync::mpsc::Sender<LocalStorageMsg>,
     /// Origin-keyed IndexedDB, **shared with the parent
     /// [`BrowserContext`]** — the FM-L5 storage plane (item 12).
-    indexed_db: Arc<parking_lot::RwLock<HashMap<String, HashMap<String, crate::storage_state::IdbDatabase>>>>,
+    indexed_db: Arc<
+        parking_lot::RwLock<HashMap<String, HashMap<String, crate::storage_state::IdbDatabase>>>,
+    >,
     /// Handle to the JS→sync-thread IndexedDB channel (drain barrier).
     idb_tx: std::sync::mpsc::Sender<crate::js::runtime::IndexedDbMsg>,
     /// Origin of the most recently imported storage state; used to route
@@ -870,7 +872,12 @@ fn handle_indexed_db_sync(
             crate::js::runtime::IndexedDbMsg::Drain(ack) => {
                 let _ = ack.send(());
             }
-            crate::js::runtime::IndexedDbMsg::PutDb { origin, name, version, data } => {
+            crate::js::runtime::IndexedDbMsg::PutDb {
+                origin,
+                name,
+                version,
+                data,
+            } => {
                 #[derive(serde::Deserialize, Default)]
                 struct Blob {
                     #[serde(default)]
@@ -883,26 +890,18 @@ fn handle_indexed_db_sync(
                 }
                 let blob = serde_json::from_str::<Blob>(&data).unwrap_or_default();
                 let stores = blob.stores;
-                indexed_db
-                    .write()
-                    .entry(origin)
-                    .or_default()
-                    .insert(
-                        name.clone(),
-                        crate::storage_state::IdbDatabase {
-                            name,
-                            version,
-                            stores,
-                            key_paths: blob.key_paths,
-                        },
-                    );
+                indexed_db.write().entry(origin).or_default().insert(
+                    name.clone(),
+                    crate::storage_state::IdbDatabase {
+                        name,
+                        version,
+                        stores,
+                        key_paths: blob.key_paths,
+                    },
+                );
             }
             crate::js::runtime::IndexedDbMsg::DeleteDb { origin, name } => {
-                indexed_db
-                    .write()
-                    .entry(origin)
-                    .or_default()
-                    .remove(&name);
+                indexed_db.write().entry(origin).or_default().remove(&name);
             }
         }
     }
@@ -2530,18 +2529,16 @@ impl Session {
                         local_storage: bucket
                             .map(|b| {
                                 b.iter()
-                                    .map(|(k, v)| {
-                                        crate::storage_state::LocalStorageEntry {
-                                            name: k.clone(),
-                                            value: v.clone(),
-                                        }
+                                    .map(|(k, v)| crate::storage_state::LocalStorageEntry {
+                                        name: k.clone(),
+                                        value: v.clone(),
                                     })
                                     .collect()
                             })
                             .unwrap_or_default(),
-                        indexed_db: dbs.filter(|d| !d.is_empty()).map(|d| {
-                            d.values().cloned().collect()
-                        }),
+                        indexed_db: dbs
+                            .filter(|d| !d.is_empty())
+                            .map(|d| d.values().cloned().collect()),
                     }]
                 }
             }
@@ -2611,18 +2608,16 @@ impl Session {
                         local_storage: bucket
                             .map(|b| {
                                 b.iter()
-                                    .map(|(k, v)| {
-                                        crate::storage_state::LocalStorageEntry {
-                                            name: k.clone(),
-                                            value: v.clone(),
-                                        }
+                                    .map(|(k, v)| crate::storage_state::LocalStorageEntry {
+                                        name: k.clone(),
+                                        value: v.clone(),
                                     })
                                     .collect()
                             })
                             .unwrap_or_default(),
-                        indexed_db: dbs.filter(|d| !d.is_empty()).map(|d| {
-                            d.values().cloned().collect()
-                        }),
+                        indexed_db: dbs
+                            .filter(|d| !d.is_empty())
+                            .map(|d| d.values().cloned().collect()),
                     })
                 })
                 .collect()
@@ -3388,24 +3383,24 @@ mod tests {
                         name: "ls_login".into(),
                         value: "a".into(),
                     }],
-                indexed_db: None,
-            },
+                    indexed_db: None,
+                },
                 OriginState {
                     origin: "https://example.com".into(),
                     local_storage: vec![LocalStorageEntry {
                         name: "ls_apex".into(),
                         value: "b".into(),
                     }],
-                indexed_db: None,
-            },
+                    indexed_db: None,
+                },
                 OriginState {
                     origin: "https://other.org".into(),
                     local_storage: vec![LocalStorageEntry {
                         name: "ls_other".into(),
                         value: "c".into(),
                     }],
-                indexed_db: None,
-            },
+                    indexed_db: None,
+                },
             ],
         };
         session.import_state(&st).expect("import");
@@ -3464,8 +3459,8 @@ mod tests {
                         name: "token".into(),
                         value: "t0k3n".into(),
                     }],
-                indexed_db: None,
-            }],
+                    indexed_db: None,
+                }],
             })
             .expect("import");
 
@@ -3534,8 +3529,8 @@ mod tests {
                             value: "3".into(),
                         },
                     ],
-                indexed_db: None,
-            }],
+                    indexed_db: None,
+                }],
             })
             .expect("import");
 
@@ -3607,16 +3602,16 @@ mod tests {
                             name: "ka".into(),
                             value: "va".into(),
                         }],
-                indexed_db: None,
-            },
+                        indexed_db: None,
+                    },
                     OriginState {
                         origin: "https://b.test".into(),
                         local_storage: vec![LocalStorageEntry {
                             name: "kb".into(),
                             value: "vb".into(),
                         }],
-                indexed_db: None,
-            },
+                        indexed_db: None,
+                    },
                 ],
             })
             .expect("import");

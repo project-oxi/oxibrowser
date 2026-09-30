@@ -300,9 +300,7 @@ async fn irreversible_gate(
     enrich_element: bool,
 ) -> Result<(), CdpError> {
     use oxibrowser_core::account::irreversible::matched_pattern;
-    use oxibrowser_core::security::audit::{
-        self, AuditDecision, AuditEvent, AuditEventKind,
-    };
+    use oxibrowser_core::security::audit::{self, AuditDecision, AuditEvent, AuditEventKind};
 
     if !ctx.browser_context.credential_mode() {
         return Ok(());
@@ -314,7 +312,12 @@ async fn irreversible_gate(
     let Some(account_id) = surface.account_for_context(ctx_id) else {
         return Ok(());
     };
-    let record = match surface.orchestrator().shared_manager().registry().get(&account_id) {
+    let record = match surface
+        .orchestrator()
+        .shared_manager()
+        .registry()
+        .get(&account_id)
+    {
         Ok(r) => r,
         Err(_) => return Ok(()),
     };
@@ -361,18 +364,18 @@ async fn irreversible_gate(
         .orchestrator()
         .shared_manager()
         .record_event(AuditEvent {
-        action: Some("irreversible_gate".to_string()),
-        origin: Some(record.scope.clone()),
-        ..audit::event(
-            AuditEventKind::PolicyViolation,
-            if allowed {
-                AuditDecision::Allow
-            } else {
-                AuditDecision::Deny
-            },
-            format!("account={account_id} pattern={pattern:?} allowed={allowed}"),
-        )
-    });
+            action: Some("irreversible_gate".to_string()),
+            origin: Some(record.scope.clone()),
+            ..audit::event(
+                AuditEventKind::PolicyViolation,
+                if allowed {
+                    AuditDecision::Allow
+                } else {
+                    AuditDecision::Deny
+                },
+                format!("account={account_id} pattern={pattern:?} allowed={allowed}"),
+            )
+        });
     if allowed {
         return Ok(());
     }

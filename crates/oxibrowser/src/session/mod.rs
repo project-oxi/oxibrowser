@@ -51,8 +51,10 @@ pub async fn run_session(
             .filter(|s| !s.is_empty())
             .collect();
         if ids.is_empty() {
-            let resp =
-                CliResponse::error("--account requires at least one account id", "INPUT_VALIDATION");
+            let resp = CliResponse::error(
+                "--account requires at least one account id",
+                "INPUT_VALIDATION",
+            );
             resp.print_json();
             return 2;
         }

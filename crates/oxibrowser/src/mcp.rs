@@ -262,13 +262,17 @@ struct McpAccounts {
 
 impl McpAccounts {
     fn empty() -> Self {
-        McpAccounts { registry: None, agent: None, primary: None }
+        McpAccounts {
+            registry: None,
+            agent: None,
+            primary: None,
+        }
     }
 
     fn registry(&self) -> Result<&oxibrowser_core::account::AccountRegistry, String> {
-        self.registry.as_ref().ok_or_else(|| {
-            "accountsUnavailable: account registry could not be opened".to_string()
-        })
+        self.registry
+            .as_ref()
+            .ok_or_else(|| "accountsUnavailable: account registry could not be opened".to_string())
     }
 }
 
@@ -325,8 +329,8 @@ async fn call_tool(
             return Ok(json!({ "accounts": rows }));
         }
         "account_status" => {
-            let id = string_arg(args, "account_id")
-                .ok_or("missing required argument: account_id")?;
+            let id =
+                string_arg(args, "account_id").ok_or("missing required argument: account_id")?;
             let r = accounts
                 .registry()?
                 .get(&id)
@@ -340,8 +344,8 @@ async fn call_tool(
             }));
         }
         "login_request" => {
-            let id = string_arg(args, "account_id")
-                .ok_or("missing required argument: account_id")?;
+            let id =
+                string_arg(args, "account_id").ok_or("missing required argument: account_id")?;
             let reason = string_arg(args, "reason");
             let r = accounts
                 .registry()?

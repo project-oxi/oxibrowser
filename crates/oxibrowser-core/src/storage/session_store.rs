@@ -521,8 +521,8 @@ mod tests {
                         name: "token".to_string(),
                         value: cookie_value.to_string(),
                     }],
-                indexed_db: None,
-            }],
+                    indexed_db: None,
+                }],
             },
         )
     }

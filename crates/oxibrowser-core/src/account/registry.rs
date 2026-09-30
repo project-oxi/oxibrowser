@@ -67,7 +67,6 @@ impl AccountRegistry {
         self.account_dir(account_id).join("sessions")
     }
 
-
     /// Path of the account's `account.json`.
     pub fn record_path(&self, account_id: &str) -> PathBuf {
         self.account_dir(account_id).join("account.json")

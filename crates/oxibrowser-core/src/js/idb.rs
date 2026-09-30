@@ -25,7 +25,9 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use boa_engine::property::Attribute;
-use boa_engine::{js_string, Context, JsError, JsObject, JsString, JsValue, JsNativeError, NativeFunction};
+use boa_engine::{
+    Context, JsError, JsNativeError, JsObject, JsString, JsValue, NativeFunction, js_string,
+};
 use serde_json::Value as Json;
 
 use super::runtime::IndexedDbMsg;
@@ -127,8 +129,8 @@ fn live_state(db: &IdbDatabase) -> SharedDbs {
         IdbDbState {
             version: db.version,
             stores: db.stores.clone(),
-        key_paths: BTreeMap::new(),
-    },
+            key_paths: BTreeMap::new(),
+        },
     )])))
 }
 
@@ -155,8 +157,8 @@ fn make_store(
         let f = unsafe {
             NativeFunction::from_closure(move |_, args, ctx| {
                 let value = args.first().cloned().unwrap_or(JsValue::undefined());
-                let json: Json = json_of(&value, ctx)
-                    .ok_or_else(|| data_error("value not serializable"))?;
+                let json: Json =
+                    json_of(&value, ctx).ok_or_else(|| data_error("value not serializable"))?;
                 let explicit_key: Option<String> = match args.get(1) {
                     Some(k) if !k.is_undefined() => Some(
                         k.to_string(ctx)
@@ -187,13 +189,21 @@ fn make_store(
                 if reject_existing && store.contains_key(&key) {
                     return Err(data_error("key already exists"));
                 }
-                store.insert(key.clone(), serde_json::to_string(&json).unwrap_or_default());
+                store.insert(
+                    key.clone(),
+                    serde_json::to_string(&json).unwrap_or_default(),
+                );
                 sync_db(&tx, &origin, &db_name, &db);
                 // v1 transaction semantics: durable immediately; the parent
                 // transaction completes after each mutating request. Request
                 // success fires BEFORE the transaction complete (spec order).
                 let req = JsObject::with_object_proto(ctx.intrinsics());
-                let _ = req.set(js_string!("result"), JsValue::from(JsString::from(key.as_str())), false, ctx);
+                let _ = req.set(
+                    js_string!("result"),
+                    JsValue::from(JsString::from(key.as_str())),
+                    false,
+                    ctx,
+                );
                 queue_event(req.clone(), "success");
                 if let Some(t) = &on_complete {
                     queue_event(t.clone(), "complete");
@@ -348,9 +358,12 @@ fn make_transaction(
     let os_fn = unsafe {
         NativeFunction::from_closure(move |_, args, ctx| {
             let name: String = match args.first() {
-                    Some(n) => n.to_string(ctx).map_err(data_error)?.to_std_string_escaped(),
-                    None => return Err(data_error("name requires a value")),
-                };
+                Some(n) => n
+                    .to_string(ctx)
+                    .map_err(data_error)?
+                    .to_std_string_escaped(),
+                None => return Err(data_error("name requires a value")),
+            };
             let exists = dbs
                 .borrow()
                 .get(&db_name)
@@ -408,9 +421,12 @@ fn make_database(
     let cos_fn = unsafe {
         NativeFunction::from_closure(move |_, args, ctx| {
             let name: String = match args.first() {
-                    Some(n) => n.to_string(ctx).map_err(data_error)?.to_std_string_escaped(),
-                    None => return Err(data_error("name requires a value")),
-                };
+                Some(n) => n
+                    .to_string(ctx)
+                    .map_err(data_error)?
+                    .to_std_string_escaped(),
+                None => return Err(data_error("name requires a value")),
+            };
             let key_path = args
                 .get(1)
                 .and_then(|o| o.as_object())
@@ -422,9 +438,7 @@ fn make_database(
                 let mut m = cos_dbs.borrow_mut();
                 let db = m.entry(cos_db.clone()).or_default();
                 if db.stores.contains_key(&name) {
-                    return Err(data_error(format!(
-                        "store \"{name}\" already exists"
-                    )));
+                    return Err(data_error(format!("store \"{name}\" already exists")));
                 }
                 db.stores.entry(name.clone()).or_default();
                 // Record the keyPath (item 12): puts without an explicit key
@@ -459,9 +473,12 @@ fn make_database(
     let del_fn = unsafe {
         NativeFunction::from_closure(move |_, args, ctx| {
             let name: String = match args.first() {
-                    Some(n) => n.to_string(ctx).map_err(data_error)?.to_std_string_escaped(),
-                    None => return Err(data_error("name requires a value")),
-                };
+                Some(n) => n
+                    .to_string(ctx)
+                    .map_err(data_error)?
+                    .to_std_string_escaped(),
+                None => return Err(data_error("name requires a value")),
+            };
             if let Some(db) = del_dbs.borrow_mut().get_mut(&del_db) {
                 db.stores.remove(&name);
                 db.key_paths.remove(&name);
@@ -500,9 +517,8 @@ fn make_database(
         ctx,
     );
 
-    let close_fn = unsafe {
-        NativeFunction::from_closure(move |_, _args, _ctx| Ok(JsValue::undefined()))
-    };
+    let close_fn =
+        unsafe { NativeFunction::from_closure(move |_, _args, _ctx| Ok(JsValue::undefined())) };
     let _ = obj.set(
         js_string!("close"),
         JsValue::from(close_fn.to_js_function(ctx.realm())),
@@ -535,9 +551,12 @@ pub fn register_indexed_db(
     let open_fn = unsafe {
         NativeFunction::from_closure(move |_, args, ctx| {
             let name: String = match args.first() {
-                    Some(n) => n.to_string(ctx).map_err(data_error)?.to_std_string_escaped(),
-                    None => return Err(data_error("name requires a value")),
-                };
+                Some(n) => n
+                    .to_string(ctx)
+                    .map_err(data_error)?
+                    .to_std_string_escaped(),
+                None => return Err(data_error("name requires a value")),
+            };
             let requested = args
                 .get(1)
                 .and_then(|v| v.as_number())
@@ -599,9 +618,12 @@ pub fn register_indexed_db(
     let delete_fn = unsafe {
         NativeFunction::from_closure(move |_, args, ctx| {
             let name: String = match args.first() {
-                    Some(n) => n.to_string(ctx).map_err(data_error)?.to_std_string_escaped(),
-                    None => return Err(data_error("name requires a value")),
-                };
+                Some(n) => n
+                    .to_string(ctx)
+                    .map_err(data_error)?
+                    .to_std_string_escaped(),
+                None => return Err(data_error("name requires a value")),
+            };
             del_dbs.borrow_mut().remove(&name);
             if let Some(tx) = del_tx.borrow().as_ref() {
                 let _ = tx.send(IndexedDbMsg::DeleteDb {
@@ -632,8 +654,8 @@ fn live_from_envelope(db: &IdbDatabase) -> SharedDbs {
         IdbDbState {
             version: db.version,
             stores: db.stores.clone(),
-        key_paths: BTreeMap::new(),
-    },
+            key_paths: BTreeMap::new(),
+        },
     )])))
 }
 
@@ -724,7 +746,9 @@ mod tests {
         let mut put_data = String::new();
         for msg in rx.try_iter() {
             match msg {
-                IndexedDbMsg::PutDb { origin, name, data, .. } => {
+                IndexedDbMsg::PutDb {
+                    origin, name, data, ..
+                } => {
                     assert_eq!(origin, "https://example.com");
                     assert_eq!(name, "auth");
                     put_data = data;
@@ -757,7 +781,8 @@ mod persist_tests {
             tx_cell.clone(),
             "https://shop.io".into(),
         );
-        ctx.eval(Source::from_bytes("var __idb_put_ok = false;")).unwrap();
+        ctx.eval(Source::from_bytes("var __idb_put_ok = false;"))
+            .unwrap();
 
         let put = r#"(function(){
             const req = indexedDB.open("auth", 1);
@@ -784,25 +809,38 @@ mod persist_tests {
         let mut bucket: BTreeMap<String, IdbDbState> = BTreeMap::new();
         for msg in rx.try_iter() {
             match msg {
-                IndexedDbMsg::PutDb { origin, name, version, data } => {
+                IndexedDbMsg::PutDb {
+                    origin,
+                    name,
+                    version,
+                    data,
+                } => {
                     assert_eq!(origin, "https://shop.io");
                     let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
                     let stores = serde_json::from_value(parsed["stores"].clone()).unwrap();
                     let key_paths = serde_json::from_value(parsed["key_paths"].clone()).unwrap();
-                    bucket.insert(name, IdbDbState { version, stores, key_paths });
+                    bucket.insert(
+                        name,
+                        IdbDbState {
+                            version,
+                            stores,
+                            key_paths,
+                        },
+                    );
                 }
                 _ => {}
             }
         }
         let auth = bucket.get("auth").expect("PutDb must carry the auth db");
-        assert_eq!(auth.key_paths.get("tokens").cloned(), Some(Some("id".to_string())));
+        assert_eq!(
+            auth.key_paths.get("tokens").cloned(),
+            Some(Some("id".to_string()))
+        );
         assert!(auth.stores["tokens"]["gcp"].contains("tok-123"));
 
         // Re-registration from the bucket (the navigation seed) — fresh map.
-        let seed: BTreeMap<String, IdbDbState> = bucket
-            .iter()
-            .map(|(n, d)| (n.clone(), d.clone()))
-            .collect();
+        let seed: BTreeMap<String, IdbDbState> =
+            bucket.iter().map(|(n, d)| (n.clone(), d.clone())).collect();
         register_indexed_db(&mut ctx, seed, tx_cell, "https://shop.io".into());
 
         ctx.eval(Source::from_bytes(

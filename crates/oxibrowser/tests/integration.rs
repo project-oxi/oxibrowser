@@ -111,7 +111,10 @@ async fn test_json_endpoint_get() {
     // api.github.com stopped serving unauthenticated root requests (403,
     // measured 2026-09-29) — retargeted to a stable minimal JSON endpoint.
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://api.ipify.org/?format=json").await.unwrap();
+    let session = browser
+        .new_page("https://api.ipify.org/?format=json")
+        .await
+        .unwrap();
 
     let guard = session.read().await;
     let page = guard.page().expect("page should be loaded");

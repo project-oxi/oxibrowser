@@ -576,10 +576,21 @@ pub(crate) async fn run_account(command: AccountCommand, audit: AuditContext) ->
             max_uses,
             ref_tag,
             json,
-        } => account_grant(&id, &agent, &actions, ttl, max_uses, ref_tag.as_deref(), json),
-        AccountCommand::Revoke { id, agent, ref_tag, json } => {
-            account_revoke(&id, &agent, ref_tag.as_deref(), json)
-        }
+        } => account_grant(
+            &id,
+            &agent,
+            &actions,
+            ttl,
+            max_uses,
+            ref_tag.as_deref(),
+            json,
+        ),
+        AccountCommand::Revoke {
+            id,
+            agent,
+            ref_tag,
+            json,
+        } => account_revoke(&id, &agent, ref_tag.as_deref(), json),
         AccountCommand::Exec {
             id,
             agent,
@@ -588,12 +599,23 @@ pub(crate) async fn run_account(command: AccountCommand, audit: AuditContext) ->
             max_uses,
             ref_tag,
             cmd,
-        } => account_exec(&id, &agent, &actions, ttl, max_uses, ref_tag.as_deref(), cmd),
+        } => account_exec(
+            &id,
+            &agent,
+            &actions,
+            ttl,
+            max_uses,
+            ref_tag.as_deref(),
+            cmd,
+        ),
         AccountCommand::Capture { id, ws, json } => account_capture(&id, &ws, json).await,
         AccountCommand::Grants { id, agent, json } => account_grants(&id, agent.as_deref(), json),
-        AccountCommand::Irreversible { id, add, clear, json } => {
-            account_irreversible(&id, &add, clear, json, &audit)
-        }
+        AccountCommand::Irreversible {
+            id,
+            add,
+            clear,
+            json,
+        } => account_irreversible(&id, &add, clear, json, &audit),
     }
 }
 
@@ -958,10 +980,11 @@ async fn account_login_agent(
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
     };
-    let (manager, _browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
-        Ok(s) => s,
-        Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
-    };
+    let (manager, _browser, orch) =
+        match login_stack(&registry, allow_private, None, &audit.lock).await {
+            Ok(s) => s,
+            Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
+        };
 
     // Credential plane: keychain provider + deny-first policy engine over
     // ~/.oxibrowser/consents.jsonl (the same wiring `credential put/get` uses).
@@ -1119,10 +1142,11 @@ async fn account_login_import(
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
     };
-    let (_manager, _browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
-        Ok(s) => s,
-        Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
-    };
+    let (_manager, _browser, orch) =
+        match login_stack(&registry, allow_private, None, &audit.lock).await {
+            Ok(s) => s,
+            Err(e) => return print_error(&e, "RUNTIME_ERROR", json),
+        };
 
     match orch.import(id, &state).await {
         Ok(outcome) => {
@@ -1176,10 +1200,11 @@ async fn account_login_host(
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", true),
     };
-    let (_manager, browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
-        Ok(s) => s,
-        Err(e) => return print_error(&e, "RUNTIME_ERROR", true),
-    };
+    let (_manager, browser, orch) =
+        match login_stack(&registry, allow_private, None, &audit.lock).await {
+            Ok(s) => s,
+            Err(e) => return print_error(&e, "RUNTIME_ERROR", true),
+        };
     let surface = LoginSurface::new(orch.clone(), browser.clone());
 
     let (handle, ctx) = match surface
@@ -1259,10 +1284,11 @@ async fn account_login_wizard(
         Ok(r) => r,
         Err(e) => return print_error(&e, "RUNTIME_ERROR", false),
     };
-    let (_manager, browser, orch) = match login_stack(&registry, allow_private, None, &audit.lock).await {
-        Ok(s) => s,
-        Err(e) => return print_error(&e, "RUNTIME_ERROR", false),
-    };
+    let (_manager, browser, orch) =
+        match login_stack(&registry, allow_private, None, &audit.lock).await {
+            Ok(s) => s,
+            Err(e) => return print_error(&e, "RUNTIME_ERROR", false),
+        };
 
     let handle = match orch.begin_login(id, LoginMode::User, timeout.map(Duration::from_secs)) {
         Ok(h) => h,
@@ -1762,7 +1788,13 @@ fn account_grants(id: &str, agent_filter: Option<&str>, json: bool) -> i32 {
                 None => true,
             })
             .collect(),
-        Err(e) => return print_error(&format!("cannot read consent store: {e}"), "RUNTIME_ERROR", json),
+        Err(e) => {
+            return print_error(
+                &format!("cannot read consent store: {e}"),
+                "RUNTIME_ERROR",
+                json,
+            );
+        }
     };
     if json {
         let rows: Vec<serde_json::Value> = grants
@@ -1806,7 +1838,11 @@ fn account_grants(id: &str, agent_filter: Option<&str>, json: bool) -> i32 {
                 rec.uses,
                 rec.max_uses,
                 rec.expires_at.to_rfc3339(),
-                if rec.active_at(now) { "" } else { " [inactive]" },
+                if rec.active_at(now) {
+                    ""
+                } else {
+                    " [inactive]"
+                },
                 rec.ref_tag
                     .as_deref()
                     .map(|r| format!(" ref={r}"))
@@ -1861,7 +1897,13 @@ fn account_exec(
             );
         }
         if !normalized.iter().any(|x| *x == a) {
-            normalized.push(ACCOUNT_GRANT_ACTIONS.iter().find(|x| **x == a).copied().unwrap());
+            normalized.push(
+                ACCOUNT_GRANT_ACTIONS
+                    .iter()
+                    .find(|x| **x == a)
+                    .copied()
+                    .unwrap(),
+            );
         }
     }
     if normalized.is_empty() {
@@ -1896,7 +1938,7 @@ fn account_exec(
                 &format!("cannot open consent store: {e}"),
                 "RUNTIME_ERROR",
                 false,
-            )
+            );
         }
     };
     if let Err(e) = consents.grant(rec.clone()) {
@@ -2033,7 +2075,7 @@ async fn account_capture(id: &str, ws_url: &str, json: bool) -> i32 {
                 &format!("cannot connect to {ws_url}: {e}"),
                 "NETWORK_ERROR",
                 json,
-            )
+            );
         }
     };
     let request = serde_json::json!({
@@ -2048,14 +2090,14 @@ async fn account_capture(id: &str, ws_url: &str, json: bool) -> i32 {
         let msg = match ws.next().await {
             Some(Ok(m)) => m,
             Some(Err(e)) => {
-                return print_error(&format!("connection error: {e}"), "NETWORK_ERROR", json)
+                return print_error(&format!("connection error: {e}"), "NETWORK_ERROR", json);
             }
             None => return print_error("connection closed before response", "NETWORK_ERROR", json),
         };
         let text = match msg {
             Message::Text(t) => t,
             Message::Close(_) => {
-                return print_error("connection closed before response", "NETWORK_ERROR", json)
+                return print_error("connection closed before response", "NETWORK_ERROR", json);
             }
             _ => continue,
         };
@@ -2076,7 +2118,10 @@ async fn account_capture(id: &str, ws_url: &str, json: bool) -> i32 {
                 json,
             );
         }
-        let result = value.get("result").cloned().unwrap_or(serde_json::Value::Null);
+        let result = value
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         if json {
             CliResponse::success(result).print_json();
         } else {
@@ -2095,7 +2140,13 @@ async fn account_capture(id: &str, ws_url: &str, json: bool) -> i32 {
 /// irreversible-pattern injection (item 16): extra deny-biased patterns
 /// layered on the built-in defaults, matched against click/fill descriptors
 /// in this account's contexts.
-fn account_irreversible(id: &str, add: &[String], clear: bool, json: bool, audit: &AuditContext) -> i32 {
+fn account_irreversible(
+    id: &str,
+    add: &[String],
+    clear: bool,
+    json: bool,
+    audit: &AuditContext,
+) -> i32 {
     if add.is_empty() && !clear {
         return print_error(
             "nothing to do — use --add <patterns> and/or --clear",

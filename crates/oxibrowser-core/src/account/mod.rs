@@ -31,12 +31,12 @@ pub mod probe;
 pub mod probes;
 pub mod record;
 pub mod registry;
-pub use irreversible::DEFAULT_IRREVERSIBLE_PATTERNS;
-pub use probes::curated_for;
 pub use agent_login::{
     AgentLoginEngine, AgentLoginOutcome, AgentLoginProgress, CredentialSource, FieldInput,
     LoginForm, MfaForbidden, MfaStep, ResolvedLogin, SourceError,
 };
+pub use irreversible::DEFAULT_IRREVERSIBLE_PATTERNS;
+pub use probes::curated_for;
 
 pub use detector::{
     Detection, DetectionInput, LoginDetector, PreLoginSnapshot, Signal, SignalKind,

@@ -359,9 +359,9 @@ async fn main() {
         oxibrowser_core::account::LockPolicy::Block
     } else {
         match cli.lock_timeout {
-            Some(secs) => oxibrowser_core::account::LockPolicy::Timeout(
-                std::time::Duration::from_secs(secs),
-            ),
+            Some(secs) => {
+                oxibrowser_core::account::LockPolicy::Timeout(std::time::Duration::from_secs(secs))
+            }
             None => oxibrowser_core::account::LockPolicy::FailFast,
         }
     };
@@ -454,7 +454,11 @@ async fn main() {
         Commands::Run {
             script, timeout, ..
         } => run_script(&script, timeout).await,
-        Commands::Session { allow_private_ips, account, ref_tag } => {
+        Commands::Session {
+            allow_private_ips,
+            account,
+            ref_tag,
+        } => {
             session::run_session(
                 allow_private_ips,
                 account.as_deref(),
@@ -1660,7 +1664,8 @@ async fn run_serve(
             }
         };
         let (_manager, _login_browser, orch) =
-            match account_cli::login_stack(&registry, allow_private_ips, ref_tag, &lock_policy).await
+            match account_cli::login_stack(&registry, allow_private_ips, ref_tag, &lock_policy)
+                .await
             {
                 Ok(s) => s,
                 Err(e) => {

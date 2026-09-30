@@ -3047,7 +3047,9 @@ async fn test_viewer_page_and_query_param_role() {
     // A bad token via query is rejected at upgrade time.
     let bad = format!("ws://{addr}/ws?role=viewer&viewer_token=oxi-viewer-bogus");
     assert!(
-        tokio_tungstenite::connect_async(bad.as_str()).await.is_err(),
+        tokio_tungstenite::connect_async(bad.as_str())
+            .await
+            .is_err(),
         "bogus query token must be rejected"
     );
 

@@ -404,7 +404,10 @@ pub fn build_summary(page: &oxibrowser_core::page::Page) -> Value {
 
 /// Map a core error to a machine-readable error code string.
 pub fn core_error_code(error: &oxibrowser_core::error::CoreError) -> &'static str {
-    if matches!(error, oxibrowser_core::error::CoreError::AccountLocked { .. }) {
+    if matches!(
+        error,
+        oxibrowser_core::error::CoreError::AccountLocked { .. }
+    ) {
         return "ACCOUNT_LOCKED";
     }
     let msg = format!("{error}");

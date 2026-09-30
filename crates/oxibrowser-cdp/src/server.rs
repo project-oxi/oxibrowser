@@ -40,7 +40,6 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 /// Maximum allowed CDP message size (1 MB).
 pub(crate) const MAX_CDP_MESSAGE_SIZE: usize = 1024 * 1024;
 
-
 /// Derive the `Sec-WebSocket-Accept` value from the client's key.
 fn derive_accept_key(client_key: &[u8]) -> String {
     let mut hasher = Sha1::new();
@@ -414,8 +413,8 @@ impl CdpServer {
                     })
                 };
                 let role_header = header("x-oxi-role").or_else(|| query_param("role"));
-                let viewer_token = header("x-oxi-viewer-token")
-                    .or_else(|| query_param("viewer_token"));
+                let viewer_token =
+                    header("x-oxi-viewer-token").or_else(|| query_param("viewer_token"));
 
                 let conn_ctx = match (role_header.as_deref(), viewer_token.as_deref()) {
                     (Some("viewer"), Some(token)) => {

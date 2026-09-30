@@ -80,7 +80,6 @@ impl AccountRuntime {
         self.primary_context = Some(ctx);
     }
 
-
     fn orch(&mut self) -> Result<Arc<LoginOrchestrator>, String> {
         if let Some(orch) = &self.orch {
             return Ok(orch.clone());
@@ -428,7 +427,6 @@ async fn execute_inner(
             .map_err(|e| CliResponse::error(e, "RUNTIME_ERROR"))?;
             Ok((serde_json::json!({ "tab_id": tab_id }), Some(tab_id)))
         }
-
 
         SessionCommand::Close { tab_id } => {
             manager
