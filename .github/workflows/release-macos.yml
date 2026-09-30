@@ -97,24 +97,32 @@ jobs:
         run: |
           ditto -c -k --keepParent dist/$BIN dist/$BIN.zip
 
-      - name: Notarize (notarytool) and staple
+      - name: Notarize (notarytool)
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
+          # The notarized ZIP is the primary artifact. `stapler` cannot attach
+          # a ticket to a bare Mach-O (Error 73 — bundle/dmg formats only),
+          # so offline validation comes from the notarized ZIP; online
+          # Gatekeeper validation is checked below via spctl.
           xcrun notarytool submit dist/$BIN.zip \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
-          xcrun stapler staple dist/$BIN
-          xcrun stapler validate dist/$BIN
 
-      - name: Gatekeeper assessment
+      - name: Gatekeeper assessment (extracted from the notarized zip)
         run: |
-          spctl -a -t execute -v dist/$BIN
+          set -euo pipefail
+          SPCTL_DIR="$RUNNER_TEMP/spctl-check"
+          mkdir -p "$SPCTL_DIR"
+          ditto -x -k dist/$BIN.zip "$SPCTL_DIR"
+          # Online Gatekeeper assessment: Apple's notarization log is keyed
+          # by the binary's code signature (staple not required when online).
+          spctl -a -t execute -v "$SPCTL_DIR/$BIN"
 
       - name: Checksums
         working-directory: dist
