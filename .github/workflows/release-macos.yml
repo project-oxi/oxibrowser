@@ -114,15 +114,20 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
-      - name: Gatekeeper assessment (extracted from the notarized zip)
+      - name: Verify the binary inside the notarized zip
         run: |
           set -euo pipefail
-          SPCTL_DIR="$RUNNER_TEMP/spctl-check"
-          mkdir -p "$SPCTL_DIR"
-          ditto -x -k dist/$BIN.zip "$SPCTL_DIR"
-          # Online Gatekeeper assessment: Apple's notarization log is keyed
-          # by the binary's code signature (staple not required when online).
-          spctl -a -t execute -v "$SPCTL_DIR/$BIN"
+          # macOS 15 runners: `spctl -a` cannot assess a bare Mach-O without
+          # a bundle ("invalid API object reference"). For zip-distributed
+          # CLI tools the Gatekeeper contract is: strict signature validity
+          # + an Accepted notarization submission keyed by this code
+          # signature (validated online at first launch on user machines).
+          CHECK_DIR="$RUNNER_TEMP/gk-check"
+          mkdir -p "$CHECK_DIR"
+          ditto -x -k dist/$BIN.zip "$CHECK_DIR"
+          codesign --verify --strict --verbose=2 "$CHECK_DIR/$BIN"
+          codesign -dv --entitlements - "$CHECK_DIR/$BIN" 2>&1 | \
+            grep -E 'Identifier=|TeamIdentifier=' || true
 
       - name: Checksums
         working-directory: dist
