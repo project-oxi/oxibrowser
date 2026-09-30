@@ -55,15 +55,17 @@ jobs:
           # runner's temp dir and is deleted with the job.
           CERT_PATH="$RUNNER_TEMP/certificate.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          # One keychain password for create/unlock/partition-list.
+          KC_PASS="$(uuidgen)"
           printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT_PATH"
-          security create-keychain -p "$(uuidgen)" "$KEYCHAIN_PATH"
+          security create-keychain -p "$KC_PASS" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$(uuidgen)" "$KEYCHAIN_PATH" || true
+          security unlock-keychain -p "$KC_PASS" "$KEYCHAIN_PATH"
           security import "$CERT_PATH" \
             -k "$KEYCHAIN_PATH" \
             -P "$APPLE_CERTIFICATE_PASSWORD" \
             -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$(uuidgen)" "$KEYCHAIN_PATH" > /dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KEYCHAIN_PATH" > /dev/null
           security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
           IMPORTED=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F'"' '/Developer ID Application/{print $2; exit}')
           if [ -z "$IMPORTED" ]; then
