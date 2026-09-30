@@ -39,7 +39,7 @@ pub fn matched_pattern<'a>(haystack: &str, extra: &'a [String]) -> Option<&'a st
     DEFAULT_IRREVERSIBLE_PATTERNS
         .iter()
         .find(|p| hay.contains(*p))
-        .map(|p| *p)
+        .copied()
         .or_else(|| {
             extra
                 .iter()

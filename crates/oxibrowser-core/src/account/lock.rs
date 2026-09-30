@@ -35,6 +35,7 @@ pub enum LockPolicy {
     Timeout(Duration),
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for LockPolicy {
     fn default() -> Self {
         LockPolicy::FailFast

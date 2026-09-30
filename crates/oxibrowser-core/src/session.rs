@@ -231,7 +231,6 @@ pub struct Session {
     /// LocalStorage sync handler task handle (for cleanup).
     #[allow(dead_code)]
     local_storage_task: Option<std::thread::JoinHandle<()>>,
-    indexed_db_task: Option<std::thread::JoinHandle<()>>,
     /// WebSocket bridge task handle (for cleanup).
     #[allow(dead_code)]
     ws_task: Option<std::thread::JoinHandle<()>>,
@@ -1025,9 +1024,9 @@ impl Session {
         // handler — the map is the context's origin-keyed IDB map.
         let indexed_db_arc = context.indexed_db_map();
         let idb_arc_clone = indexed_db_arc.clone();
-        let indexed_db_task = Some(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             handle_indexed_db_sync(idb_rx, idb_arc_clone);
-        }));
+        });
 
         if let Err(e) = js_runtime.set_cookie_jar(cookie_jar.clone()) {
             tracing::warn!("failed to set cookie jar: {}", e);
@@ -1053,7 +1052,6 @@ impl Session {
             js_runtime,
             fetch_task,
             local_storage_task,
-            indexed_db_task,
             ws_task,
             closed: AtomicBool::new(false),
             dialog_gate,

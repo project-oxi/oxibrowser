@@ -53,7 +53,7 @@ thread_local! {
     /// The live database map for the current page origin (unused by the
     /// closures — they capture the per-registration `Rc` — but kept for
     /// future cross-frame introspection).
-    static IDB_ORIGIN: RefCell<String> = RefCell::new(String::new());
+    static IDB_ORIGIN: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Queue an event for the next pump.
@@ -122,19 +122,9 @@ fn sync_db(tx: &SharedTx, origin: &str, name: &str, state: &IdbDbState) {
     }
 }
 
-/// Convert an `IdbDatabase` (envelope/serde shape) into live state.
-fn live_state(db: &IdbDatabase) -> SharedDbs {
-    Rc::new(RefCell::new(BTreeMap::from([(
-        db.name.clone(),
-        IdbDbState {
-            version: db.version,
-            stores: db.stores.clone(),
-            key_paths: BTreeMap::new(),
-        },
-    )])))
-}
 
 /// Build a `store` object bound to `(db_name, store_name)`.
+#[allow(clippy::too_many_arguments)]
 fn make_store(
     dbs: SharedDbs,
     db_name: String,
@@ -193,7 +183,7 @@ fn make_store(
                     key.clone(),
                     serde_json::to_string(&json).unwrap_or_default(),
                 );
-                sync_db(&tx, &origin, &db_name, &db);
+                sync_db(&tx, &origin, &db_name, db);
                 // v1 transaction semantics: durable immediately; the parent
                 // transaction completes after each mutating request. Request
                 // success fires BEFORE the transaction complete (spec order).
@@ -269,9 +259,9 @@ fn make_store(
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut arr = boa_engine::object::builtins::JsArray::new(ctx);
+            let arr = boa_engine::object::builtins::JsArray::new(ctx);
             for v in &records {
-                arr.push(json_value(v, ctx), ctx)?;
+                arr.push(json_value(v, ctx), ctx).ok();
             }
             Ok(arr.into())
         })
@@ -303,7 +293,7 @@ fn make_store(
                 && let Some(store) = db.stores.get_mut(&del_store)
             {
                 store.remove(&key);
-                sync_db(&del_tx, &del_origin, &del_db, &db);
+                sync_db(&del_tx, &del_origin, &del_db, db);
             }
             queue_event(make_request(ctx, JsValue::undefined()), "success");
             if let Some(t) = &on_complete {
@@ -482,7 +472,7 @@ fn make_database(
             if let Some(db) = del_dbs.borrow_mut().get_mut(&del_db) {
                 db.stores.remove(&name);
                 db.key_paths.remove(&name);
-                sync_db(&del_del_tx, &del_del_origin, &del_db, &db);
+                sync_db(&del_del_tx, &del_del_origin, &del_db, db);
             }
             Ok(JsValue::undefined())
         })
@@ -593,7 +583,7 @@ pub fn register_indexed_db(
                 let mut dbs = open_dbs.borrow_mut();
                 let db = dbs.entry(name.clone()).or_default();
                 db.version = version;
-                sync_db(&open_tx, &open_origin, &name, &db);
+                sync_db(&open_tx, &open_origin, &name, db);
             }
 
             // Expose the database handle before events fire so
@@ -808,27 +798,24 @@ mod persist_tests {
         // Apply sync messages to the "context bucket".
         let mut bucket: BTreeMap<String, IdbDbState> = BTreeMap::new();
         for msg in rx.try_iter() {
-            match msg {
-                IndexedDbMsg::PutDb {
-                    origin,
+            if let IndexedDbMsg::PutDb {
+                origin,
+                name,
+                version,
+                data,
+            } = msg {
+                assert_eq!(origin, "https://shop.io");
+                let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
+                let stores = serde_json::from_value(parsed["stores"].clone()).unwrap();
+                let key_paths = serde_json::from_value(parsed["key_paths"].clone()).unwrap();
+                bucket.insert(
                     name,
-                    version,
-                    data,
-                } => {
-                    assert_eq!(origin, "https://shop.io");
-                    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-                    let stores = serde_json::from_value(parsed["stores"].clone()).unwrap();
-                    let key_paths = serde_json::from_value(parsed["key_paths"].clone()).unwrap();
-                    bucket.insert(
-                        name,
-                        IdbDbState {
-                            version,
-                            stores,
-                            key_paths,
-                        },
-                    );
-                }
-                _ => {}
+                    IdbDbState {
+                        version,
+                        stores,
+                        key_paths,
+                    },
+                );
             }
         }
         let auth = bucket.get("auth").expect("PutDb must carry the auth db");
