@@ -125,8 +125,8 @@ jobs:
           CHECK_DIR="$RUNNER_TEMP/gk-check"
           mkdir -p "$CHECK_DIR"
           ditto -x -k dist/$BIN.zip "$CHECK_DIR"
-          codesign --verify --strict --verbose=2 "$CHECK_DIR/$BIN"
-          codesign -dv --entitlements - "$CHECK_DIR/$BIN" 2>&1 | \
+          codesign --verify --strict --verbose=2 "$CHECK_DIR/oxibrowser/$BIN"
+          codesign -dv --entitlements - "$CHECK_DIR/oxibrowser/$BIN" 2>&1 | \
             grep -E 'Identifier=|TeamIdentifier=' || true
 
       - name: Checksums
