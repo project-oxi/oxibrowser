@@ -23,6 +23,7 @@ browser = [
     "dep:oxibrowser-cdp",
     "dep:oxibrowser-credentials",
     "dep:oxibrowser-render",
+    "dep:parking_lot",
     "dep:boa_engine",
     "dep:chrono",
     "dep:rpassword",
@@ -60,6 +61,7 @@ oxibrowser-core = { version = "0.25.0", path = "../oxibrowser-core", optional = 
 oxibrowser-cdp = { version = "0.25.0", path = "../oxibrowser-cdp", optional = true }
 oxibrowser-credentials = { version = "0.25.0", path = "../oxibrowser-credentials", optional = true }
 oxibrowser-render = { version = "0.25.0", path = "../oxibrowser-render", optional = true }
+parking_lot = { workspace = true, optional = true }
 boa_engine = { workspace = true, optional = true }
 
 # account/credential CLI support (browser feature)

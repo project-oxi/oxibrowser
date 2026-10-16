@@ -158,3 +158,90 @@ fn repl_fill_credential_fails_closed_without_account() {
     let err = resps[0]["error"].as_str().unwrap();
     assert!(err.contains("BROKER_UNAVAILABLE"), "got {err:?}");
 }
+
+const DIALOG_HTML: &str = r#"<!doctype html>
+<html><body>
+<button id="go">Go</button>
+<span id="out">none</span>
+<script>
+document.getElementById('go').addEventListener('click', function () {
+  alert('hello from the page');
+  document.getElementById('out').textContent = 'after-dialog';
+});
+</script>
+</body></html>"#;
+
+#[test]
+fn repl_dialog_flow_unblocks_action() {
+    let port = serve(DIALOG_HTML.into());
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let resps = run_repl(&[format!(
+        r#"await page.goto('{url}'); try {{ await page.getByRole('button', {{ name: 'Go' }}).click(); }} catch (e) {{}} const d = await page.waitForEvent('dialog', {{ timeoutMs: 8000 }}); const message = d.message; await d.accept(); await page.waitForTimeout(400); return {{ message, yaml: await page.ariaSnapshot() }};"#
+    )]);
+    let data = resps[0].get("data").unwrap();
+    assert_eq!(data["message"], "hello from the page");
+    let yaml = data["yaml"].as_str().unwrap();
+    assert!(
+        yaml.contains("after-dialog"),
+        "post-dialog effect missing: {yaml}"
+    );
+}
+
+#[test]
+fn repl_popup_from_window_open() {
+    let port = serve(r#"<script>window.open('/popped');</script>"#.to_string());
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let resps = run_repl(&[format!(
+        r#"await page.goto('{url}'); return await page.waitForEvent('popup', {{ timeoutMs: 8000 }});"#
+    )]);
+    let data = resps[0].get("data").unwrap();
+    assert_eq!(data["type"], "popup");
+    assert!(data["url"].as_str().unwrap().ends_with("/popped"));
+    assert!(data["id"].as_str().unwrap().starts_with('p'));
+}
+
+#[test]
+fn repl_popup_from_target_blank_click() {
+    let port = serve(r#"<a href="/elsewhere" target="_blank">External</a>"#.to_string());
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let resps = run_repl(&[format!(
+        r#"await page.goto('{url}'); await page.getByRole('link', {{ name: 'External' }}).click(); return await page.waitForEvent('popup', {{ timeoutMs: 8000 }});"#
+    )]);
+    let data = resps[0].get("data").unwrap();
+    assert_eq!(data["type"], "popup");
+    assert!(data["url"].as_str().unwrap().ends_with("/elsewhere"));
+    assert_eq!(data["target"], "_blank");
+}
+
+#[test]
+fn repl_download_event() {
+    // Attachment responses trigger the Download core event from the
+    // navigate path.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let body = b"file-body-123";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=\"notes.txt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.write_all(body);
+        }
+    });
+    let url = format!("http://127.0.0.1:{port}/file");
+
+    let resps = run_repl(&[format!(
+        r#"try {{ await page.goto('{url}'); }} catch (e) {{}} const d = await page.waitForEvent('download', {{ timeoutMs: 8000 }}); return {{ filename: d.filename, saved: d.save_path.length > 0 }};"#
+    )]);
+    let data = resps[0].get("data").unwrap();
+    assert_eq!(data["filename"], "notes.txt");
+    assert_eq!(data["saved"], true);
+}

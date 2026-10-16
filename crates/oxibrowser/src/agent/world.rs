@@ -103,6 +103,16 @@ fn register_natives(ctx: &mut Context, cmd_tx: mpsc::Sender<WorldCmd>) {
 
             let (tx, rx) = std::sync::mpsc::channel();
             let cmd = match kind.as_str() {
+                "waitEvent" => WorldCmd::WaitEvent {
+                    kind: payload["kind"].as_str().unwrap_or("any").to_string(),
+                    timeout_ms: payload["timeout_ms"].as_u64().unwrap_or(20_000),
+                    resp: tx,
+                },
+                "resolveDialog" => WorldCmd::ResolveDialog {
+                    accept: payload["accept"].as_bool().unwrap_or(true),
+                    prompt_text: payload["prompt_text"].as_str().map(str::to_string),
+                    resp: tx,
+                },
                 "goto" => WorldCmd::Goto {
                     url: payload["url"].as_str().unwrap_or_default().to_string(),
                     resp: tx,
@@ -259,6 +269,19 @@ Promise.resolve(globalThis.__replP).then(
 /// The Playwright-shaped surface. Kept in JS: chains, classes, and error
 /// messages live where the model can read them back.
 const PRELUDE: &str = r#"
+
+class Dialog {
+  constructor(d) { Object.assign(this, d); }
+  accept(text) {
+    return __host('resolveDialog', JSON.stringify({
+      accept: true, prompt_text: text != null ? String(text) : null,
+    }));
+  }
+  dismiss() {
+    return __host('resolveDialog', JSON.stringify({ accept: false, prompt_text: null }));
+  }
+  toString() { return this.dialog_type + ': ' + this.message; }
+}
 'use strict';
 class Locator {
   constructor(q) { this.__q = q; }
@@ -284,6 +307,13 @@ globalThis.page = {
   async url() { return (await __host('meta', '{}')).url; },
   async title() { return (await __host('meta', '{}')).title; },
   async waitForTimeout(ms) { return __sleep(Number(ms) || 0); },
+  async waitForEvent(kind, opts) {
+    const ev = await __host('waitEvent', JSON.stringify({
+      kind: String(kind),
+      timeout_ms: (opts && (opts.timeoutMs ?? opts.timeout_ms)) || 20000,
+    }));
+    return (kind === 'dialog' && ev && ev.type === 'dialog') ? new Dialog(ev) : ev;
+  },
   getByRole(role, o) {
     return new Locator({ spec: spec('role', { role: String(role), name: (o && o.name != null) ? String(o.name) : null }), nth: null });
   },

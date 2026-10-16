@@ -63,6 +63,16 @@ pub enum WorldCmd {
     Meta {
         resp: Reply,
     },
+    WaitEvent {
+        kind: String,
+        timeout_ms: u64,
+        resp: Reply,
+    },
+    ResolveDialog {
+        accept: bool,
+        prompt_text: Option<String>,
+        resp: Reply,
+    },
 }
 
 /// Locator action kinds.
@@ -79,6 +89,11 @@ pub struct ReplHost {
     pub surface: Option<Arc<LoginSurface>>,
     pub session: Arc<RwLock<Session>>,
     pub broker: Option<Arc<oxibrowser_credentials::BrokerSource>>,
+    /// Steering queue + popup sessions (M2).
+    pub events: Arc<super::events::EventHub>,
+    /// Pre-cloned dialog gate: resolution never needs the session lock
+    /// (a blocking `alert()` holds the write lock).
+    pub dialog_gate: oxibrowser_core::js::DialogGate,
 }
 
 fn gate_err(e: GateError) -> Value {
@@ -132,6 +147,32 @@ impl ReplHost {
                 } => (self.fill_credential(&query, &account_id).await, resp),
                 WorldCmd::Screenshot { resp } => (self.screenshot().await, resp),
                 WorldCmd::Meta { resp } => (self.meta().await, resp),
+                WorldCmd::WaitEvent {
+                    kind,
+                    timeout_ms,
+                    resp,
+                } => {
+                    let res = self
+                        .events
+                        .wait_for(&kind, timeout_ms)
+                        .await
+                        .ok_or_else(|| {
+                            err(
+                                "WAIT_TIMEOUT",
+                                format!("no '{kind}' event within {timeout_ms}ms"),
+                            )
+                        });
+                    (res, resp)
+                }
+                WorldCmd::ResolveDialog {
+                    accept,
+                    prompt_text,
+                    resp,
+                } => {
+                    super::events::resolve_dialog(&self.dialog_gate, accept, prompt_text);
+                    self.events.clear_dialog_pending();
+                    (Ok(json!({"resolved": true})), resp)
+                }
             };
             let _ = resp.send(result);
         }
@@ -226,10 +267,13 @@ impl ReplHost {
                 let target = observation
                     .target(el.node_id)
                     .ok_or_else(|| err("NOT_ACTIONABLE", "element has no native target"))?;
-                let receipt = guard
-                    .native_act(target, oxibrowser_core::js::runtime::NativeInput::Click)
-                    .await
-                    .map_err(|e| err("ACTION_FAILED", e.to_string()))?;
+                let receipt = Self::native_act_guarded(
+                    &mut guard,
+                    target,
+                    oxibrowser_core::js::runtime::NativeInput::Click,
+                    &self.events,
+                )
+                .await?;
                 Ok(json!({
                     "acted": true, "ref": r#ref, "generation": generation,
                     "callbacks": receipt.callbacks,
@@ -242,13 +286,13 @@ impl ReplHost {
                 let target = observation
                     .target(el.node_id)
                     .ok_or_else(|| err("NOT_ACTIONABLE", "element has no native target"))?;
-                let receipt = guard
-                    .native_act(
-                        target,
-                        oxibrowser_core::js::runtime::NativeInput::Fill(value.clone()),
-                    )
-                    .await
-                    .map_err(|e| err("ACTION_FAILED", e.to_string()))?;
+                let receipt = Self::native_act_guarded(
+                    &mut guard,
+                    target,
+                    oxibrowser_core::js::runtime::NativeInput::Fill(value.clone()),
+                    &self.events,
+                )
+                .await?;
                 Ok(json!({
                     "acted": true, "ref": r#ref, "generation": generation,
                     "callbacks": receipt.callbacks,
@@ -256,6 +300,44 @@ impl ReplHost {
                     "observe_required": true,
                 }))
             }
+        }
+    }
+
+    /// `native_act` with a 3s guard: a listener that parks the JS thread
+    /// on a dialog (`alert`/`confirm`/`prompt`) would otherwise deadlock
+    /// the bridge — the world thread waits on this reply and could never
+    /// reach `waitForEvent('dialog')`. On timeout with a pending dialog we
+    /// return early with `blocked_on_dialog`; the parked command finishes
+    /// in the background once the gate is resolved (its receipt is lost —
+    /// re-observe to see the effect).
+    async fn native_act_guarded(
+        guard: &mut tokio::sync::RwLockWriteGuard<'_, Session>,
+        target: oxibrowser_core::js::runtime::NativeTarget,
+        input: oxibrowser_core::js::runtime::NativeInput,
+        events: &Arc<super::events::EventHub>,
+    ) -> Result<oxibrowser_core::js::runtime::NativeReceipt, HostError> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            guard.native_act(target, input),
+        )
+        .await
+        {
+            Ok(r) => r.map_err(|e| err("ACTION_FAILED", e.to_string())),
+            Err(_) if events.dialog_pending() => {
+                // The write guard drops with this early return, releasing
+                // the session for the dialog-resolution path.
+                Err(json!({
+                    "code": "BLOCKED_ON_DIALOG",
+                    "message": "action parked on a page dialog — waitForEvent('dialog'), \
+                                then accept/dismiss and re-observe",
+                    "blocked_on_dialog": true,
+                }))
+            }
+            Err(_) => Err(err(
+                "ACTION_STUCK",
+                "action did not complete within 3s and no dialog is pending — \
+                 the page may be busy; re-observe and retry",
+            )),
         }
     }
 
@@ -368,6 +450,24 @@ pub async fn run_repl(
             return 1;
         }
     };
+    // Clone the gate BEFORE any action: dialog resolution must never need
+    // the session lock.
+    let dialog_gate = session.read().await.dialog_gate();
+    // Steering events (M2): popup sessions, dialogs, downloads, console.
+    let events = {
+        let mut guard = session.write().await;
+        super::events::EventHub::attach(browser.clone(), context.clone(), &mut guard)
+    };
+    // Downloads land in a per-run temp dir (process-global setting — the
+    // REPL is a dedicated process by design, see the execution doc §1).
+    let download_dir = std::env::temp_dir().join(format!(
+        "oxibrowser-repl-dl-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    ));
+    oxibrowser_core::session::set_download_behavior(Some(download_dir));
 
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let host = ReplHost {
@@ -375,6 +475,8 @@ pub async fn run_repl(
         surface,
         session,
         broker,
+        events,
+        dialog_gate,
     };
     tokio::spawn(host.run(cmd_rx));
     let world = super::world::World::spawn(cmd_tx);
@@ -485,6 +587,30 @@ mod tests {
         Arc::new(oxibrowser_core::Browser::new(config).await.unwrap())
     }
 
+    /// Build a ReplHost with the M2 steering attachments (events hub +
+    /// pre-cloned dialog gate).
+    async fn host_with_events(
+        browser: &Arc<oxibrowser_core::Browser>,
+        context: Arc<oxibrowser_core::context::BrowserContext>,
+        surface: Option<Arc<LoginSurface>>,
+        broker: Option<Arc<BrokerSource>>,
+        session: Arc<RwLock<Session>>,
+    ) -> ReplHost {
+        let dialog_gate = session.read().await.dialog_gate();
+        let events = {
+            let mut guard = session.write().await;
+            crate::agent::events::EventHub::attach(browser.clone(), context.clone(), &mut guard)
+        };
+        ReplHost {
+            context,
+            surface,
+            session,
+            broker,
+            events,
+            dialog_gate,
+        }
+    }
+
     fn password_query() -> LocatorQuery {
         LocatorQuery {
             spec: LocatorSpec::Role {
@@ -497,7 +623,6 @@ mod tests {
 
     const FORM_HTML: &str = r#"<!doctype html>
 <html><head><title>Form</title></head><body>
-<form action="/login">
   <input name="u" aria-label="Username">
   <input type="password" name="p" aria-label="Password">
   <button type="submit">Sign in</button>
@@ -514,12 +639,7 @@ mod tests {
             .unwrap();
         ctx.set_credential_mode(true);
         let session = browser.new_session_in(&ctx).await.unwrap();
-        let host = ReplHost {
-            context: ctx,
-            surface: None,
-            session: session.clone(),
-            broker: None,
-        };
+        let host = host_with_events(&browser, ctx, None, None, session.clone()).await;
         let port = serve(FORM_HTML.into());
         session
             .write()
@@ -557,12 +677,7 @@ mod tests {
         // browsing (same condition as `OXI.fillRef`).
         let plain = browser.default_context();
         let session2 = browser.new_session_in(&plain).await.unwrap();
-        let host2 = ReplHost {
-            context: plain,
-            surface: None,
-            session: session2.clone(),
-            broker: None,
-        };
+        let host2 = host_with_events(&browser, plain, None, None, session2.clone()).await;
         session2
             .write()
             .await
@@ -654,12 +769,8 @@ mod tests {
         ctx.set_credential_mode(true);
         surface.bind_direct("acc", ctx.clone());
         let session = browser.new_session_in(&ctx).await.unwrap();
-        let host = ReplHost {
-            context: ctx,
-            surface: Some(surface),
-            session: session.clone(),
-            broker: Some(broker),
-        };
+        let host =
+            host_with_events(&browser, ctx, Some(surface), Some(broker), session.clone()).await;
         session
             .write()
             .await
