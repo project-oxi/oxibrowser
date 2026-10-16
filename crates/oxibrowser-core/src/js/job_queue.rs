@@ -98,6 +98,25 @@ impl TokioJobQueue {
     pub fn microtask_count(&self) -> usize {
         self.microtasks.borrow().len()
     }
+
+    /// Host automation pump: callbacks cannot extend this queue without bound.
+    pub(crate) fn run_bounded_jobs(
+        &self,
+        context: &mut Context,
+        limit: usize,
+    ) -> Result<usize, ()> {
+        let mut count = 0;
+        loop {
+            if count == limit && !self.microtasks.borrow().is_empty() {
+                return Err(());
+            }
+            let Some(job) = self.microtasks.borrow_mut().pop_front() else {
+                return Ok(count);
+            };
+            count += 1;
+            job.call(context).map_err(|_| ())?;
+        }
+    }
 }
 
 impl Default for TokioJobQueue {

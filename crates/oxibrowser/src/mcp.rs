@@ -14,6 +14,9 @@
 //! Notifications (messages without an `id`) are ignored. Unknown methods
 //! answer with `-32601`; unparseable lines with `-32700`.
 
+mod ghost;
+pub use ghost::run_ghost_stdio;
+
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::io::BufRead;

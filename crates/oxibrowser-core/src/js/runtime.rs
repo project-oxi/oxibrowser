@@ -49,6 +49,10 @@ use oxibrowser_render::{CaptureOpts, RenderDocument, RenderError, Viewport};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+mod native_action;
+pub use native_action::{NativeInput, NativeObservation, NativeReceipt, NativeTarget};
+static NEXT_NATIVE_DOCUMENT: AtomicU64 = AtomicU64::new(1);
+
 /// Global counter for unique node IDs, avoids collisions in tight loops.
 /// Starts at 1_000_000 to stay above any parsed DOM snapshot IDs.
 static NEXT_NODE_ID: AtomicU64 = AtomicU64::new(1_000_000);
@@ -104,6 +108,33 @@ thread_local! {
     #[allow(clippy::type_complexity)]
     static LISTENER_REGISTRY: RefCell<HashMap<(u32, u32), HashMap<String, Vec<JsObject>>>> =
         RefCell::new(HashMap::new());
+}
+
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static NATIVE_LISTENERS: RefCell<HashMap<(u32,u32), (u64, HashMap<String,Vec<JsObject>>)>> = RefCell::new(HashMap::new());
+}
+fn registry_add_native(node: u32, token: u64, event: &str, cb: JsObject) {
+    NATIVE_LISTENERS.with(|r| {
+        let mut r = r.borrow_mut();
+        let entry = r
+            .entry((active_context_id(), node))
+            .or_insert_with(|| (token, HashMap::new()));
+        if entry.0 != token {
+            *entry = (token, HashMap::new());
+        }
+        entry.1.entry(event.into()).or_default().push(cb);
+    });
+}
+fn registry_get_native(node: u32, token: u64, event: &str) -> Vec<JsObject> {
+    NATIVE_LISTENERS.with(|r| {
+        r.borrow()
+            .get(&(active_context_id(), node))
+            .filter(|e| e.0 == token)
+            .and_then(|e| e.1.get(event))
+            .cloned()
+            .unwrap_or_default()
+    })
 }
 
 thread_local! {
@@ -380,6 +411,11 @@ fn registry_get(node_id: u32, event_type: &str) -> Vec<JsObject> {
 /// Remove all callbacks for a node + event type.
 fn registry_remove(node_id: u32, event_type: &str) {
     let key = (active_context_id(), node_id);
+    NATIVE_LISTENERS.with(|r| {
+        if let Some(e) = r.borrow_mut().get_mut(&key) {
+            e.1.remove(event_type);
+        }
+    });
     LISTENER_REGISTRY.with(|r| {
         if let Some(m) = r.borrow_mut().get_mut(&key) {
             m.remove(event_type);
@@ -619,6 +655,15 @@ enum JsCommand {
     },
     /// Drop all child-frame contexts (context_id > 1) on navigation.
     ClearChildContexts { response_tx: Sender<JsResponse> },
+    NativeObserve {
+        url: String,
+        response_tx: Sender<JsResponse>,
+    },
+    NativeAct {
+        target: NativeTarget,
+        input: NativeInput,
+        response_tx: Sender<JsResponse>,
+    },
     /// Shut down the JS thread.
     Shutdown,
 }
@@ -632,16 +677,28 @@ enum JsResponse {
         console_output: Vec<String>,
         timed_out: bool,
     },
+    NativeObservation(Box<NativeObservation>),
+    NativeReceipt(NativeReceipt),
+    NativeFailure {
+        message: String,
+        may_have_acted: bool,
+    },
     /// Ack for SetGlobal / SetDom / Shutdown.
     Done,
     /// PNG bytes returned by a `Capture` command.
-    CaptureResult { png: Vec<u8> },
+    CaptureResult {
+        png: Vec<u8>,
+    },
     /// Serialized DomSnapshot of the current RenderDocument.
     Snapshot(Box<crate::js::dom_snapshot::DomSnapshot>),
     /// Nodes returned by a `Query` command.
-    QueryResult { nodes: Vec<NodeInfo> },
+    QueryResult {
+        nodes: Vec<NodeInfo>,
+    },
     /// Error from a `SetDocument` / `Capture` / `Query` command.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1892,6 +1949,61 @@ impl JsRuntime {
         }
     }
 
+    /// Native main-document observation. Waiting is off the async runtime thread.
+    pub async fn native_observe(&mut self, url: &str) -> Result<NativeObservation> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(JsCommand::NativeObserve {
+                url: url.into(),
+                response_tx,
+            })
+            .map_err(|_| CoreError::SessionClosed)?;
+        match tokio::task::spawn_blocking(move || response_rx.recv())
+            .await
+            .map_err(|_| CoreError::SessionClosed)?
+            .map_err(|_| CoreError::SessionClosed)?
+        {
+            JsResponse::NativeObservation(o) => Ok(*o),
+            JsResponse::NativeFailure {
+                message,
+                may_have_acted,
+            } => Err(CoreError::NativeAction {
+                message,
+                may_have_acted,
+            }),
+            _ => Err(CoreError::SessionClosed),
+        }
+    }
+    pub async fn native_act(
+        &mut self,
+        target: NativeTarget,
+        input: NativeInput,
+    ) -> Result<NativeReceipt> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.cmd_tx
+            .send(JsCommand::NativeAct {
+                target,
+                input,
+                response_tx,
+            })
+            .map_err(|_| CoreError::SessionClosed)?;
+        match tokio::task::spawn_blocking(move || response_rx.recv())
+            .await
+            .map_err(|_| CoreError::SessionClosed)?
+            .map_err(|_| CoreError::SessionClosed)?
+        {
+            JsResponse::NativeReceipt(r) => Ok(r),
+            JsResponse::NativeFailure {
+                message,
+                may_have_acted,
+            } => Err(CoreError::NativeAction {
+                message,
+                may_have_acted,
+            }),
+            _ => Err(CoreError::SessionClosed),
+        }
+    }
+
     // ── Phase 8: per-frame execution contexts ────────────────────────────
 
     /// Evaluate a JS expression in a specific frame's execution context.
@@ -2181,9 +2293,81 @@ fn js_thread_loop(
     // window globals against the right URL. Kept in sync by `SetPageUrl` and
     // `SetDocument`.
     let mut current_page_url = String::new();
+    let mut native_document_id = 0;
 
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
+            JsCommand::NativeObserve { url, response_tx } => {
+                ACTIVE_CONTEXT_ID.with(|id| id.set(1));
+                let limits = ctx.runtime_limits_mut();
+                limits.set_loop_iteration_limit(100_000);
+                limits.set_recursion_limit(100);
+                limits.set_stack_size_limit(1024);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    native_action::pump(&mut ctx, &job_queue)?;
+                    if native_action::pending_navigation(&mutations) {
+                        return Err(native_action::Failure {
+                            message: "stale ref — re-observe",
+                            may_have_acted: false,
+                        });
+                    }
+                    let mut guard = render_doc_cell.borrow_mut();
+                    Ok(match guard.as_mut() {
+                        Some(doc) => native_action::observe(doc, native_document_id, &url),
+                        None => NativeObservation::empty(native_document_id),
+                    })
+                }));
+                let response = match outcome {
+                    Ok(Ok(o)) => JsResponse::NativeObservation(Box::new(o)),
+                    Ok(Err(e)) => JsResponse::NativeFailure {
+                        message: e.message.into(),
+                        may_have_acted: e.may_have_acted,
+                    },
+                    Err(_) => JsResponse::NativeFailure {
+                        message: "NATIVE_RUNTIME_PANIC".into(),
+                        may_have_acted: true,
+                    },
+                };
+                let _ = response_tx.send(response);
+            }
+            JsCommand::NativeAct {
+                target,
+                input,
+                response_tx,
+            } => {
+                ACTIVE_CONTEXT_ID.with(|id| id.set(1));
+                let limits = ctx.runtime_limits_mut();
+                limits.set_loop_iteration_limit(100_000);
+                limits.set_recursion_limit(100);
+                limits.set_stack_size_limit(1024);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    native_action::pump(&mut ctx, &job_queue)?;
+                    let mut r = native_action::act(
+                        &mut ctx,
+                        &render_doc_cell,
+                        &dom_dirty,
+                        &mutations,
+                        native_document_id,
+                        &target,
+                        input,
+                    )?;
+                    native_action::pump(&mut ctx, &job_queue)?;
+                    r.navigation_requested = native_action::pending_navigation(&mutations);
+                    Ok::<_, native_action::Failure>(r)
+                }));
+                let response = match outcome {
+                    Ok(Ok(r)) => JsResponse::NativeReceipt(r),
+                    Ok(Err(e)) => JsResponse::NativeFailure {
+                        message: e.message.into(),
+                        may_have_acted: e.may_have_acted,
+                    },
+                    Err(_) => JsResponse::NativeFailure {
+                        message: "NATIVE_RUNTIME_PANIC".into(),
+                        may_have_acted: true,
+                    },
+                };
+                let _ = response_tx.send(response);
+            }
             JsCommand::Eval {
                 context_id,
                 expression,
@@ -2515,6 +2699,11 @@ fn js_thread_loop(
                 };
                 match RenderDocument::from_html_with_fonts(&html, base_url.as_deref(), vp, &fonts) {
                     Ok(doc) => {
+                        native_document_id = NEXT_NATIVE_DOCUMENT.fetch_add(1, Ordering::Relaxed);
+                        LISTENER_REGISTRY
+                            .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
+                        NATIVE_LISTENERS
+                            .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
                         *render_doc_cell.borrow_mut() = Some(doc);
                         // Shadow roots are per-document; drop stale entries.
                         crate::js::dom_snapshot::clear_shadow_roots();
@@ -6492,6 +6681,7 @@ fn create_render_element_object(
         })
     };
 
+    let rd_listener = render_doc.clone();
     let ael_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, _ctx| {
             let event_type = args
@@ -6500,6 +6690,13 @@ fn create_render_element_object(
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_default();
             if let Some(cb) = args.get(1).and_then(|v| v.as_object().cloned()) {
+                if let Some(token) = rd_listener
+                    .borrow_mut()
+                    .as_mut()
+                    .and_then(|d| d.node_incarnation(node_id))
+                {
+                    registry_add_native(node_id as u32, token, &event_type, cb.clone());
+                }
                 registry_add(node_id as u32, &event_type, cb);
             }
             Ok(JsValue::undefined())

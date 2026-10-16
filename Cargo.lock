@@ -3480,6 +3480,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "libc",
  "oxibrowser-cdp",
  "oxibrowser-core",
  "oxibrowser-credentials",
@@ -3493,6 +3494,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "wiremock",
 ]
 

@@ -1803,6 +1803,14 @@ impl Session {
             .evaluate_with_await(expression, await_promise)
             .await?;
 
+        self.reconcile_native_mutations(true).await?;
+
+        Ok(result)
+    }
+
+    /// Drain effects with the same navigation reconciliation as ordinary evaluation.
+    /// Uncertain failures discard queued navigation; the caller must end the process.
+    async fn reconcile_native_mutations(&mut self, allow_navigation: bool) -> Result<()> {
         // DOM edits are now applied live to the RenderDocument by the JS
         // bindings themselves — no mutation log to drain/apply. Only
         // JS-triggered navigation (location.href / assign / reload) is still
@@ -1817,11 +1825,15 @@ impl Session {
             match m {
                 DomMutation::Navigate { url } => {
                     tracing::debug!(url = %url, "JS-triggered navigation");
-                    self.navigate(&url).await?;
+                    if allow_navigation {
+                        self.navigate(&url).await?;
+                    }
                 }
                 DomMutation::Reload => {
                     tracing::debug!("JS-triggered reload");
-                    self.reload().await?;
+                    if allow_navigation {
+                        self.reload().await?;
+                    }
                 }
                 _ => {} // DOM edits handled directly on the RenderDocument.
             }
@@ -1838,7 +1850,47 @@ impl Session {
             page.bump_generation();
         }
 
-        Ok(result)
+        Ok(())
+    }
+
+    pub async fn native_observe(&mut self) -> Result<crate::js::runtime::NativeObservation> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::SessionClosed);
+        }
+        let url = self
+            .current_url()
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let result = self.js_runtime.native_observe(&url).await;
+        let uncertain = matches!(
+            &result,
+            Err(CoreError::NativeAction {
+                may_have_acted: true,
+                ..
+            })
+        );
+        self.reconcile_native_mutations(!uncertain).await?;
+        result
+    }
+
+    pub async fn native_act(
+        &mut self,
+        target: crate::js::runtime::NativeTarget,
+        input: crate::js::runtime::NativeInput,
+    ) -> Result<crate::js::runtime::NativeReceipt> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::SessionClosed);
+        }
+        let result = self.js_runtime.native_act(target, input).await;
+        let uncertain = matches!(
+            &result,
+            Err(CoreError::NativeAction {
+                may_have_acted: true,
+                ..
+            })
+        );
+        self.reconcile_native_mutations(!uncertain).await?;
+        result
     }
 
     /// Install the CoreEvent sink so console / exception / fetch / WebSocket /

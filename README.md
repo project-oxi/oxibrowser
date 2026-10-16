@@ -144,6 +144,21 @@ exit
 {"ok":true,"data":{"exit":true}}
 ```
 
+### Isolated Ghost session
+
+```bash
+oxibrowser serve --mcp --ghost <identity>
+```
+
+This restricted stdio MCP mode starts with empty in-memory state, exposes
+explicit tabs and snapshot-bound refs, and never opens the account registry
+or a network listener. Optional `--ghost-control-fd` plus `--ghost-task` accepts
+an inherited anonymous local supervisor socketpair for handoff/resume, blocks
+agent operations during human ownership and requires fresh observations after
+resume. Page scripts/network continue; see [the handoff contract](docs/ghost-handoff.md).
+See [the Ghost integration contract](docs/ghost-mcp.md)
+for correlation, cancellation, uncertainty, and the remaining handoff work.
+
 ### Start CDP server (Puppeteer/Playwright)
 
 ```bash

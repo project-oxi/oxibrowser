@@ -41,6 +41,13 @@ pub enum CoreError {
     #[error("JS runtime limit exceeded: {0}")]
     JsRuntimeLimit(String),
 
+    /// Fixed host error, with an explicit side-effect classification.
+    #[error("{message}")]
+    NativeAction {
+        message: String,
+        may_have_acted: bool,
+    },
+
     #[error("page not loaded")]
     PageNotLoaded,
 

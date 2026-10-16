@@ -244,6 +244,15 @@ enum Commands {
         /// annotations; default "main").
         #[arg(long, value_name = "ID")]
         as_agent: Option<String>,
+        /// Restricted, ephemeral MCP session for one Ghost identity.
+        #[arg(long, requires = "mcp", conflicts_with_all = ["cookie_file", "account", "proxy", "auth_token", "as_agent"])]
+        ghost: Option<String>,
+        /// Anonymous Unix socketpair endpoint inherited from a trusted local supervisor.
+        #[arg(long, requires_all = ["ghost", "ghost_task"])]
+        ghost_control_fd: Option<i32>,
+        /// Bind the controlled child to exactly one task. Requires the host channel.
+        #[arg(long, requires = "ghost_control_fd")]
+        ghost_task: Option<String>,
     },
 
     /// Print CLI schema as JSON (for agents).
@@ -341,11 +350,13 @@ async fn main() {
     let cli = Cli::parse();
 
     // Audit log: default path unless `--audit PATH`; `--no-audit` disables.
-    oxibrowser_core::security::audit::init(if cli.no_audit {
-        None
-    } else {
-        Some(cli.audit.clone())
-    });
+    oxibrowser_core::security::audit::init(
+        if cli.no_audit || matches!(&cli.command, Commands::Serve { ghost: Some(_), .. }) {
+            None
+        } else {
+            Some(cli.audit.clone())
+        },
+    );
 
     // Organization-specific redaction headers (global `--redact-header`).
     if !cli.redact_headers.is_empty() {
@@ -478,8 +489,19 @@ async fn main() {
             account,
             ref_tag,
             as_agent,
+            ghost,
+            ghost_control_fd,
+            ghost_task,
         } => {
-            if mcp {
+            if let Some(ghost_id) = ghost {
+                mcp::run_ghost_stdio(
+                    &ghost_id,
+                    allow_private_ips,
+                    ghost_control_fd,
+                    ghost_task.as_deref(),
+                )
+                .await
+            } else if mcp {
                 mcp::run_mcp_stdio(
                     cookie_file.as_deref(),
                     allow_private_ips,

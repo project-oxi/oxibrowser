@@ -25,7 +25,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "commands": ["new","goto","back","forward","reload","click","fill","press","type","select","check","uncheck","scroll","eval","extract","content","screenshot","wait","save-state","load-state","close","list","help","exit"]
             },
             "serve": {
-                "flags": ["host","port","cookie-file","allow-private-ips","proxy","auth-token","mcp","account","ref","as-agent"]
+                "flags": ["host","port","cookie-file","allow-private-ips","proxy","auth-token","mcp","account","ref","as-agent","ghost","ghost-control-fd","ghost-task"]
             },
             "describe": {
                 "args": ["command?"],
@@ -168,7 +168,10 @@ pub fn describe_all(compact: bool) -> CliResponse {
                         "mcp": {"type": "bool", "description": "Serve as a stdio MCP server (JSON-RPC 2.0) instead of CDP; adds account tools (account_list/account_status/login_request) and binds --account contexts for browser tools"},
                         "account": {"type": "string", "description": "Bind account ids (comma list): CDP contexts per account, or the MCP browser tools' primary context"},
                         "ref": {"type": "string", "description": "Correlation tag stamped on audit events"},
-                        "as-agent": {"type": "string", "description": "[mcp] Acting agent identity for the ledger and escalations"}
+                        "as-agent": {"type": "string", "description": "[mcp] Acting agent identity for the ledger and escalations"},
+                        "ghost-control-fd": {"type":"integer", "description":"Requires --ghost and --ghost-task. Inherited anonymous Unix socketpair for trusted local supervisor control; never agent/page input."},
+                        "ghost-task": {"type":"string", "description":"Bind the controlled Ghost child to one task; requires --ghost-control-fd."},
+                        "ghost": {"type": "string", "description": "Requires --mcp; isolated ephemeral Ghost session with restricted ref tools, request correlation and cancellation. Conflicts with account/cookie/proxy/auth-token/as-agent."}
                     }
                 },
                 "describe": {

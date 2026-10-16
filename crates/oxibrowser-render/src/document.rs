@@ -122,6 +122,10 @@ fn html_name(local: &str) -> QualName {
 pub struct RenderDocument {
     doc: BaseDocument,
     viewport: Viewport,
+    tree_revision: u64,
+    next_incarnation: u64,
+    incarnations: std::collections::HashMap<NodeId, u64>,
+    attachments: std::collections::HashMap<NodeId, u64>,
 }
 
 impl RenderDocument {
@@ -162,7 +166,14 @@ impl RenderDocument {
         // Drive Stylo restyle + Taffy relayout once so the tree is paint-ready.
         doc.resolve(0.0);
 
-        Ok(Self { doc, viewport })
+        Ok(Self {
+            doc,
+            viewport,
+            tree_revision: 0,
+            next_incarnation: 1,
+            incarnations: Default::default(),
+            attachments: Default::default(),
+        })
     }
 
     /// Like [`from_html`](Self::from_html), but registers the supplied webfont
@@ -198,7 +209,14 @@ impl RenderDocument {
             effective_color_scheme(),
         ));
         doc.resolve(0.0);
-        Ok(Self { doc, viewport })
+        Ok(Self {
+            doc,
+            viewport,
+            tree_revision: 0,
+            next_incarnation: 1,
+            incarnations: Default::default(),
+            attachments: Default::default(),
+        })
     }
 
     /// Borrow the inner [`BaseDocument`] (read-only).
@@ -213,7 +231,45 @@ impl RenderDocument {
     /// Borrow the inner [`BaseDocument`] mutably. Callers are responsible for
     /// re-running [`BaseDocument::resolve`] after mutation before capturing.
     pub fn document_mut(&mut self) -> &mut BaseDocument {
+        self.tree_revision += 1;
+        self.incarnations.clear();
+        self.attachments.clear();
         &mut self.doc
+    }
+
+    /// Invalidates observed targets on every structural edit, even a detach/reinsert.
+    pub fn tree_revision(&self) -> u64 {
+        self.tree_revision
+    }
+
+    /// Slab node IDs can be reused; an incarnation cannot.
+    pub fn node_incarnation(&mut self, node: NodeId) -> Option<u64> {
+        self.doc.get_node(node)?;
+        if let Some(token) = self.incarnations.get(&node) {
+            return Some(*token);
+        }
+        let token = self.next_incarnation;
+        self.next_incarnation += 1;
+        self.incarnations.insert(node, token);
+        Some(token)
+    }
+
+    pub fn node_attachment_revision(&self, node: NodeId) -> u64 {
+        self.attachments.get(&node).copied().unwrap_or(0)
+    }
+
+    fn mark_attachment_subtree(&mut self, node: NodeId) {
+        let mut pending = vec![node];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(node) = self.doc.get_node(id) {
+                pending.extend_from_slice(&node.children);
+            }
+            self.attachments.insert(id, self.tree_revision);
+        }
     }
 
     // ── Queries ────────────────────────────────────────────────────────────
@@ -299,16 +355,26 @@ impl RenderDocument {
     /// Create a new element node (detached; use [`Self::append_child`] to
     /// attach it).
     pub fn create_element(&mut self, tag: &str) -> NodeId {
-        self.doc.mutate().create_element(html_name(tag), Vec::new())
+        self.tree_revision += 1;
+        let id = self.doc.mutate().create_element(html_name(tag), Vec::new());
+        self.incarnations.remove(&id);
+        self.node_incarnation(id);
+        id
     }
 
     /// Create a new text node (detached).
     pub fn create_text_node(&mut self, text: &str) -> NodeId {
-        self.doc.create_text_node(text)
+        self.tree_revision += 1;
+        let id = self.doc.create_text_node(text);
+        self.incarnations.remove(&id);
+        self.node_incarnation(id);
+        id
     }
 
     /// Append `child` to `parent`'s children.
     pub fn append_child(&mut self, parent: NodeId, child: NodeId) {
+        self.tree_revision += 1;
+        self.mark_attachment_subtree(child);
         self.doc.mutate().append_children(parent, &[child]);
     }
 
@@ -337,14 +403,16 @@ impl RenderDocument {
             .map(|n| n.children.clone())
             .unwrap_or_default();
         for child in children {
-            self.doc.mutate().remove_node(child);
+            self.remove_node(child);
         }
-        let text_id = self.doc.create_text_node(text);
-        self.doc.mutate().append_children(node, &[text_id]);
+        let text_id = self.create_text_node(text);
+        self.append_child(node, text_id);
     }
 
-    /// Detach `node` from its parent (the node itself is dropped).
+    /// Detach `node` from its parent. Blitz preserves the node and listeners.
     pub fn remove_node(&mut self, node: NodeId) {
+        self.tree_revision += 1;
+        self.mark_attachment_subtree(node);
         self.doc.mutate().remove_node(node);
     }
 

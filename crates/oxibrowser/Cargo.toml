@@ -26,6 +26,8 @@ browser = [
     "dep:rpassword",
     "dep:psl",
     "dep:tokio-tungstenite",
+    "dep:uuid",
+    "dep:libc",
 ]
 
 [[bin]]
@@ -45,6 +47,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 url = { workspace = true }
+uuid = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
 base64 = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
@@ -61,6 +65,7 @@ psl = { workspace = true, optional = true }
 tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 
 wiremock = "0.6"
 futures = { workspace = true }

@@ -279,7 +279,10 @@ async fn resolve_and_validate(
     })?;
     let generation = session.page().map(|p| p.generation()).unwrap_or(0);
     let snapshot = session.dom_snapshot().await?.ok_or_else(stale_ref_error)?;
-    if generation != entry.generation || snapshot.fingerprint(entry.node_id) != entry.fingerprint {
+    if generation != entry.generation
+        || snapshot.fingerprint(entry.node_id) != entry.fingerprint
+        || snapshot.query_selector(&entry.selector) != Some(entry.node_id)
+    {
         return Err(stale_ref_error());
     }
     Ok((entry, snapshot))
@@ -439,6 +442,14 @@ async fn click_ref(params: Option<Value>, ctx: &DispatchContext) -> DomainResult
 
     let js = click_js(&entry.selector);
     let result = guard.evaluate_js(&js).await?;
+    if result.timed_out || result.exception.is_some() {
+        return Err(CdpError {
+            code: -32000,
+            message: result
+                .exception
+                .unwrap_or_else(|| "clickRef: JS timed out".to_string()),
+        });
+    }
     if result.value.as_ref().is_none_or(|v| v.is_null()) {
         return Err(CdpError {
             code: -32000,
@@ -486,7 +497,18 @@ async fn fill_ref(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
     }
 
     let js = oxibrowser_core::js::form::js_fill(&entry.selector, &value);
-    guard.evaluate_js(&js).await?;
+    let result = guard.evaluate_js(&js).await?;
+    if result.timed_out || result.exception.is_some() {
+        return Err(CdpError {
+            code: -32000,
+            message: result
+                .exception
+                .unwrap_or_else(|| "fillRef: JS timed out".to_string()),
+        });
+    }
+    if result.value.as_ref().is_none_or(|v| v.is_null()) {
+        return Err(stale_ref_error());
+    }
     Ok(Some(json!({ "filled": true, "ref": r#ref })))
 }
 
