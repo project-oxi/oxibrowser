@@ -1,0 +1,13 @@
+{
+ "name": "dialog-flow",
+ "task": "Handle the dialog.",
+ "max_steps": 4,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/dialog-page'); try { await page.getByRole('button', { name: 'Go' }).click(); } catch (e) { } const d = await page.waitForEvent('dialog', { timeoutMs: 8000 }); const m = d.message; await d.accept(); await page.waitForTimeout(300); return m",
+  "const y = await page.ariaSnapshot(); task.done(y)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "after-dialog"
+ }
+}

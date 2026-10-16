@@ -29,6 +29,12 @@ pub enum AgentCommand {
         #[arg(long, default_value_t = 200_000)]
         budget_tokens: u64,
     },
+    /// Run a deterministic corpus (see corpus/ — JSON cases against the
+    /// built-in fixture server) and print a pass-rate report.
+    Eval {
+        /// Directory of case JSON files.
+        dir: String,
+    },
     /// Resume a saved task run by id: the transcript is replayed and the
     /// loop continues from where it stopped.
     Resume {
@@ -42,6 +48,9 @@ pub enum AgentCommand {
 
 /// Entry point for `oxibrowser agent …`.
 pub async fn run_agent(command: AgentCommand) -> i32 {
+    if let AgentCommand::Eval { dir } = &command {
+        return super::corpus::run_corpus(dir);
+    }
     let (task, account, allow_private_ips, ref_tag, max_steps, budget_tokens, task_id) =
         match command {
             AgentCommand::Run {
@@ -66,6 +75,7 @@ pub async fn run_agent(command: AgentCommand) -> i32 {
                         .unwrap_or(0)
                 ),
             ),
+            AgentCommand::Eval { .. } => unreachable!("handled above"),
             AgentCommand::Resume {
                 task_id,
                 max_steps,

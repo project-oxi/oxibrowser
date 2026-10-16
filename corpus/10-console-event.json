@@ -1,0 +1,12 @@
+{
+ "name": "console-event",
+ "task": "Catch the console message.",
+ "max_steps": 3,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/console-page'); const c = await page.waitForEvent('console', { timeoutMs: 8000 }); task.done(c.text)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "hello-corpus"
+ }
+}

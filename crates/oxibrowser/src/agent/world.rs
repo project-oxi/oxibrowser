@@ -109,6 +109,11 @@ fn register_natives(ctx: &mut Context, cmd_tx: mpsc::Sender<WorldCmd>) {
                     timeout_ms: payload["timeout_ms"].as_u64().unwrap_or(20_000),
                     resp: tx,
                 },
+                "mouseClick" => WorldCmd::MouseClick {
+                    x: payload["x"].as_f64().unwrap_or(0.0),
+                    y: payload["y"].as_f64().unwrap_or(0.0),
+                    resp: tx,
+                },
                 "replay" => WorldCmd::Replay {
                     url: payload["url"].as_str().unwrap_or_default().to_string(),
                     resp: tx,
@@ -334,6 +339,11 @@ globalThis.page = {
   async title() { return (await __host('meta', '{}')).title; },
   async waitForTimeout(ms) { return __sleep(Number(ms) || 0); },
   async login(account) { return __host('login', JSON.stringify({ account: String(account) })); },
+  get mouse() {
+    return {
+      click: (x, y) => __host('mouseClick', JSON.stringify({ x: Number(x), y: Number(y) })),
+    };
+  },
   async replay(o) { return __host('replay', JSON.stringify({ url: o == null ? '' : String((typeof o === 'string') ? o : (o.url || '')) })); },
   async waitForEvent(kind, opts) {
     const ev = await __host('waitEvent', JSON.stringify({

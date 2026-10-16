@@ -8,6 +8,7 @@
 //! land here as they are built.
 
 pub mod cli;
+pub mod corpus;
 pub mod events;
 pub mod gates;
 pub mod locators;

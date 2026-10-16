@@ -1,0 +1,12 @@
+{
+ "name": "popup-blank",
+ "task": "Follow the external link.",
+ "max_steps": 3,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/blank-link'); await page.getByRole('link', { name: 'External' }).click(); const p = await page.waitForEvent('popup', { timeoutMs: 8000 }); task.done(p.url)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "elsewhere"
+ }
+}

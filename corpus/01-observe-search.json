@@ -1,0 +1,12 @@
+{
+ "name": "observe-search",
+ "task": "Read the search page.",
+ "max_steps": 3,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/search'); const o = await page.observe({ budgetTokens: 400 }); task.done(o.aria_yaml)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "Search Fixture"
+ }
+}

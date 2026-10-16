@@ -1,0 +1,13 @@
+{
+ "name": "fill-and-click",
+ "task": "Search for oxi.",
+ "max_steps": 3,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/search'); await page.getByLabel('Query').fill('oxibrowser'); await page.getByRole('button', { name: 'Search' }).click(); await page.waitForTimeout(200); return 1",
+  "const y = await page.ariaSnapshot(); task.done(y)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "matched"
+ }
+}

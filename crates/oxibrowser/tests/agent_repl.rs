@@ -245,3 +245,31 @@ fn repl_download_event() {
     assert_eq!(data["filename"], "notes.txt");
     assert_eq!(data["saved"], true);
 }
+
+#[test]
+fn repl_mouse_click_hits_by_coordinates() {
+    // CUA fallback: a big button at a predictable position; clicking its
+    // center via page.mouse.click drives the same JS-handler path.
+    let html = r#"<!doctype html>
+<html><body style="margin:0">
+<button id="go" style="width:200px;height:80px">Go</button>
+<span id="out">none</span>
+<script>
+document.getElementById('go').addEventListener('click', function () {
+  document.getElementById('out').textContent = 'mouse-clicked';
+});
+</script>
+</body></html>"#
+        .to_string();
+    let port = serve(html);
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let resps = run_repl(&[format!(
+        r#"await page.goto('{url}'); await page.mouse.click(100, 40); await page.waitForTimeout(200); return await page.ariaSnapshot();"#
+    )]);
+    let yaml = resps[0]["data"].as_str().unwrap();
+    assert!(
+        yaml.contains("mouse-clicked"),
+        "mouse click effect missing: {yaml}"
+    );
+}

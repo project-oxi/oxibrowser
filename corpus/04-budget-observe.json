@@ -1,0 +1,12 @@
+{
+ "name": "budget-observe",
+ "task": "Observe under budget.",
+ "max_steps": 3,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/search'); const o = await page.observe({ budgetTokens: 10 }); task.done(o.truncated)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "true"
+ }
+}

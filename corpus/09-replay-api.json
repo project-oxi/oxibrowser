@@ -1,0 +1,13 @@
+{
+ "name": "replay-api",
+ "task": "Replay the API call.",
+ "max_steps": 4,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/api-page'); await page.waitForTimeout(400); return 1",
+  "const r = await page.replay({ url: '/api' }); task.done(r.status)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "200"
+ }
+}

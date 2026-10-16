@@ -82,6 +82,12 @@ pub enum WorldCmd {
         url: String,
         resp: Reply,
     },
+    /// CUA fallback: coordinate click via layout hit-test.
+    MouseClick {
+        x: f64,
+        y: f64,
+        resp: Reply,
+    },
 }
 
 /// Locator action kinds.
@@ -205,6 +211,7 @@ impl ReplHost {
                 }
                 WorldCmd::Login { account_id, resp } => (self.login(&account_id).await, resp),
                 WorldCmd::Replay { url, resp } => (self.replay(&url).await, resp),
+                WorldCmd::MouseClick { x, y, resp } => (self.mouse_click(x, y).await, resp),
             };
             let _ = resp.send(result);
         }
@@ -374,6 +381,52 @@ impl ReplHost {
                  the page may be busy; re-observe and retry",
             )),
         }
+    }
+
+    /// `page.mouse.click(x, y)` — CUA fallback: resolve the element at the
+    /// viewport point via the engine's layout hit-test
+    /// (`document.elementFromPoint`), then deliver a native click. The
+    /// returned node id still goes through the native target validation
+    /// (incarnation/attachment), so a patched `elementFromPoint` cannot
+    /// forge the delivery target — worst case it points at the wrong node,
+    /// the known CUA tradeoff when the DOM path has already failed.
+    async fn mouse_click(&self, x: f64, y: f64) -> Result<Value, HostError> {
+        let mut guard = self.session.write().await;
+        let js = format!(
+            r#"(function () {{
+                var el = document.elementFromPoint({x}, {y});
+                return el && el.__nodeId != null ? el.__nodeId : null;
+            }})()"#
+        );
+        let node = guard
+            .evaluate_js(&js)
+            .await
+            .map_err(|e| err("HIT_TEST_FAILED", e.to_string()))?;
+        let node_id = node.value.and_then(|v| v.as_u64()).ok_or_else(|| {
+            err(
+                "NO_ELEMENT_AT_POINT",
+                format!("no element at ({x}, {y}) — check page.screenshot() coordinates"),
+            )
+        })? as u32;
+        let observation = guard
+            .native_observe()
+            .await
+            .map_err(|e| err("OBSERVE_ERROR", e.to_string()))?;
+        let target = observation
+            .target(node_id)
+            .ok_or_else(|| err("NOT_ACTIONABLE", "hit-test node has no native target"))?;
+        let receipt = Self::native_act_guarded(
+            &mut guard,
+            target,
+            oxibrowser_core::js::runtime::NativeInput::Click,
+            &self.events,
+        )
+        .await?;
+        Ok(json!({
+            "clicked": true, "x": x, "y": y, "node_id": node_id,
+            "callbacks": receipt.callbacks,
+            "observe_required": true,
+        }))
     }
 
     /// `page.replay({ url })` — replay the last captured network request
@@ -674,6 +727,10 @@ impl WorldSetup {
             let mut guard = session.write().await;
             super::events::EventHub::attach(browser.clone(), context.clone(), &mut guard)
         };
+        // Agent-plane logical viewport (execution design M1 §4.4): fixed
+        // for CUA reproducibility; process-global override, so repl/agent
+        // must stay dedicated processes (no serve in the same process).
+        oxibrowser_core::session::set_viewport_override(1440, 900);
         // Downloads land in a per-run temp dir (process-global setting —
         // repl/agent are dedicated processes by design, execution doc §1).
         let download_dir = std::env::temp_dir().join(format!(

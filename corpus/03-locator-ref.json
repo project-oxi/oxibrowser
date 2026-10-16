@@ -1,0 +1,12 @@
+{
+ "name": "locator-ref",
+ "task": "Get a ref.",
+ "max_steps": 3,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/search'); const r = await page.getByRole('button', { name: 'Search' }).ref(); task.done(r.ref)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "e1"
+ }
+}

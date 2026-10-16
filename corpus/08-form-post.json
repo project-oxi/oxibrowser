@@ -1,0 +1,12 @@
+{
+ "name": "form-post",
+ "task": "Submit the form.",
+ "max_steps": 4,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/form'); await page.getByLabel('Username').fill('alice'); await page.getByRole('button', { name: 'Sign in' }).click(); await page.waitForTimeout(400); const y = await page.ariaSnapshot(); task.done(y)"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "submitted-ok"
+ }
+}

@@ -65,6 +65,16 @@ pub struct ObsResult {
 /// Default actionable cap (ghost snapshot parity).
 const DEFAULT_MAX_ACTIONABLE: usize = 64;
 
+/// Bytes per token for the approximation (calibratable from corpus/real
+/// usage via `OXIBROWSER_BYTES_PER_TOKEN`; 4 ≈ English prose).
+fn bytes_per_token() -> u64 {
+    std::env::var("OXIBROWSER_BYTES_PER_TOKEN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4)
+}
+
 /// Observe `tab`: aria YAML + actionable refs, within budget.
 pub async fn observe(tab: &Tab, opts: &ObsOpts) -> Result<ObsResult, String> {
     let mut guard = tab.lock_session().await;
@@ -137,7 +147,7 @@ pub async fn observe_session(
     let mut truncated = false;
     let mut omitted_bytes = 0u64;
     if let Some(budget) = opts.budget_tokens {
-        let byte_cap = budget.saturating_mul(4) as usize;
+        let byte_cap = budget.saturating_mul(bytes_per_token()) as usize;
         if yaml.len() > byte_cap {
             let mut cut = byte_cap.min(yaml.len());
             while cut > 0 && !yaml.is_char_boundary(cut) {
@@ -157,7 +167,7 @@ pub async fn observe_session(
         url,
         title,
         generation,
-        approximate_tokens: yaml.len() as u64 / 4,
+        approximate_tokens: yaml.len() as u64 / bytes_per_token(),
         aria_yaml: yaml,
         truncated,
         omitted_bytes,

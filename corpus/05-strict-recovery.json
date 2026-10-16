@@ -1,0 +1,13 @@
+{
+ "name": "strict-recovery",
+ "task": "Handle ambiguity.",
+ "max_steps": 4,
+ "script": [
+  "await page.goto('http://127.0.0.1:{PORT}/search'); try { await page.getByText('e').click(); } catch (e) { } return 1",
+  "const r = await page.getByRole('button', { name: 'Search' }).ref(); task.done('recovered')"
+ ],
+ "expect": {
+  "ok": true,
+  "result_contains": "recovered"
+ }
+}
