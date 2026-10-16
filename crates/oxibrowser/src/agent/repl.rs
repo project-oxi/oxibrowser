@@ -73,6 +73,10 @@ pub enum WorldCmd {
         prompt_text: Option<String>,
         resp: Reply,
     },
+    Login {
+        account_id: String,
+        resp: Reply,
+    },
 }
 
 /// Locator action kinds.
@@ -85,6 +89,7 @@ pub enum ActKind {
 
 /// Everything the host owns for one REPL run.
 pub struct ReplHost {
+    pub browser: Arc<oxibrowser_core::Browser>,
     pub context: Arc<BrowserContext>,
     pub surface: Option<Arc<LoginSurface>>,
     pub session: Arc<RwLock<Session>>,
@@ -173,6 +178,7 @@ impl ReplHost {
                     self.events.clear_dialog_pending();
                     (Ok(json!({"resolved": true})), resp)
                 }
+                WorldCmd::Login { account_id, resp } => (self.login(&account_id).await, resp),
             };
             let _ = resp.send(result);
         }
@@ -341,6 +347,59 @@ impl ReplHost {
         }
     }
 
+    /// `page.login(account)` — agent-driven login inside the account's
+    /// bound context. The login session shares the context jar, so fresh
+    /// cookies are immediately visible to the live page (no session swap).
+    async fn login(&self, account_id: &str) -> Result<Value, HostError> {
+        let (surface, broker) = match (self.surface.as_ref(), self.broker.as_ref()) {
+            (Some(s), Some(b)) => (s, b),
+            _ => {
+                return Err(err(
+                    "BROKER_UNAVAILABLE",
+                    "page.login requires --account (login surface + broker)",
+                ));
+            }
+        };
+        let ctx = surface.context_for_account(account_id).ok_or_else(|| {
+            err(
+                "ACCOUNT_NOT_BOUND",
+                format!("account {account_id:?} is not bound"),
+            )
+        })?;
+        let orch = surface.orchestrator();
+        let engine = oxibrowser_core::account::AgentLoginEngine::new(
+            orch.shared_manager(),
+            orch.shared_keys(),
+            broker.clone(),
+            "repl",
+        )
+        .with_events(orch.event_sender());
+        let session = self
+            .browser
+            .new_session_in(&ctx)
+            .await
+            .map_err(|e| err("RUNTIME_ERROR", e.to_string()))?;
+        let outcome = {
+            let mut guard = session.write().await;
+            engine.login(account_id, &mut guard).await
+        };
+        // The login session's whole point was the shared jar; close it and
+        // reclaim the slot (envelope capture already happened on success).
+        if let Err(e) = session.write().await.close().await {
+            tracing::warn!(error = %e, "login session close failed");
+        }
+        self.browser.cleanup_closed_sessions();
+        match outcome {
+            Ok(o) => Ok(json!({
+                "account_id": account_id,
+                "state": o.state(),
+                "detail": o.detail(),
+                "retryable": o.retryable(),
+            })),
+            Err(e) => Err(err("LOGIN_FAILED", e.to_string())),
+        }
+    }
+
     /// `oxi.fillCredential(locator, account)` — broker-resolved password,
     /// injected natively; the value never transits the model context.
     async fn fill_credential(
@@ -414,72 +473,19 @@ impl ReplHost {
 // ---------------------------------------------------------------------------
 
 /// Run the REPL: stdin lines are JS program blocks (top-level `await`
-/// allowed), stdout carries one JSON response per line.
 pub async fn run_repl(
     account: Option<&str>,
     allow_private_ips: bool,
     ref_tag: Option<&str>,
 ) -> i32 {
-    let mut config = oxibrowser_core::BrowserConfig::headless();
-    if allow_private_ips {
-        config.enable_ssrf_filter = false;
-        eprintln!("⚠ SSRF filter disabled: private/internal IP ranges accessible.");
-    }
-    let browser = match oxibrowser_core::Browser::new(config).await {
-        Ok(b) => std::sync::Arc::new(b),
-        Err(e) => {
-            eprintln!("browser init failed: {e}");
-            return 1;
-        }
-    };
-
-    let (context, surface, broker) = match account {
-        Some(id) => match setup_account(&browser, id, ref_tag).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{e}");
-                return 1;
-            }
-        },
-        None => (browser.default_context(), None, None),
-    };
-    let session = match browser.new_session_in(&context).await {
+    let setup = match WorldSetup::new(account, allow_private_ips, ref_tag).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("session init failed: {e}");
+            eprintln!("{e}");
             return 1;
         }
     };
-    // Clone the gate BEFORE any action: dialog resolution must never need
-    // the session lock.
-    let dialog_gate = session.read().await.dialog_gate();
-    // Steering events (M2): popup sessions, dialogs, downloads, console.
-    let events = {
-        let mut guard = session.write().await;
-        super::events::EventHub::attach(browser.clone(), context.clone(), &mut guard)
-    };
-    // Downloads land in a per-run temp dir (process-global setting — the
-    // REPL is a dedicated process by design, see the execution doc §1).
-    let download_dir = std::env::temp_dir().join(format!(
-        "oxibrowser-repl-dl-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    ));
-    oxibrowser_core::session::set_download_behavior(Some(download_dir));
-
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let host = ReplHost {
-        context,
-        surface,
-        session,
-        broker,
-        events,
-        dialog_gate,
-    };
-    tokio::spawn(host.run(cmd_rx));
-    let world = super::world::World::spawn(cmd_tx);
+    let world = &setup.world;
 
     // stdin on a dedicated thread → tokio channel (session REPL idiom).
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
@@ -498,7 +504,10 @@ pub async fn run_repl(
         }
     });
 
-    while let Some(line) = line_rx.recv().await {
+    'world_loop: loop {
+        let Some(line) = line_rx.recv().await else {
+            break 'world_loop;
+        };
         let src = line.trim();
         if src.is_empty() || src.starts_with('#') {
             continue;
@@ -509,17 +518,118 @@ pub async fn run_repl(
                 serde_json::to_string(&json!({"ok": true, "data": {"exit": true}, "meta": {}}))
                     .unwrap()
             );
-            break;
+            break 'world_loop;
         }
         let started = std::time::Instant::now();
         let elapsed = || started.elapsed().as_millis() as u64;
         let resp = match world.eval(src) {
-            Ok(v) => json!({"ok": true, "data": v, "meta": {"elapsed_ms": elapsed()}}),
+            Ok((value, done)) => json!({
+                "ok": true, "data": value,
+                "done": done,
+                "meta": {"elapsed_ms": elapsed()},
+            }),
             Err(e) => json!({"ok": false, "error": e, "meta": {"elapsed_ms": elapsed()}}),
         };
         println!("{}", serde_json::to_string(&resp).unwrap());
     }
     0
+}
+
+/// Shared assembly for `repl` and `agent run`: browser, (account-bound)
+/// context, session, steering hub, host task, world thread.
+pub struct WorldSetup {
+    pub world: super::world::World,
+    surface: Option<Arc<LoginSurface>>,
+    context: Arc<BrowserContext>,
+    session: Arc<RwLock<Session>>,
+    browser: Arc<oxibrowser_core::Browser>,
+    pub account_bound: bool,
+}
+
+impl WorldSetup {
+    pub async fn new(
+        account: Option<&str>,
+        allow_private_ips: bool,
+        ref_tag: Option<&str>,
+    ) -> Result<Self, String> {
+        let mut config = oxibrowser_core::BrowserConfig::headless();
+        if allow_private_ips {
+            config.enable_ssrf_filter = false;
+            eprintln!("⚠ SSRF filter disabled: private/internal IP ranges accessible.");
+        }
+        let browser = Arc::new(
+            oxibrowser_core::Browser::new(config)
+                .await
+                .map_err(|e| format!("browser init failed: {e}"))?,
+        );
+
+        let (context, surface, broker) = match account {
+            Some(id) => setup_account(&browser, id, ref_tag).await?,
+            None => (browser.default_context(), None, None),
+        };
+        let session = browser
+            .new_session_in(&context)
+            .await
+            .map_err(|e| format!("session init failed: {e}"))?;
+        // Clone the gate BEFORE any action: dialog resolution must never
+        // need the session lock.
+        let dialog_gate = session.read().await.dialog_gate();
+        let events = {
+            let mut guard = session.write().await;
+            super::events::EventHub::attach(browser.clone(), context.clone(), &mut guard)
+        };
+        // Downloads land in a per-run temp dir (process-global setting —
+        // repl/agent are dedicated processes by design, execution doc §1).
+        let download_dir = std::env::temp_dir().join(format!(
+            "oxibrowser-agent-dl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        oxibrowser_core::session::set_download_behavior(Some(download_dir));
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let host = ReplHost {
+            browser: browser.clone(),
+            context: context.clone(),
+            surface: surface.clone(),
+            session: session.clone(),
+            broker,
+            events,
+            dialog_gate,
+        };
+        tokio::spawn(host.run(cmd_rx));
+        let world = super::world::World::spawn(cmd_tx);
+        Ok(Self {
+            world,
+            surface,
+            context,
+            session,
+            browser,
+            account_bound: account.is_some(),
+        })
+    }
+
+    /// Login surface for consent flows (`agent run`).
+    pub fn host_surface(&self) -> Option<Arc<LoginSurface>> {
+        self.surface.clone()
+    }
+
+    pub fn context_id(&self) -> Option<String> {
+        Some(self.context.id().to_string())
+    }
+
+    /// Best-effort cleanup: close the session (drops the world with it).
+    pub async fn shutdown(mut self) -> Result<(), String> {
+        let _ = &mut self.browser;
+        self.session
+            .write()
+            .await
+            .close()
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Account binding for the REPL: restored-envelope credential-mode context

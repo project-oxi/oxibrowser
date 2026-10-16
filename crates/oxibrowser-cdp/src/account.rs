@@ -213,6 +213,18 @@ impl LoginSurface {
             .find(|(_, ctx)| ctx.id().as_str() == context_id)
             .map(|(account, _)| account.clone())
     }
+
+    /// The context bound to `account_id` (the `bind`/`bind_direct` map).
+    /// `page.login` uses this to run the agent login flow inside the
+    /// already-bound credential-mode context, so fresh cookies land in the
+    /// shared jar the live page also uses.
+    pub fn context_for_account(&self, account_id: &str) -> Option<Arc<BrowserContext>> {
+        self.bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(account_id)
+            .cloned()
+    }
     /// Register the takeover window for an open login (context, deadline,
     /// one-time viewer token).
     fn register_takeover(&self, handle: &LoginHandle, ctx: Arc<BrowserContext>) {

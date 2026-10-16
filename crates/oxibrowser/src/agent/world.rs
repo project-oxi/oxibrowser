@@ -36,7 +36,7 @@ use super::repl::{ActKind, BRIDGE_TIMEOUT, WorldCmd};
 /// One program submission from the CLI loop.
 struct Program {
     src: String,
-    resp: std::sync::mpsc::Sender<Result<Value, String>>,
+    resp: std::sync::mpsc::Sender<Result<(Value, Option<Value>), String>>,
 }
 
 /// Handle to the world thread.
@@ -55,8 +55,9 @@ impl World {
         Self { prog_tx }
     }
 
-    /// Evaluate one program block; returns its JSON value or error text.
-    pub fn eval(&self, src: &str) -> Result<Value, String> {
+    /// Evaluate one program block; returns its JSON value plus the
+    /// `task.done` payload when the program called it.
+    pub fn eval(&self, src: &str) -> Result<(Value, Option<Value>), String> {
         let (tx, rx) = std::sync::mpsc::channel();
         self.prog_tx
             .send(Program {
@@ -106,6 +107,10 @@ fn register_natives(ctx: &mut Context, cmd_tx: mpsc::Sender<WorldCmd>) {
                 "waitEvent" => WorldCmd::WaitEvent {
                     kind: payload["kind"].as_str().unwrap_or("any").to_string(),
                     timeout_ms: payload["timeout_ms"].as_u64().unwrap_or(20_000),
+                    resp: tx,
+                },
+                "login" => WorldCmd::Login {
+                    account_id: payload["account"].as_str().unwrap_or_default().to_string(),
                     resp: tx,
                 },
                 "resolveDialog" => WorldCmd::ResolveDialog {
@@ -207,8 +212,9 @@ fn register_natives(ctx: &mut Context, cmd_tx: mpsc::Sender<WorldCmd>) {
 }
 
 /// Evaluate a program: async-IIFE wrap → settle via promise handlers →
-/// poll the job queue until settled or the 60s guard trips.
-fn eval_program(ctx: &mut Context, src: &str) -> Result<Value, String> {
+/// poll the job queue until the 60s guard trips. Returns the program value
+/// plus `task.done`'s payload when the program called it.
+fn eval_program(ctx: &mut Context, src: &str) -> Result<(Value, Option<Value>), String> {
     use boa_engine::property::Attribute;
 
     let wrapped = format!("(async () => {{\n{src}\n}})()");
@@ -249,9 +255,22 @@ Promise.resolve(globalThis.__replP).then(
             let _ = ctx.eval(Source::from_bytes(
                 "delete globalThis.__replP; delete globalThis.__replSettled;",
             ));
+            let done = ctx
+                .eval(Source::from_bytes(
+                    "(function (v) { delete globalThis.__taskDone; return v; })(globalThis.__taskDone === undefined ? null : globalThis.__taskDone)",
+                ))
+                .ok()
+                .and_then(|v| if v.is_null_or_undefined() { None } else { v.to_json(ctx).ok() });
             return if ok {
-                v.to_json(ctx)
-                    .map_err(|e| format!("result serialization: {e}"))
+                let value = if v.is_undefined() {
+                    // Programs without an explicit `return` settle to
+                    // undefined; boa's to_json panics on it.
+                    Value::Null
+                } else {
+                    v.to_json(ctx)
+                        .map_err(|e| format!("result serialization: {e}"))?
+                };
+                Ok((value, done))
             } else {
                 Err(v
                     .to_string(ctx)
@@ -283,6 +302,9 @@ class Dialog {
   toString() { return this.dialog_type + ': ' + this.message; }
 }
 'use strict';
+globalThis.task = {
+  done: (result) => { globalThis.__taskDone = result === undefined ? null : result; return result; },
+};
 class Locator {
   constructor(q) { this.__q = q; }
   first() { return new Locator(Object.assign({}, this.__q, { nth: 0 })); }
@@ -307,6 +329,7 @@ globalThis.page = {
   async url() { return (await __host('meta', '{}')).url; },
   async title() { return (await __host('meta', '{}')).title; },
   async waitForTimeout(ms) { return __sleep(Number(ms) || 0); },
+  async login(account) { return __host('login', JSON.stringify({ account: String(account) })); },
   async waitForEvent(kind, opts) {
     const ev = await __host('waitEvent', JSON.stringify({
       kind: String(kind),

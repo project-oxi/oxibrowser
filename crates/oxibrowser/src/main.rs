@@ -218,6 +218,15 @@ enum Commands {
         ref_tag: Option<String>,
     },
 
+    /// Run an agent task autonomously (agent plane M3): observe → model →
+    /// REPL program loop with compaction, budgets, and consent prompts.
+    /// Model config via OXIBROWSER_LLM_* env vars (or a scripted
+    /// OXIBROWSER_LLM_SCRIPT=FILE for deterministic runs).
+    Agent {
+        #[command(subcommand)]
+        command: agent::cli::AgentCommand,
+    },
+
     /// Start CDP server for Puppeteer/Playwright.
     ///
     /// With `--mcp`, run as a stdio MCP server (newline-delimited JSON-RPC
@@ -503,6 +512,7 @@ async fn main() {
             account,
             ref_tag,
         } => agent::repl::run_repl(account.as_deref(), allow_private_ips, ref_tag.as_deref()).await,
+        Commands::Agent { command } => agent::cli::run_agent(command).await,
         Commands::Serve {
             host,
             port,
