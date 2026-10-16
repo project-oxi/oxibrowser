@@ -68,13 +68,22 @@ const DEFAULT_MAX_ACTIONABLE: usize = 64;
 /// Observe `tab`: aria YAML + actionable refs, within budget.
 pub async fn observe(tab: &Tab, opts: &ObsOpts) -> Result<ObsResult, String> {
     let mut guard = tab.lock_session().await;
-    let session_key = guard.id().to_string();
-    let generation = guard.page().map(|p| p.generation()).unwrap_or(0);
-    let url = guard
+    observe_session(&mut guard, opts).await
+}
+
+/// Session-level observation — the REPL host owns `Arc<RwLock<Session>>`
+/// sessions (not `Tab` handles), so the core logic lives on `&mut Session`.
+pub async fn observe_session(
+    session: &mut oxibrowser_core::session::Session,
+    opts: &ObsOpts,
+) -> Result<ObsResult, String> {
+    let session_key = session.id().to_string();
+    let generation = session.page().map(|p| p.generation()).unwrap_or(0);
+    let url = session
         .current_url()
         .map(|u| u.to_string())
         .unwrap_or_default();
-    let snapshot = guard.dom_snapshot().await.map_err(|e| e.to_string())?;
+    let snapshot = session.dom_snapshot().await.map_err(|e| e.to_string())?;
 
     let Some(s) = snapshot else {
         return Ok(ObsResult {

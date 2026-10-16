@@ -80,7 +80,7 @@ impl AccountRuntime {
         self.primary_context = Some(ctx);
     }
 
-    fn orch(&mut self) -> Result<Arc<LoginOrchestrator>, String> {
+    pub fn orch(&mut self) -> Result<Arc<LoginOrchestrator>, String> {
         if let Some(orch) = &self.orch {
             return Ok(orch.clone());
         }
@@ -104,7 +104,7 @@ impl AccountRuntime {
     /// Credential plane for unattended logins (M-D): keychain provider +
     /// deny-first policy engine over `~/.oxibrowser/consents.jsonl`, auditing
     /// to the default audit path.
-    fn agent_source(&self) -> Result<Arc<oxibrowser_credentials::BrokerSource>, String> {
+    pub fn agent_source(&self) -> Result<Arc<oxibrowser_credentials::BrokerSource>, String> {
         let provider: Arc<dyn oxibrowser_credentials::CredentialProvider> =
             Arc::new(crate::account_cli::provider());
         let consents = oxibrowser_credentials::ConsentStore::open_default()

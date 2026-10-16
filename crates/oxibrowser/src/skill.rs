@@ -12,7 +12,13 @@ pub fn skill_text() -> &'static str {
 1. **One-shot**: `oxibrowser fetch <url> [flags]` or `oxibrowser extract <url> [flags]`
 2. **Automation**: `oxibrowser run <script.yaml>`
 3. **Interactive**: `oxibrowser session --json` (stdin commands, stdout JSON)
-4. **Server**: `oxibrowser serve` (CDP for Puppeteer/Playwright) or `oxibrowser serve --mcp` (stdio MCP tools: navigate/observe/click/fill/eval/read/wait/screenshot)
+4. **REPL (agents)**: `oxibrowser repl` — Playwright-style JS programs (top-level
+   `await`): `await page.getByRole('button', {name:'Go'}).click()`,
+   `await page.ariaSnapshot()`, `await page.observe({budgetTokens: N})`,
+   `await oxi.fillCredential(locator, 'account')` (needs `--account`). One
+   stdin line = one program; one JSON response per line. Script effects are
+   visible through `page.ariaSnapshot()`/`page.observe()`, not `page.content()`.
+5. **Server**: `oxibrowser serve` (CDP for Puppeteer/Playwright) or `oxibrowser serve --mcp` (stdio MCP tools: navigate/observe/click/fill/eval/read/wait/screenshot)
 
 ## Invariant Rules
 
@@ -21,7 +27,7 @@ pub fn skill_text() -> &'static str {
 - Use `--summary` first to check if a page is relevant before full read
 - Use `--fields url,title,status` to skip large content fields
 - Use `session` for multi-step interactions (click → read → click → read)
-- Use `run` for complex multi-step automation (YAML scripts)
+- Use `repl` for locator-driven flows and coded interaction (Playwright API)
 - NEVER trust eval with untrusted input — use `extract` instead
 
 ## One-shot Patterns

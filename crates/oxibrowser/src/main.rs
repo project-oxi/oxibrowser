@@ -200,6 +200,24 @@ enum Commands {
         ref_tag: Option<String>,
     },
 
+    /// Interactive JS REPL with a Playwright-shaped API (agent plane M1):
+    /// `page.getByRole(...).click()`, token-budgeted `page.observe()`,
+    /// `oxi.fillCredential`. One stdin line = one program (top-level
+    /// `await` allowed); one JSON response per line.
+    Repl {
+        /// Allow navigation to private/internal IP ranges (disables SSRF filter).
+        /// Use for local development only.
+        #[arg(long)]
+        allow_private_ips: bool,
+        /// Bind an account: context gets its stored envelope restored
+        /// (credential mode on) and `oxi.fillCredential` becomes available.
+        #[arg(long, value_name = "ID")]
+        account: Option<String>,
+        /// Correlation tag stamped on audit events.
+        #[arg(long = "ref", value_name = "TAG")]
+        ref_tag: Option<String>,
+    },
+
     /// Start CDP server for Puppeteer/Playwright.
     ///
     /// With `--mcp`, run as a stdio MCP server (newline-delimited JSON-RPC
@@ -479,6 +497,12 @@ async fn main() {
             )
             .await
         }
+
+        Commands::Repl {
+            allow_private_ips,
+            account,
+            ref_tag,
+        } => agent::repl::run_repl(account.as_deref(), allow_private_ips, ref_tag.as_deref()).await,
         Commands::Serve {
             host,
             port,

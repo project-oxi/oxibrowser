@@ -1,0 +1,699 @@
+//! REPL host — the async side of the agent world (execution design M1).
+//!
+//! Owns the browser, the (possibly account-bound, credential-mode) context,
+//! the session, and the enforcement pieces (`gates`). The world thread
+//! (boa, `world.rs`) sends [`WorldCmd`]s over a tokio mpsc and blocks on a
+//! std oneshot reply; the host never touches boa and the world never holds
+//! a session lock — the deadlock boundary of the design.
+//!
+//! Actions resolve locators against the **native observation**
+//! (`Session::native_observe`) and deliver via `Session::native_act` — the
+//! eval-free path ghost built — after the gates run on snapshot-derived
+//! descriptors.
+
+use std::sync::Arc;
+use std::sync::mpsc as std_mpsc;
+
+use oxibrowser_cdp::account::LoginSurface;
+use oxibrowser_cdp::refs::RefRegistry;
+use oxibrowser_core::account::agent_login::CredentialSource;
+use oxibrowser_core::context::BrowserContext;
+use oxibrowser_core::session::Session;
+use serde_json::{Value, json};
+use tokio::sync::{RwLock, mpsc};
+
+use super::gates::{self, GateError};
+use super::locators::{self, LocatorQuery};
+use super::obs::{self, ObsOpts};
+
+/// Host-side reply channel (the world blocks on it with a timeout).
+pub type Reply = std_mpsc::Sender<Result<Value, Value>>;
+/// Host-side error: `{code, message}` JSON.
+pub type HostError = Value;
+
+/// How long the world waits for one host command before failing.
+pub const BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What the world asks the host to do.
+pub enum WorldCmd {
+    Goto {
+        url: String,
+        resp: Reply,
+    },
+    Content {
+        resp: Reply,
+    },
+    Observe {
+        budget_tokens: Option<u64>,
+        resp: Reply,
+    },
+    Act {
+        query: LocatorQuery,
+        action: ActKind,
+        resp: Reply,
+    },
+    FillCredential {
+        query: LocatorQuery,
+        account_id: String,
+        resp: Reply,
+    },
+    Screenshot {
+        resp: Reply,
+    },
+    Meta {
+        resp: Reply,
+    },
+}
+
+/// Locator action kinds.
+pub enum ActKind {
+    Click,
+    Fill(String),
+    /// Resolve + mint a ref, act on nothing.
+    RefOnly,
+}
+
+/// Everything the host owns for one REPL run.
+pub struct ReplHost {
+    pub context: Arc<BrowserContext>,
+    pub surface: Option<Arc<LoginSurface>>,
+    pub session: Arc<RwLock<Session>>,
+    pub broker: Option<Arc<oxibrowser_credentials::BrokerSource>>,
+}
+
+fn gate_err(e: GateError) -> Value {
+    serde_json::to_value(e).unwrap_or_else(|_| json!({"code":"GATE_ERROR","message":"gate"}))
+}
+
+fn loc_err(e: locators::LocError) -> Value {
+    serde_json::to_value(e).unwrap_or_else(|_| json!({"code":"LOCATOR_ERROR","message":"locator"}))
+}
+
+fn err(code: &str, message: impl Into<String>) -> Value {
+    json!({"code": code, "message": message.into()})
+}
+
+impl ReplHost {
+    /// Serve world commands until the channel closes.
+    pub async fn run(self, mut rx: mpsc::Receiver<WorldCmd>) {
+        while let Some(cmd) = rx.recv().await {
+            let (result, resp) = match cmd {
+                WorldCmd::Goto { url, resp } => (self.goto(&url).await, resp),
+                WorldCmd::Content { resp } => (self.content().await, resp),
+                WorldCmd::Observe {
+                    budget_tokens,
+                    resp,
+                } => {
+                    let mut guard = self.session.write().await;
+                    let res = obs::observe_session(
+                        &mut guard,
+                        &ObsOpts {
+                            budget_tokens,
+                            max_actionable: None,
+                        },
+                    )
+                    .await
+                    .map_err(|e| err("OBSERVE_ERROR", e))
+                    .and_then(|r| {
+                        serde_json::to_value(r).map_err(|e| err("SERIALIZE_ERROR", e.to_string()))
+                    });
+                    drop(guard);
+                    (res, resp)
+                }
+                WorldCmd::Act {
+                    query,
+                    action,
+                    resp,
+                } => (self.act(&query, &action).await, resp),
+                WorldCmd::FillCredential {
+                    query,
+                    account_id,
+                    resp,
+                } => (self.fill_credential(&query, &account_id).await, resp),
+                WorldCmd::Screenshot { resp } => (self.screenshot().await, resp),
+                WorldCmd::Meta { resp } => (self.meta().await, resp),
+            };
+            let _ = resp.send(result);
+        }
+    }
+
+    async fn goto(&self, url: &str) -> Result<Value, HostError> {
+        let mut guard = self.session.write().await;
+        guard
+            .navigate(url)
+            .await
+            .map_err(|e| err("NAVIGATION_ERROR", e.to_string()))?;
+        Ok(json!({
+            "url": guard.current_url().map(|u| u.to_string()).unwrap_or_default(),
+            "title": guard.page().map(|p| p.title().unwrap_or_default()).unwrap_or_default(),
+        }))
+    }
+
+    async fn content(&self) -> Result<Value, HostError> {
+        let session = self.session.read().await;
+        let page = session
+            .page()
+            .ok_or_else(|| err("NO_PAGE", "no page loaded — page.goto() first"))?;
+        Ok(json!({
+            "url": session.current_url().map(|u| u.to_string()).unwrap_or_default(),
+            "title": page.title().unwrap_or_default(),
+            "markdown": page.to_markdown(),
+        }))
+    }
+
+    async fn meta(&self) -> Result<Value, HostError> {
+        let guard = self.session.read().await;
+        Ok(json!({
+            "url": guard.current_url().map(|u| u.to_string()).unwrap_or_default(),
+            "title": guard.page().map(|p| p.title().unwrap_or_default()).unwrap_or_default(),
+        }))
+    }
+
+    async fn screenshot(&self) -> Result<Value, HostError> {
+        let mut guard = self.session.write().await;
+        let png = guard
+            .capture_screenshot_png(1280)
+            .await
+            .map_err(|e| err("SCREENSHOT_ERROR", e.to_string()))?;
+        let path = std::env::temp_dir().join(format!(
+            "oxibrowser-repl-{}.png",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, &png).map_err(|e| err("IO_ERROR", e.to_string()))?;
+        Ok(json!({"path": path.to_string_lossy(), "bytes": png.len()}))
+    }
+
+    async fn act(&self, query: &LocatorQuery, action: &ActKind) -> Result<Value, HostError> {
+        let mut guard = self.session.write().await;
+        let observation = guard
+            .native_observe()
+            .await
+            .map_err(|e| err("OBSERVE_ERROR", e.to_string()))?;
+        let el = locators::resolve(&observation.snapshot, query).map_err(loc_err)?;
+        let generation = guard.page().map(|p| p.generation()).unwrap_or(0);
+        let session_key = guard.id().to_string();
+
+        // Mint the ref first (every path reports it; one observation → one
+        // stable namespace, same recipe as the observe command).
+        let r#ref = RefRegistry::allocate(
+            &session_key,
+            el.node_id,
+            generation,
+            observation.snapshot.fingerprint(el.node_id),
+            el.selector.clone(),
+        );
+
+        match action {
+            ActKind::RefOnly => {
+                return Ok(json!({"ref": r#ref, "generation": generation}));
+            }
+            ActKind::Click => {
+                let url = guard
+                    .current_url()
+                    .map(|u| u.to_string())
+                    .unwrap_or_default();
+                gates::check_click(
+                    &self.context,
+                    self.surface.as_deref(),
+                    &url,
+                    &observation.snapshot,
+                    &el,
+                )
+                .map_err(gate_err)?;
+                let target = observation
+                    .target(el.node_id)
+                    .ok_or_else(|| err("NOT_ACTIONABLE", "element has no native target"))?;
+                let receipt = guard
+                    .native_act(target, oxibrowser_core::js::runtime::NativeInput::Click)
+                    .await
+                    .map_err(|e| err("ACTION_FAILED", e.to_string()))?;
+                Ok(json!({
+                    "acted": true, "ref": r#ref, "generation": generation,
+                    "callbacks": receipt.callbacks,
+                    "navigation_requested": receipt.navigation_requested,
+                    "observe_required": true,
+                }))
+            }
+            ActKind::Fill(value) => {
+                gates::check_fill(&self.context, &el).map_err(gate_err)?;
+                let target = observation
+                    .target(el.node_id)
+                    .ok_or_else(|| err("NOT_ACTIONABLE", "element has no native target"))?;
+                let receipt = guard
+                    .native_act(
+                        target,
+                        oxibrowser_core::js::runtime::NativeInput::Fill(value.clone()),
+                    )
+                    .await
+                    .map_err(|e| err("ACTION_FAILED", e.to_string()))?;
+                Ok(json!({
+                    "acted": true, "ref": r#ref, "generation": generation,
+                    "callbacks": receipt.callbacks,
+                    "navigation_requested": receipt.navigation_requested,
+                    "observe_required": true,
+                }))
+            }
+        }
+    }
+
+    /// `oxi.fillCredential(locator, account)` — broker-resolved password,
+    /// injected natively; the value never transits the model context.
+    async fn fill_credential(
+        &self,
+        query: &LocatorQuery,
+        account_id: &str,
+    ) -> Result<Value, HostError> {
+        let broker = self
+            .broker
+            .as_ref()
+            .ok_or_else(|| err("BROKER_UNAVAILABLE", "fillCredential requires --account"))?;
+        let (surface, record) = match self.surface.as_ref() {
+            Some(s) => match s.orchestrator().shared_manager().registry().get(account_id) {
+                Ok(r) => (s, r),
+                Err(e) => return Err(err("ACCOUNT_NOT_FOUND", e.to_string())),
+            },
+            None => return Err(err("BROKER_UNAVAILABLE", "no login surface")),
+        };
+
+        let mut guard = self.session.write().await;
+        let origin = guard
+            .current_url()
+            .map(|u| oxibrowser_core::network::origin_policy::Origin::parse(u.as_str()))
+            .transpose()
+            .map_err(|e| err("NO_PAGE", format!("page origin unusable: {e}")))?
+            .ok_or_else(|| err("NO_PAGE", "fillCredential needs a page with an origin"))?;
+        let resolved = broker
+            .resolve_login(&record.credentials, &record.scope, &origin)
+            .map_err(|e| err("CONSENT_REQUIRED", format!("{e:?}")))?;
+        let observation = guard
+            .native_observe()
+            .await
+            .map_err(|e| err("OBSERVE_ERROR", e.to_string()))?;
+        let el = locators::resolve(&observation.snapshot, query).map_err(loc_err)?;
+        if !el
+            .input_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("password"))
+        {
+            return Err(err(
+                "NOT_A_PASSWORD_FIELD",
+                "fillCredential targets password fields only",
+            ));
+        }
+        let target = observation
+            .target(el.node_id)
+            .ok_or_else(|| err("NOT_ACTIONABLE", "element has no native target"))?;
+        let receipt = guard
+            .native_act(
+                target,
+                oxibrowser_core::js::runtime::NativeInput::FillCredential(
+                    resolved.password.to_string(),
+                ),
+            )
+            .await
+            .map_err(|e| err("ACTION_FAILED", e.to_string()))?;
+        let _ = surface; // audit flows through the broker
+        Ok(json!({
+            "acted": true,
+            "handle": resolved.handle,
+            "fingerprint": resolved.fingerprint,
+            "username_hint": resolved.username,
+            "callbacks": receipt.callbacks,
+            "observe_required": true,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CLI entry — `oxibrowser repl`
+// ---------------------------------------------------------------------------
+
+/// Run the REPL: stdin lines are JS program blocks (top-level `await`
+/// allowed), stdout carries one JSON response per line.
+pub async fn run_repl(
+    account: Option<&str>,
+    allow_private_ips: bool,
+    ref_tag: Option<&str>,
+) -> i32 {
+    let mut config = oxibrowser_core::BrowserConfig::headless();
+    if allow_private_ips {
+        config.enable_ssrf_filter = false;
+        eprintln!("⚠ SSRF filter disabled: private/internal IP ranges accessible.");
+    }
+    let browser = match oxibrowser_core::Browser::new(config).await {
+        Ok(b) => std::sync::Arc::new(b),
+        Err(e) => {
+            eprintln!("browser init failed: {e}");
+            return 1;
+        }
+    };
+
+    let (context, surface, broker) = match account {
+        Some(id) => match setup_account(&browser, id, ref_tag).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        },
+        None => (browser.default_context(), None, None),
+    };
+    let session = match browser.new_session_in(&context).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("session init failed: {e}");
+            return 1;
+        }
+    };
+
+    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let host = ReplHost {
+        context,
+        surface,
+        session,
+        broker,
+    };
+    tokio::spawn(host.run(cmd_rx));
+    let world = super::world::World::spawn(cmd_tx);
+
+    // stdin on a dedicated thread → tokio channel (session REPL idiom).
+    let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) => {
+                    if line_tx.send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    while let Some(line) = line_rx.recv().await {
+        let src = line.trim();
+        if src.is_empty() || src.starts_with('#') {
+            continue;
+        }
+        if src == "exit" || src == "quit" {
+            println!(
+                "{}",
+                serde_json::to_string(&json!({"ok": true, "data": {"exit": true}, "meta": {}}))
+                    .unwrap()
+            );
+            break;
+        }
+        let started = std::time::Instant::now();
+        let elapsed = || started.elapsed().as_millis() as u64;
+        let resp = match world.eval(src) {
+            Ok(v) => json!({"ok": true, "data": v, "meta": {"elapsed_ms": elapsed()}}),
+            Err(e) => json!({"ok": false, "error": e, "meta": {"elapsed_ms": elapsed()}}),
+        };
+        println!("{}", serde_json::to_string(&resp).unwrap());
+    }
+    0
+}
+
+/// Account binding for the REPL: restored-envelope credential-mode context
+/// + `bind_direct` (the local user launched this process, so
+/// pattern-matched irreversible actions are allowed — same semantics as
+/// `session/serve --account`) + the broker for `oxi.fillCredential`.
+async fn setup_account(
+    browser: &std::sync::Arc<oxibrowser_core::Browser>,
+    id: &str,
+    ref_tag: Option<&str>,
+) -> Result<
+    (
+        std::sync::Arc<oxibrowser_core::context::BrowserContext>,
+        Option<std::sync::Arc<LoginSurface>>,
+        Option<std::sync::Arc<oxibrowser_credentials::BrokerSource>>,
+    ),
+    String,
+> {
+    let ctx = crate::account_cli::bind_account_context(browser, id, ref_tag).await?;
+    let mut runtime = crate::session::executor::AccountRuntime::new(browser.clone());
+    let orch = runtime.orch()?;
+    let surface = LoginSurface::new(orch, browser.clone());
+    surface.bind_direct(id, ctx.clone());
+    let broker = runtime.agent_source()?;
+    Ok((ctx, Some(surface), Some(broker)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::locators::{LocatorQuery, LocatorSpec};
+    use oxibrowser_cdp::account::LoginSurface;
+    use oxibrowser_core::account::{AccountManager, AccountRecord, LoginOrchestrator};
+    use oxibrowser_core::security::audit::AuditLog;
+    use oxibrowser_core::storage::session_store::StaticKeyProvider;
+    use oxibrowser_credentials::{
+        BrokerSource, ConsentRecord, ConsentStore, ConsentSubject, CredentialKind,
+        CredentialProvider, InMemoryProvider, NewCredential, PolicyEngine, SecretBox,
+    };
+    use std::io::Write as _;
+
+    /// Loopback fixture serving `html` for every request.
+    fn serve(html: String) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    async fn test_browser() -> Arc<oxibrowser_core::Browser> {
+        let mut config = oxibrowser_core::BrowserConfig::headless();
+        config.enable_ssrf_filter = false;
+        Arc::new(oxibrowser_core::Browser::new(config).await.unwrap())
+    }
+
+    fn password_query() -> LocatorQuery {
+        LocatorQuery {
+            spec: LocatorSpec::Role {
+                role: "textbox".into(),
+                name: Some("Password".into()),
+            },
+            nth: None,
+        }
+    }
+
+    const FORM_HTML: &str = r#"<!doctype html>
+<html><head><title>Form</title></head><body>
+<form action="/login">
+  <input name="u" aria-label="Username">
+  <input type="password" name="p" aria-label="Password">
+  <button type="submit">Sign in</button>
+</form></body></html>"#;
+
+    #[tokio::test]
+    async fn password_literal_fill_denied_in_credential_mode() {
+        let browser = test_browser().await;
+        let ctx = browser
+            .new_context(oxibrowser_core::ContextConfig {
+                label: None,
+                proxy: None,
+            })
+            .unwrap();
+        ctx.set_credential_mode(true);
+        let session = browser.new_session_in(&ctx).await.unwrap();
+        let host = ReplHost {
+            context: ctx,
+            surface: None,
+            session: session.clone(),
+            broker: None,
+        };
+        let port = serve(FORM_HTML.into());
+        session
+            .write()
+            .await
+            .navigate(&format!("http://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+
+        let denied = host
+            .act(&password_query(), &ActKind::Fill("hunter2".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(denied["code"], "POLICY_DENIED");
+        assert!(
+            denied["message"]
+                .as_str()
+                .unwrap()
+                .contains("passwordFillRequiresCredential"),
+            "got {denied}"
+        );
+
+        // Non-password fields still fill in credential mode.
+        let username = LocatorQuery {
+            spec: LocatorSpec::Role {
+                role: "textbox".into(),
+                name: Some("Username".into()),
+            },
+            nth: None,
+        };
+        host.act(&username, &ActKind::Fill("alice".into()))
+            .await
+            .expect("username literal fill is allowed");
+
+        // And without credential mode, password literal fills are ordinary
+        // browsing (same condition as `OXI.fillRef`).
+        let plain = browser.default_context();
+        let session2 = browser.new_session_in(&plain).await.unwrap();
+        let host2 = ReplHost {
+            context: plain,
+            surface: None,
+            session: session2.clone(),
+            broker: None,
+        };
+        session2
+            .write()
+            .await
+            .navigate(&format!("http://127.0.0.1:{port}/plain"))
+            .await
+            .unwrap();
+        let denied2 = host2
+            .act(&password_query(), &ActKind::Fill("hunter2".into()))
+            .await
+            .expect_err("literal password fill is denied at the native layer too");
+        // Defense in depth: the REPL gate fires first in credential mode;
+        // the native layer denies literal password fills everywhere, so
+        // only broker-authorized FillCredential ever writes one.
+        assert_eq!(denied2["code"], "ACTION_FAILED");
+        assert!(
+            denied2["message"]
+                .as_str()
+                .unwrap()
+                .contains("NATIVE_CONTROL_DENIED")
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_credential_resolves_broker_and_fills_natively() {
+        let browser = test_browser().await;
+        let dir = std::env::temp_dir().join(format!(
+            "oxi-repl-fillcred-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let audit = Arc::new(AuditLog::open(dir.join("audit.jsonl")).unwrap());
+        let registry =
+            oxibrowser_core::account::AccountRegistry::open(dir.join("accounts")).unwrap();
+        registry
+            .add(AccountRecord::new("acc", "127.0.0.1").unwrap())
+            .unwrap();
+        let manager = Arc::new(AccountManager::with_audit(registry, audit));
+        let orch = Arc::new(LoginOrchestrator::new(
+            manager,
+            browser.clone(),
+            Arc::new(StaticKeyProvider::new([7u8; 32])),
+        ));
+        let surface = LoginSurface::new(orch, browser.clone());
+
+        let port = serve(FORM_HTML.into());
+        let origin = format!("http://127.0.0.1:{port}");
+        let provider = InMemoryProvider::new();
+        let cred_id = provider
+            .put(NewCredential {
+                agent_id: "main".into(),
+                scope: "127.0.0.1".into(),
+                kind: CredentialKind::Password,
+                slug: "pw".into(),
+                allowed_origins: vec![origin.clone()],
+                login_hint: Some("alice".into()),
+                password: Some(SecretBox::from_string("s3cret-value".into())),
+                otpauth_uri: None,
+            })
+            .unwrap();
+        let consents = ConsentStore::open(dir.join("consents.jsonl")).unwrap();
+        consents
+            .grant(ConsentRecord::new(
+                ConsentSubject::Credential {
+                    credential: cred_id,
+                },
+                &origin,
+                &["login"],
+                chrono::Duration::minutes(10),
+                3,
+            ))
+            .unwrap();
+        let engine = Arc::new(PolicyEngine::new(
+            Vec::new(),
+            consents,
+            Arc::new(AuditLog::open(dir.join("policy.jsonl")).unwrap()),
+        ));
+        let broker = Arc::new(BrokerSource::new(Arc::new(provider), engine));
+
+        let ctx = browser
+            .new_context(oxibrowser_core::ContextConfig {
+                label: Some("account:acc".into()),
+                proxy: None,
+            })
+            .unwrap();
+        ctx.set_credential_mode(true);
+        surface.bind_direct("acc", ctx.clone());
+        let session = browser.new_session_in(&ctx).await.unwrap();
+        let host = ReplHost {
+            context: ctx,
+            surface: Some(surface),
+            session: session.clone(),
+            broker: Some(broker),
+        };
+        session
+            .write()
+            .await
+            .navigate(&format!("{origin}/"))
+            .await
+            .unwrap();
+
+        let out = host
+            .fill_credential(&password_query(), "acc")
+            .await
+            .expect("fillCredential resolves the broker");
+        assert_eq!(out["acted"], true);
+        assert_eq!(out["username_hint"], "alice");
+
+        // The fill landed (acted, no error) AND the observation surface
+        // redacts it — the secret must not leak back through snapshots.
+        let value = {
+            let mut guard = session.write().await;
+            let obs = guard.native_observe().await.unwrap();
+            obs.snapshot
+                .interactive_elements()
+                .into_iter()
+                .find(|el| el.input_type.as_deref() == Some("password"))
+                .and_then(|el| {
+                    obs.snapshot
+                        .nodes
+                        .get(&el.node_id)
+                        .and_then(|n| n.attributes.get("value").cloned())
+                })
+        };
+        assert_eq!(value.as_deref(), Some("__REDACTED__"));
+        assert!(
+            !out.to_string().contains("s3cret-value"),
+            "the secret must not appear in the returned payload"
+        );
+    }
+}
