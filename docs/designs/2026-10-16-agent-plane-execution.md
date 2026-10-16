@@ -1,128 +1,144 @@
-# Agent plane 실행 설계 (2026-10-16)
+# Agent plane 실행 설계 (2026-10-16, 리뷰 반영 v2)
 
 > [2026-10-16-agent-first-browser.md](2026-10-16-agent-first-browser.md)의 단계(P0–P3)를
-> 코드 수준으로 전개한 실행 계획. 모든 착지점은 2026-10-16 스카우트 보고(실제 심볼 기준)에
-> 근거한다. 시간 추정은 의도적으로 없음 — 의존 순서와 완료 기준만.
+> 코드 수준으로 전개한 실행 계획. v2는 2026-10-16 코드 대조 리뷰(치명 2·중간 7·경미 4)
+> 를 반영해 consent 흐름을 3개 메커니즘으로 분리하고, bash를 v1에서 제외하며, 폼
+> activation·팝업 기반을 실제 엔진 상태로 정정했다. 시간 추정 없음 — 의존 순서와
+> 완료 기준만.
 
 ## 0. 조사로 확정된 사실 (계획의 전제)
 
 | 설계 필요사항 | 이미 있는 구현 | 갭 |
 |---|---|---|
-| ariaSnapshot 관측 | `DomSnapshot::render_aria_yaml` (core/js/dom_snapshot.rs:2271), CDP `oxi.rs aria_snapshot()` | CDP 밖 노출 + 토큰 예산 |
-| ref epoch 무효화 | `oxibrowser-cdp/src/refs.rs` RefRegistry + `oxi.rs resolve_and_validate` (generation·fingerprint·재질의) | 에이전트 모듈에서 재사용 |
-| 불가역/consent 게이트 | `oxi.rs:299 irreversible_gate` → `account/irreversible.rs matched_pattern` + `LoginSurface::irreversible_allowed` | REPL 경로에 동일 강제 |
-| 비밀 리터럴 거부 | `OXI.fillRef` → `selector_targets_password` → `passwordFillRequiresCredential` (oxi.rs:486); `fillCredential` 존재 | 로케이터 fill에 동일 규칙 |
-| 이벤트 구독 | `Session::set_event_sink(CoreEvent)` (session.rs:1899) — Dialog/Download/Console/Fetch 등 | REPL 이벤트 큐로 연결 |
-| 계정/로그인 오케스트레이션 | `AccountRuntime`/`LoginOrchestrator`, `AgentLoginEngine`(폼 직접 POST, 비밀 JS 리터럴화 없음) | REPL `page.login()` 랩 |
-| 뷰포트 | `set_viewport_override(w,h)` 프로세스 전역 (session.rs:313), 기본 1280×720 | 1440×900 에이전트 고정 |
-| boa 컨텍스트 패턴 | `JsRuntime` 전용 스레드 + `JsCommand` mpsc + fetch/localStorage 브리지(스레드 로컬 + 응답 펌프) | agent-world 별도 스레드가 동일 이디엄 |
+| ariaSnapshot 관측 | `DomSnapshot::render_aria_yaml`(dom_snapshot.rs:2271), CDP `oxi.rs aria_snapshot()` | CDP 밖 노출 + 토큰 예산 |
+| ref epoch 무효화 | cdp `refs.rs` RefRegistry + `resolve_and_validate`(generation·fingerprint·재질의) | 에이전트 모듈에서 재사용 |
+| 불가역 게이트 | `irreversible_gate`(oxi.rs:299) — 거부는 CdpError 문자열, remedy는 `account grant` + **컨텍스트 재생성**(능력은 컨텍스트 생성 시 스냅샷) | 대기·승인 흐름은 별도 설계(M3) |
+| credential consent | `PolicyEngine::RequireConfirmation` → broker pending + `OXI.confirmationRequired` 이벤트(requestId/timeoutMs) + viewer `OXI.resolveConfirmation` — **승인이 fill을 직접 완료**(재시도 아님). `CONFIRMATION_TTL`=60s. exit-5 envelope는 CLI 서브프로세스 계약 — 프로세스 내 REPL에서는 발생 안 함 | 루프가 이벤트를 구독해 카드 표시 후 결과 수신(M3) |
+| 비밀 리터럴 거부 | `selector_targets_password` → `passwordFillRequiresCredential`; `fillCredential` 존재 | 로케이터 fill에 동일 규칙 |
+| 안전한 액션 전달 | `Session::native_act`(session.rs:1876) — Rust 측 node/incarnation 검증·변이, 페이지 eval 없음(ghost가 이 경로를 만든 이유가 selector/이벤트 위조 방지) | M1이 이 경로를 채택 |
+| 폼 제출 | **`form.submit()`은 noop, 클릭 기본 동작(activation behavior) 부재** — `AgentLoginEngine`도 직접 POST로 우회 | M1.5 코어 작업 |
+| 팝업 | `window.open` 바인딩·`target=_blank` 처리 **둘 다 없음** — "이벤트가 없는" 것이 아니라 "새 탭을 여는 페이지 동작이 없는" 것 | M2에서 기능+이벤트 함께 |
+| 이벤트 구독 | `Session::set_event_sink(CoreEvent)` — Dialog/Download/Console/Fetch | REPL 이벤트 큐 연결 |
+| 뷰포트 | `set_viewport_override` — **프로세스 전역 static**. 다음 네비게이션부터 적용. `set_download_behavior`도 전역 | 에이전트 전용 프로세스 정책(§1) |
+| boa 컨텍스트 패턴 | `JsRuntime` 전용 스레드 + `JsCommand` mpsc + fetch 브리지 응답 펌프. `Context::eval`은 script 골 — **최상위 await는 SyntaxError** | agent-world는 async IIFE 랩 + 바인딩 목록(M1) |
+| 계정/로그인 오케스트레이션 | `AccountRuntime`/`LoginOrchestrator`, `AgentLoginEngine`(폼 직접 POST) | `page.login()` 랩(M3) |
+| 크레이트 경계 | `irreversible_gate`·`resolve_and_validate`는 private, `DispatchContext` 요구 — bin 크레이트 구성 선례는 ghost.rs:272(단 `logins:None`이면 게이트 우회 = 반드시 채워야 함) | §1 재사용 경로 |
 
-알려진 구멍: 자발적 팝업(링크 → 새 탭)은 코어 이벤트가 없음(target.rs:133 — 명시적
-생성만 이벤트). M2에서 TabManager 폴링으로 보완하고 `CoreEvent::TabSpawned`는 별도 PR.
+## 1. 구조 결정 (v2 확정)
 
-## 1. 구조 결정
+- **에이전트 모듈 위치**: `crates/oxibrowser/src/agent/` (bin 크레이트, session/·mcp/ 패턴).
+- **게이트/refs 재사용 경로**: cdp `domains` 디스패치 라우팅(변경 최소) — 에이전트 브리지가
+  `DispatchContext`를 `logins`/`credential_mode`를 채워 구성(ghost.rs 선례, 단 ghost와 달리
+  `logins` 필수) 후 `OXI.clickRef`/`fillRef` 계열 핸들러를 호출한다. `pub` 승격은 하지
+  않는다. 강제 지점이 한 곳(도메인 핸들러)에 유지된다.
+- **agent-world**: 페이지 `JsRuntime`과 별도 스레드 + 별도 boa `Context`. 입력 스크립트는
+  async IIFE로 랩(최상위 await 지원). REPL 스레드는 공유 락 미보유 + oneshot 타임아웃 30s.
+  M1 산출물로 agent-world 바인딩 목록 명시(`console`, `URL`, `fetch`(브리지), `JSON`,
+  timers, `page`, `oxi`) — 미지원 심볼(`Buffer`/`process`/`require`) 오류는 "agent-world에는
+  없음, 대안" 안내로 모델 자교정 유도.
+- **액션 전달**: 전부 `native_act`(스냅샷 node_id → NativeTarget). 페이지 eval 경로
+  (`click_js`)는 채택하지 않는다 — 페이지 스크립트의 selector/이벤트/descriptor 위조 차단.
+  대가: native 경로의 알려진 한계(캡처 단계 없음, 인라인 onclick 미등록, shadow 콘텐츠
+  미포함 — ghost-mcp.md 명시)를 상속; 한계 해소는 코어 후속 과제로 기록.
+- **bash 없음(v1)**: 스코프 강제 수단(프로세스 격리+화이트리스트)이 없는 `--shell
+  workspace`는 거짓 안전. v1은 브라우저 과업만; bash는 샌드박스 설계를 동반한 별도
+  마일스톤(M6 후보)으로 연기.
+- **뷰포트/다운로드 정책**: 에이전트는 전용 프로세스에서만 구동(`agent run`은 자기
+  프로세스). 1440×900 오버라이드와 다운로드 디렉터리는 그 프로세스에 한정된 전역으로
+  선언 — serve/CDP 클라이언트 동시 운영 금지를 문서+시작 시 경고로 강제. 퍼-세션 뷰포트는
+  코어 변경 후 재검토.
+- **레인**: `--trust full|restricted` 단일 플래그. `restricted` = 기존 MCP 관측/액션만(사실상
+  ghost 레인). ghost 바이너리 경로 유지.
 
-- **에이전트 모듈 위치**: `crates/oxibrowser/src/agent/` (bin 크레이트). session/·mcp/와 동일
-  패턴. `oxibrowser-cdp`를 라이브러리로 의존해 `refs`·게이트 헬퍼를 재사용한다(지금
-  core로 추출하는 리팩터는 하지 않는다 — cdp 크레이트 테스트 75개를 흔들 이유가 없다.
-  oxios 임베드 시점에 `oxibrowser-agent` 승격과 함께 재검토).
-- **agent-world 실행 컨테이너**: 페이지 `JsRuntime`과 **별도 스레드 + 별도 boa `Context`**.
-  페이지 런타임은 전혀 손대지 않는다(페이지 호환 리스크 0). 호스트 바인딩(`page`, `oxi`)
-  은 native fn → mpsc 커맨드 → 비동기 쪽에서 `Arc<RwLock<Session>>` 획득 → oneshot 응답.
-  REPL 스레드는 어떤 공유 락도 직접 잡지 않는다(교착 원천 차단). fetch 브리지
-  (`PENDING_FETCH` + 응답 펌프)가 이 블로킹 패턴의 선례다.
-- **CLI 표면**: `oxibrowser repl`(신규, JS REPL), `oxibrowser agent run|resume`(M3). 기존
-  `session`(JSON 명령 REPL)은 그대로 — 관객이 다르다(스크립트/파이프라인 vs 모델).
-- **bash 스코프(설계 문서 §8-1 결정)**: 기본 `none`. `--shell workspace` 옵트인 시
-  작업 디렉터리(작업별 `~/.local/state/oxibrowser/tasks/<id>/ws`)로 제한. 그 밖은
-  irreversible 게이트와 같은 consent 카드로 승격. `--shell full`은 만들지 않는다( 필요하면
-  그때 다시 결정).
-- **레인(§8-4 결정)**: `--trust full|restricted` 단일 플래그. `restricted`는 REPL 없이
-  기존 MCP 관측/액션 도구만 = 사실상 오늘의 ghost 레인. ghost 바이너리 경로는 유지.
+## 2. 마일스톤 (v2)
 
-## 2. 마일스톤
+### M0 — 관측 기반
 
-### M0 — 관측 기반 (P0 전반)
+새 파일 `agent/mod.rs`, `agent/obs.rs`.
 
-새 파일 `crates/oxibrowser/src/agent/mod.rs`, `agent/obs.rs`.
+- `observe(session, ObsOpts{budget_bytes, max_actionable}) -> ObsResult{aria_yaml, actionable, url, title, generation, truncated, omitted}` — `dom_snapshot()` → `render_aria_yaml`(ref 클로저 = cdp `RefRegistry::allocate`). 예산 초과 시 트리 하단 절단 + 보고. 토큰은 바이트 근사(4B/token), M5에서 실측 보정.
+- session REPL에 `observe <tab> [--budget N]` 추가. describe/skill 카탈로그 갱신 포함(신규 명령마다 — 이하 모든 마일스톤 동일).
 
-- `observe(session, ObsOpts{budget_bytes, max_actionable}) -> ObsResult{ aria_yaml, actionable: Vec<{ref, role, name, kind}>, url, title, generation, truncated, omitted }`
-  - `Session::dom_snapshot()` → `render_aria_yaml`(ref 클로저는 cdp `RefRegistry::allocate` 재사용).
-  - 예산 초과 시 트리 하단 절단 + `truncated` 보고(ghost 스냅샷의 8,000B 캡과 같은 규칙).
-- session REPL에 `observe <tab> [--budget N]` 명령 추가(parser.rs/executor.rs — 기존 27개 명령 패턴).
-- 토큰 계산은 바이트 근사(4B/token)로 시작. 정확도는 코퍼스 평가(M5)에서 교정.
+완료 기준: `printf 'new\ngoto t1 https://example.com\nobserve t1 --budget 1500\nexit\n' | cargo run -- session --json` 출력 1,500토큰 이하 + ref 포함. 예산 절단·stale ref 단위 테스트.
 
-완료 기준: `printf 'new\ngoto t1 https://example.com\nobserve t1 --budget 1500\nexit\n' | cargo run -- session --json`이 1,500토큰 이하 출력 + ref 포함. 예산 절단·ref 무효화(재네비게이션 후 stale) 단위 테스트.
+### M1 — Oxiwright REPL
 
-### M1 — Oxiwright REPL (P0 후반)
+새 파일 `agent/world.rs`, `agent/bridge.rs`, `agent/locators.rs`.
 
-새 파일 `agent/world.rs`(boa 컨텍스트+스레드), `agent/bridge.rs`(커맨드 mpsc + oneshot), `agent/locators.rs`.
+- 로케이터: `getByRole/getByText/getByLabel/getByPlaceholder/locator(css)/.first/.nth` → 스냅샷 질의 → ref 발급 → `resolve_and_validate` 재검증. 액션 `.click()/.fill()/.press()/.check()`은 **native_act 전달**. 탐색 `goto/back/forward/reload`, `content()`, `ariaSnapshot()`, `screenshot()`.
+- 게이트(§1 디스패치 경유): click → `irreversible_gate` 동일 조건; fill 대상 password → 거부 + `oxi.fillCredential(locator, 'account')` 안내(BrokerSource 해결, 네이티브 주입).
+- **오류 계약 산출물**: timeout/strict/stale-ref/unsupported 구조화 코드 + Playwright 문체 메시지 명세.
+- agent-world 바인딩 목록 + async IIFE 랩 + 미지원 심볼 안내(§1).
+- CLI: `oxibrowser repl [--account id]` — stdin 블록 = 프로그램, 결과 JSON. OXSESS 저장 재사용.
 
-- 로케이터: `page.getByRole(name), getByText, getByLabel, getByPlaceholder, locator(css), .first, .nth(i)` — 전부 최신 스냅샷 질의로 ref 발급 후 `resolve_and_validate` 재검증. 액션: `.click(), .fill(text), .press(key), .check()`. 탐색: `page.goto/back/forward/reload`, `page.content()`, `page.ariaSnapshot()`, `page.screenshot()`.
-- 게이트 강제(전부 비동기 측 세션 락 안에서):
-  - `.click()` → `irreversible_gate` 동일 조건(패턴 매치 + credential_mode + grant) 실패 시 `irreversibleActionRequiresGrant` — consent 흐름은 M3.
-  - `.fill()` 대상이 password → `selector_targets_password` 참이면 거부 + 안내: `oxi.fillCredential(locator, 'account-id')` → BrokerSource 해결 → 네이티브 주입. 모델 컨텍스트에 비밀 미경유.
-- 다이얼로그: 액션 중 `DialogGate` 걸림은 기존 폴링 세미닉 그대로, REPL에는 `page.on('dialog')` 로 노출(M2에서 이벤트 큐로 완성).
-- CLI: `oxibrowser repl [--account id] [--headless]` — stdin 한 블록 = 한 프로그램(`await` 최상위 허용), 결과는 JSON. 전체 라이프사이클에서 OXSESS 봉투 저장(`session`의 SaveState/LoadState 재사용).
+완료 기준: (1) fixture에서 `getByRole('button',{name:'Submit'}).click()`이 **JS 핸들러 경로로** 실제 효과(DOM 변화/카운터)를 내는 e2e — 순수 HTML 폼 제출은 M1.5 전까지 기준에서 제외(activation behavior 부재, §0), (2) password literal fill 거부 + `fillCredential` 성공 e2e, (3) 브리지 30s 타임아웃 테스트.
 
-완료 기준: 로컬 fixture(루프백 서버)에서 (1) `await page.getByRole('button', {name: 'Submit'}).click()` 이 실제 폼 제출로 이어지고, (2) password 필드 literal fill이 거부되며 `fillCredential` 경로는 성공하는 e2e 2개. boa 브리지 타임아웃(액션 30s) 테스트.
+### M1.5 — 폼 activation (코어 PR)
 
-### M2 — steering 이벤트 (P1 전반)
+- submit 버튼 클릭의 기본 동작: 폼 인코딩(application/x-www-form-urlencoded, multipart 지원 여부 결정) → `post()` 네비게이션. `form.submit()` noop 해소. 로드맵 "Web platform gaps"와 병합 가능.
+- 완료 기준: 순수 HTML 폼(핸들러 없음)에서 M1의 클릭이 서버 수신으로 이어지는 e2e. 프로브: 로컬 루프백 서버가 받은 바디 검증.
 
-- `agent/events.rs`: `set_event_sink`로 CoreEvent 구독 → agent-world 이벤트 큐. REPL API: `page.waitForEvent('dialog'|'download'|'console'|'popup')`, 루프(M3)에는 인터럽트로 주입.
-- 팝업 gap 보완: TabManager 폴링(500ms, 탭 세트 diff) → `popup` 이벤트. `CoreEvent::TabSpawned` 코어 추가는 별도 소형 PR로 분리.
-- 다운로드: `set_download_behavior(작업 디렉터리)` + `Download/DownloadFailed` 이벤트.
+### M2 — steering 이벤트
 
-완료 기준: fixture에서 `alert()` 페이지 → `waitForEvent('dialog')` 수신 → `dialog.accept()` 해제 e2e. 다운로드 시작 이벤트 수신 e2e.
+- `agent/events.rs`: `set_event_sink` → REPL 이벤트 큐. `page.waitForEvent('dialog'|'download'|'console')`.
+- **팝업은 기능 구현 포함**: `window.open` 바인딩 + `target=_blank` 링크 처리 → 새 세션 생성 + `CoreEvent::TabSpawned`(신규) 발행. 이것이 없으면 `waitForEvent('popup')`은 관측 대상이 없다(§0).
+- 다운로드: 전역 `set_download_behavior`(전용 프로세스 정책 §1 준수) + 이벤트.
 
-### M3 — 에이전트 루프 (P1 후반)
+완료 기준: alert fixture → dialog 수신→해제 e2e; `window.open` fixture → popup 이벤트 + 새 탭 관측 e2e; 다운로드 시작 이벤트 e2e.
+
+### M3 — 에이전트 루프
 
 새 파일 `agent/loop.rs`, `agent/model.rs`, `agent/prompt.rs`.
 
-- `ModelProvider` trait: `complete(messages, tools, opts) -> Stream<Delta>`. 구현 1개: OpenAI 호환 HTTP(CHAT 엔드포인트, wreq 재사용). Anthropic은 인터페이스만 남기고 M4+.
-- API 키: credential 브로커에 `llm:<provider>` 스코프로 저장(`credential` CLI 재사용).
-- 루프: 관측(M0) → 모델 → REPL 코드 실행(M1) → 결과/steering 피드백. compaction: 전사 길이 임계 초과 시 직전 관측+요약으로 압축(요약 호출도 같은 provider).
-- consent 통합: 게이트 거부 → exit-5 envelope의 `request_id/ttl` 파싱 → viewer에 에이전트 consent 카드(기존 확인카드·일회용 토큰 패턴 재사용, `include_str! viewer.html` 확장) → `ConsentStore::active_for` 폴링(1s, TTL 한도) → 승인 시 재시도.
-- 프롬프트 규율: `agent/prompt.rs`에 상수 시스템 프롬프트 + 도구 정의. CI에서 대략 토큰 상한(10K) 검증 — 상한 초과면 빌드 실패 테스트.
-- CLI: `oxibrowser agent run "<task>" [--account id] [--shell workspace|none] [--max-steps N] [--budget-tokens N]`.
+- `ModelProvider` trait + OpenAI 호환 구현(wreq). 키는 브로커 `llm:<provider>` 스코프.
+- 루프: 관측(M0) → 모델 → REPL(M1) → 결과/steering. compaction: 임계 초과 시 직전 관측+요약.
+- **consent 통합 — 메커니즘별 분리(리뷰 치명-1 반영)**:
+  - (a) credential consent: broker `OXI.confirmationRequired` 이벤트 수신 → viewer 카드 → `resolveConfirmation` 결과 수신 후 **재관측**(재시도 아님 — 승인이 fill을 완료함).
+  - (b) 불가역 거부: 루프 정지 + viewer 카드("이 계정에 irreversible 그랜트 필요") → 사람이 `account grant` 실행 → 루프가 그랜트 관측 후 **컨텍스트 재생성 + 마지막 관측부터 재개**(능력이 컨텍스트 생성 시 스냅샷되므로). 게이트가 pending confirmation을 발행하도록 확장하는 안은 신규 엔진 작업으로 기록만.
+  - (c) exit-5 envelope 파싱은 CLI 서브프로세스를 쓸 때만 유효 — 루프는 (a)/(b)만 사용.
+- `page.login(id)` 랩(§4.3 설계 — AccountRuntime/LoginOrchestrator 재사용, site file 마커는 M4).
+- 프롬프트 규율: 상수 시스템 프롬프트+도구 정의, CI에서 ~10K 토큰 상한 빌드 실패 테스트. 시스템 프롬프트에 위협 모델 격리 규칙 포함(설계 §4.7).
+- CLI: `oxibrowser agent run "<task>" [--account id] [--trust full|restricted] [--max-steps N] [--budget-tokens N]` — `--shell` 없음(v1).
 
-완료 기준: 로컬 fixture 3-스텝 과업(검색→폼→결과 확인) 자율 완료 e2e(더미 모델 provider로 결정론 테스트 + 실제 모델 1회 스모크). consent 일시정지→viewer 승인→재개 e2e.
+완료 기준: 더미 provider로 3-스텝 과업(검색→폼→확인) 자율 완료 e2e + 실모델 1회 스모크(`--ignored`급, CI 비상정). credential consent (a) 흐름 e2e: 카드→승인→재관측. 불가역 (b) 흐름 e2e: 거부→정지→그랜트→컨텍스트 재생성→재개.
 
-### M4 — 기억 + API 재생 (P2)
+### M4 — 기억 + API 재생
 
-- site file: `~/.local/share/oxibrowser/sites/<origin>.json` — `{verified_selectors, login_markers, api_endpoints, bot_notes, stats}`. 루프가 성공 액션의 로케이터/엔드포인트를 기록, 다음 실행에 관측 주석으로 주입("이 사이트는 `.search-input` 가 검증됨").
-- `task resume <id>`: 전사(OXSESS + audit JSONL)에서 마지막 관측 복원 후 재개.
-- `page.replay(requestId)`: `network_log_snapshot()` 항목을 in-page `fetch()`로 재생(쿠키/헤더는 세션 것 사용 — 사이트 자체 요청과 동일 지문).
+- site file `~/.local/share/oxibrowser/sites/<origin>.json` — 검증 셀렉터/로그인 마커/API 엔드포인트. 성공 액션 기록, 다음 실행 관측 주석 주입.
+- `agent resume <id>`(명명 통일): 전사(OXSESS+audit JSONL)에서 마지막 관측 복원 재개.
+- `page.replay(requestId)`: `network_log_snapshot()` 항목 in-page `fetch()` 재생.
 
-완료 기준: 동일 과업 2회 실행에서 2회째 관측/스텝 수 감소를 로그로 실측하는 회귀 테스트. replay가 fixture API를 인증 없이 재생하는 e2e.
+완료 기준: 동일 과업 2회 실행 관측/스텝 수 감소 실측 회귀 테스트. replay가 fixture API를 재생하는 e2e.
 
-### M5 — CUA 폴백 + 코퍼스 (P3)
+### M5 — CUA 폴백 + 코퍼스
 
-- `page.screenshot()` → `capture_png`(vello_cpu), `page.mouse.click(x,y)`, `page.viewport = {1440, 900}`(에이전트 탭은 `set_viewport_override` 고정, viewer 미러와 무관).
-- `oxibrowser agent eval <corpus-dir>`: 과업 YAML + 채점 함수 코퍼스 러너, 통과율 JSON 리포트. 로드맵 2번(공개 호환 벤치마크)과 같은 CI 자리에 배치.
+- `page.screenshot()`(capture_png), `page.mouse.click(x,y)`(렌더 문서 hit-test → native 전달 — 좌표→노드 해석은 M1의 hit-test 재사용), 뷰포트 1440×900(전용 프로세스 정책, §1).
+- `oxibrowser agent eval <corpus-dir>`: 과업 YAML+채점 코퍼스 러너, 통과율 JSON 리포트. 로드맵 2번 벤치마크와 같은 CI 자리. 토큰 근사 보정 계수 도입.
 
-완료 기준: 로케이터 불가 canvas fixture를 좌표 클릭으로 조작 성공. 코퍼스(최소 10 과업) 통과율 리포트 생성.
+완료 기준: 로케이터 불가 canvas fixture 좌표 클릭 성공. 코퍼스(최소 10 과업) 통과율 리포트.
 
 ## 3. 수정하지 않는 것 (리스크 차단)
 
-- 페이지 `JsRuntime`/js_thread_loop — M1~M5 전 구간 무변경 (agent-world는 별도 스레드).
-- CDP 12 도메인, stdio MCP 12 도구, ghost 레인 — 표면 동결.
-- `oxibrowser-cdp` 내부 구조(게이트/refs 재사용은 읽기만).
-- 5-크레이트 구조 유지 (agent는 bin 크레이트 모듈).
+- 페이지 `JsRuntime`/js_thread_loop — 전 구간 무변경 (agent-world 별도 스레드; M1.5는 엔진 동작 추가이지만 런타임 구조 변경 아님).
+- CDP 12 도메인, stdio MCP 12 도구, ghost 레인 — 표면 동결. 도메인 핸들러는 디스패치 경유 재사용만(읽기 전용).
+- 5-크레이트 구조 유지.
 
-## 4. 리스크
+## 4. 리스크 (v2 확장)
 
 | 리스크 | 완화 |
 |---|---|
-| boa native fn 블로킹 브리지 교착 | REPL 스레드가 공유 락 미보유 원칙 + oneshot 30s 타임아웃 + 브리지 테스트 |
-| RefRegistry 프로세스 전역(LazyLock) | 단일 CLI 프로세스 사용은 안전; 멀티 세션 서빙 시점에 세션 키 검증 강화 |
-| 토큰 추정 부정확(바이트 근사) | M0에서 근사, M5 코퍼스에서 실측 토큰으로 보정 계수 도입 |
-| 모델 provider 편차 | 더미 provider로 루프 로직 결정론 테스트; 실모델은 스모크만 |
-| viewer 카드 확장 범위 확대 | 기존 확인카드 컴포넌트 재사용, 신규 스타일 없음 |
-| consent 폴링 TTL 경쟁 | exit-5 envelope의 ttl을 그대로 존중, 만료 시 작업 실패 처리(재시도 없음) |
+| boa native fn 블로킹 브리지 교착 | REPL 스레드 공유 락 미보유 + oneshot 30s 타임아웃 + 브리지 테스트 |
+| 모델 작성 JS의 Node 표준 분포 가정(`Buffer`/`process`/`URL`/`require`, TMA) | async IIFE 랩, agent-world 바인딩 목록 M1 산출물, 미지원 심볼 자교정 메시지(§1) |
+| 프롬프트 인젝션(ariaSnapshot 이름 등 페이지 파생 텍스트) | 설계 §4.7 위협 모델: 비신뢰 조립 + 격리 규칙 + native 액션 + 정책 강제 게이트; 잔여 위험은 코퍼스·감사로 관측 |
+| native_act 경로 한계(캡처 없음, 인라인 onclick, shadow 미포함) 상속 | M1 문서화 + 코어 후속 과제 목록; 필요 시 사이트별 회피(site file) |
+| consent 3-흐름 혼동 재발 | M3 완료 기준이 (a)/(b) 각각 e2e — 하나의 통합 흐름으로 테스트하지 않음 |
+| 뷰포트/다운로드 전역 간섭 | 전용 프로세스 정책 + 시작 시 serve 공존 경고 |
+| RefRegistry 프로세스 전역 | 단일 CLI 프로세스 안전; 멀티 태스크 서빙 시점 재검토 |
+| 토큰 추정 부정확 | M0 근사 → M5 실측 보정 |
+| 모델 provider 편차 | 더미 provider 결정론 테스트; 실모델 `--ignored` 스모크 |
 
 ## 5. 브랜치/검증 규율
 
-각 마일스톤 = `feat/agent-m<N>` 브랜치(main에서), 완료 기준 명령 실측 + 관련 테스트
-통과 후에만 커밋→푸시. main의 현재 미커밋 ghost 변경은 별소 작업 — 절대 함께 stage하지
-않는다. 문서 변경(본 파일)은 design 브랜치에 이어서.
+각 마일스톤 = `feat/agent-m<N>` 브랜치(main에서). 완료 기준 명령 실측 + 관련 테스트 통과
+후 커밋→푸시. 각 마일스톤 완료 기준에 describe/skill/main.rs 코멘트 갱신 포함(리뷰 경미-10).
+main의 미커밋 ghost 변경은 별소 작업 — 함께 stage하지 않는다.
