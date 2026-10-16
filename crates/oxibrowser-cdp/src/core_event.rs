@@ -246,6 +246,25 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
                 }),
             );
         }
+        CoreEvent::TabSpawned {
+            url,
+            target,
+            source_session_id,
+        } => {
+            // Page-initiated new-tab request (window.open / target=_blank).
+            // The CDP layer does not mint the session here — hosts that
+            // want popup support create it (the agent-plane EventHub does;
+            // see CoreEvent::TabSpawned docs). The event surfaces as a
+            // custom OXI notification for observability.
+            events.send_browser_event(
+                "OXI.tabSpawned",
+                json!({
+                    "url": url,
+                    "target": target,
+                    "sourceSessionId": source_session_id,
+                }),
+            );
+        }
         CoreEvent::DownloadFailed {
             guid,
             url: _,

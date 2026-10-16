@@ -156,6 +156,12 @@ pub enum DomMutation {
         body: String,
         content_type: String,
     },
+    /// Page-initiated new-tab (popup) request: `window.open(...)` or the
+    /// default action of a `target="_blank"` link click. Handled by
+    /// `Session::reconcile_native_mutations`, which emits
+    /// `CoreEvent::TabSpawned`; the attached observer (upper layer) creates
+    /// the actual session.
+    OpenTab { url: String, target: String },
 }
 
 /// Serializable DOM node.

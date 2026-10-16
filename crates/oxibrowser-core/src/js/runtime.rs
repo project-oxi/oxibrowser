@@ -850,6 +850,22 @@ pub enum CoreEvent {
         resource_type: String,
         timestamp: f64,
     },
+    /// A page-initiated new-tab (popup) request (`window.open` or the default
+    /// action of a `target="_blank"` link click). Core does not create the
+    /// session itself — a `Session` holds no `Browser` handle — so the
+    /// attached observer (CDP layer / upper layer) owns session creation:
+    /// it should create a session on the same browser/context and navigate it
+    /// to `url`. The returned window proxy is not provided (v1): the source
+    /// script gets `null` from `window.open` regardless.
+    TabSpawned {
+        /// Requested URL, already resolved against the source page URL
+        /// (absolute).
+        url: String,
+        /// Window target as requested by the page (`_blank` default).
+        target: String,
+        /// Id of the session whose page initiated the spawn.
+        source_session_id: String,
+    },
     /// `alert` / `confirm` / `prompt` dialog requested by the page.
     Dialog {
         dialog_type: DialogType,
@@ -1693,10 +1709,6 @@ impl JsRuntime {
 
     /// Set the DOM snapshot (called after navigate).
     pub fn set_dom_snapshot(&mut self, snapshot: Option<DomSnapshot>) {
-        self.mutations.write().clear();
-        // New document: stale dirtiness from the previous page must not
-        // cost a spurious screencast frame.
-        self.dom_dirty.store(false, Ordering::Relaxed);
         let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
         if let Err(e) = self.cmd_tx.send(JsCommand::SetDom {
             snapshot: Box::new(snapshot),
@@ -1858,6 +1870,14 @@ impl JsRuntime {
         viewport: (u32, u32),
         scripts: Vec<ScriptSource>,
     ) -> Result<()> {
+        // New document: the journal starts empty and dirtiness is reset
+        // BEFORE page scripts run, so their effects (location navigation,
+        // form submits, window.open tab spawns) survive until the session's
+        // post-injection reconcile drains them. (The clear used to live in
+        // `set_dom_snapshot`, which runs AFTER the scripts — wiping their
+        // journaled effects.)
+        self.mutations.write().clear();
+        self.dom_dirty.store(false, Ordering::Relaxed);
         let (response_tx, response_rx) = mpsc::channel::<JsResponse>();
         self.cmd_tx
             .send(JsCommand::SetDocument {
@@ -11356,6 +11376,54 @@ fn register_window_globals(
         };
         let _ = ctx.register_global_callable(js_string!("__oxiFormSubmit"), 1, form_submit_global);
     }
+    // window.open(url, target, features) → page-driven new-tab request.
+    // Journals `DomMutation::OpenTab` (resolved against the current page URL);
+    // `Session::reconcile_native_mutations` emits `CoreEvent::TabSpawned` and
+    // the attached observer creates the session. v1: no window proxy is
+    // returned — the script sees `null` (same as a blocked popup).
+    {
+        let wo_url = url_owned.clone();
+        let wo_mut = mutations.clone();
+        let window_open_fn = unsafe {
+            NativeFunction::from_closure(move |_this, args, _ctx| {
+                let raw = args
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .unwrap_or_default();
+                let target = args
+                    .get(1)
+                    .and_then(|v| v.as_string())
+                    .map(|s| s.to_std_string_escaped())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "_blank".to_string());
+                if raw.trim().is_empty() {
+                    // `window.open()` with no URL: real browsers open an empty
+                    // tab; without a window proxy to hand back there is
+                    // nothing useful to spawn — no-op.
+                    return Ok(JsValue::null());
+                }
+                let resolved = match url::Url::parse(&wo_url) {
+                    Ok(base) => match base.join(&raw) {
+                        Ok(u) => u.to_string(),
+                        Err(_) => return Ok(JsValue::null()),
+                    },
+                    Err(_) => raw,
+                };
+                wo_mut.write().push(DomMutation::OpenTab {
+                    url: resolved,
+                    target,
+                });
+                Ok(JsValue::null())
+            })
+        };
+        let _ = ctx.register_global_callable(js_string!("open"), 3, window_open_fn);
+        // Mirror onto `window` (a distinct object from globalThis here, and a
+        // counting Proxy when telemetry is on — assignment forwards).
+        let _ = ctx.eval(Source::from_bytes(
+            b"if (typeof window !== 'undefined') { window.open = globalThis.open; }",
+        ));
+    }
     let bootstrap = HISTORY_LOCATION_BOOTSTRAP.replace("/*PAGE_URL*/", &page_url_json);
     if let Err(e) = ctx.eval(Source::from_bytes(&bootstrap)) {
         tracing::warn!(error = %e, "history/location bootstrap failed");
@@ -16224,8 +16292,13 @@ mod tests {
         assert!(second.is_empty());
     }
 
+    /// The mutation journal resets at the START of a new document
+    /// (`set_document_with_scripts`), not in `set_dom_snapshot` (which runs
+    /// after page scripts and would wipe their journaled effects —
+    /// window.open spawns, load-time navigations). Stale effects from a
+    /// previous document are still dropped: the clear just moved.
     #[tokio::test]
-    async fn test_set_dom_snapshot_clears_mutations() {
+    async fn test_new_document_clears_mutations_at_start() {
         let mut rt = JsRuntime::new();
         let html = r#"<html><body><button id="btn">Click</button></body></html>"#;
         let frame = make_frame(html).await;
@@ -16235,11 +16308,13 @@ mod tests {
         rt.evaluate("document.getElementById('btn').click()")
             .await
             .unwrap();
+        let _ = rt.drain_mutations(); // the click may journal or not — irrelevant here
 
-        let snapshot2 = DomSnapshot::from_frame(&frame);
-        rt.set_dom_snapshot(Some(snapshot2));
-        let mutations = rt.drain_mutations();
-        assert!(mutations.is_empty());
+        // A new document starts with an empty journal and clean dirtiness.
+        let _ = rt
+            .set_document_with_scripts("<html><body></body></html>", None, (1280, 720), vec![])
+            .await;
+        assert!(rt.drain_mutations().is_empty());
     }
 
     #[tokio::test]

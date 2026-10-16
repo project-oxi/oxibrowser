@@ -530,6 +530,38 @@ pub(super) fn act(
                         }
                     }
                 }
+                // Click default action on an anchor: `target="_blank"` links
+                // spawn a new tab (page-driven popup). Journals
+                // `DomMutation::OpenTab`; `Session::reconcile_native_mutations`
+                // emits `CoreEvent::TabSpawned` and the observer creates the
+                // session. Plain (no-target) link navigation is not yet a
+                // default action on this path.
+                let anchor_url = {
+                    let cell = render_doc.borrow();
+                    match cell.as_ref() {
+                        Some(doc) => {
+                            let snapshot = DomSnapshot::from_render_document(doc, "", "");
+                            snapshot.nodes.get(&target.node_id).and_then(|n| {
+                                let is_blank_anchor = n.tag == "a"
+                                    && n.attributes
+                                        .get("target")
+                                        .map(|t| t.eq_ignore_ascii_case("_blank"))
+                                        .unwrap_or(false);
+                                if is_blank_anchor && let Some(href) = n.attributes.get("href") {
+                                    return page.join(href).ok().map(|u| u.to_string());
+                                }
+                                None
+                            })
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(url) = anchor_url {
+                    mutations.write().push(DomMutation::OpenTab {
+                        url,
+                        target: "_blank".to_string(),
+                    });
+                }
             }
         }
         NativeInput::Fill(_) | NativeInput::FillCredential(_) => {

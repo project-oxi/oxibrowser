@@ -3486,6 +3486,7 @@ dependencies = [
  "oxibrowser-core",
  "oxibrowser-credentials",
  "oxibrowser-render",
+ "parking_lot",
  "psl",
  "reqwest",
  "rpassword",

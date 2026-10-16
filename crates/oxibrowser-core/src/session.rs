@@ -1223,6 +1223,12 @@ impl Session {
         // Phase 8: build per-frame execution contexts for child iframes.
         self.inject_child_frames().await;
 
+        // Drain page-script effects (location navigations, form submits,
+        // window.open tab spawns): a load-time popup must fire without
+        // waiting for the next eval/act to reconcile the journal. Boxed:
+        // a drained Navigate re-enters navigate() (async recursion).
+        Box::pin(self.reconcile_native_mutations(true)).await?;
+
         Ok(())
     }
 
@@ -1813,11 +1819,12 @@ impl Session {
     async fn reconcile_native_mutations(&mut self, allow_navigation: bool) -> Result<()> {
         // DOM edits are now applied live to the RenderDocument by the JS
         // bindings themselves — no mutation log to drain/apply. Only
-        // JS-triggered navigation (location.href / assign / reload) is still
-        // signalled via the mutation channel, because it needs async network I/O.
-        // Take the dirty flag BEFORE the drain: RenderDocument-direct
-        // bindings set it instead of journaling, so ordering doesn't lose
-        // either signal for this eval.
+        // JS-triggered navigation (location.href / assign / reload) and
+        // page-driven effects (form submits, window.open spawns) are still
+        // signalled via the mutation channel, because they need async
+        // network I/O or observer action. Take the dirty flag BEFORE the
+        // drain: RenderDocument-direct bindings set it instead of
+        // journaling, so ordering doesn't lose either signal.
         let dom_dirty = self.js_runtime.take_dom_dirty();
         let drained = self.js_runtime.drain_mutations();
         let had_mutations = !drained.is_empty();
@@ -1844,6 +1851,22 @@ impl Session {
                     if allow_navigation {
                         self.post(&url, &body, &content_type).await?;
                     }
+                }
+                DomMutation::OpenTab { url, target } => {
+                    tracing::debug!(url = %url, target = %target, "page-initiated tab spawn");
+                    // Core cannot create the session (a Session holds no
+                    // Browser handle): emit the request to the attached
+                    // observer, which owns session creation. See
+                    // `CoreEvent::TabSpawned`.
+                    let resolved = match self.current_url() {
+                        Some(base) => base.join(&url).map(|u| u.to_string()).unwrap_or(url),
+                        None => url,
+                    };
+                    self.emit_core_event(crate::js::CoreEvent::TabSpawned {
+                        url: resolved,
+                        target,
+                        source_session_id: self.id.to_string(),
+                    });
                 }
                 _ => {} // DOM edits handled directly on the RenderDocument.
             }
