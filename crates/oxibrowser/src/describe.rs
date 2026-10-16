@@ -22,7 +22,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                 "args": ["script"]
             },
             "session": {
-                "commands": ["new","goto","back","forward","reload","click","fill","press","type","select","check","uncheck","scroll","eval","extract","content","screenshot","wait","save-state","load-state","close","list","help","exit"]
+                "commands": ["new","goto","back","forward","reload","observe","click","fill","press","type","select","check","uncheck","scroll","eval","extract","content","screenshot","wait","save-state","load-state","close","list","help","exit"],
             },
             "serve": {
                 "flags": ["host","port","cookie-file","allow-private-ips","proxy","auth-token","mcp","account","ref","as-agent","ghost","ghost-control-fd","ghost-task"]

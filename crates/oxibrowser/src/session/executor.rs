@@ -774,6 +774,27 @@ async fn execute_inner(
             Ok((data, Some(tab_id)))
         }
 
+        // ---- Observe (agent plane M0) ----
+        SessionCommand::Observe {
+            tab_id,
+            budget_tokens,
+            max_actionable,
+        } => {
+            let tab = get_tab(manager, &tab_id)?;
+            let result = crate::agent::obs::observe(
+                &tab,
+                &crate::agent::obs::ObsOpts {
+                    budget_tokens,
+                    max_actionable,
+                },
+            )
+            .await
+            .map_err(|e| CliResponse::error(e, "OBSERVE_ERROR"))?;
+            let data = serde_json::to_value(&result)
+                .map_err(|e| CliResponse::error(e.to_string(), "SERIALIZE_ERROR"))?;
+            Ok((data, Some(tab_id)))
+        }
+
         // ---- Screenshot ----
         SessionCommand::Screenshot {
             tab_id,
@@ -915,7 +936,7 @@ async fn execute_inner(
                     "extract <tab_id> [--selector <s>] [--all] [--attrs a,b] [--links] [--title] [--text] [--markdown] [--max-bytes N]",
                     "content <tab_id> [--format markdown|html|text] [--max-bytes N]",
                     "screenshot <tab_id> [-o path] [--width N]",
-                    "wait <tab_id> <selector> [--timeout <ms>]",
+                    "observe <tab_id> [--budget N] [--max-actionable N]",
                     "close <tab_id>",
                     "close --all",
                     "list",

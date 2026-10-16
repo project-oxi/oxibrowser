@@ -96,6 +96,13 @@ pub enum SessionCommand {
         selector: String,
         timeout_ms: Option<u64>,
     },
+    /// Token-budgeted ariaSnapshot observation with actionable refs
+    /// (agent plane M0).
+    Observe {
+        tab_id: String,
+        budget_tokens: Option<u64>,
+        max_actionable: Option<usize>,
+    },
     /// Close a tab.
     Close { tab_id: String },
     /// Close all tabs.
@@ -168,6 +175,8 @@ pub fn parse_session_command(line: &str) -> Result<SessionCommand, String> {
             let tab_id = args.first().ok_or("reload <tab_id>")?.to_string();
             Ok(SessionCommand::Reload { tab_id })
         }
+
+        "observe" => parse_observe(args),
 
         "click" => {
             let (pos, tab_id) = require_tab_id(args, "click <tab_id> <selector>")?;
@@ -390,6 +399,45 @@ fn parse_goto(args: &[&str]) -> Result<SessionCommand, String> {
         url,
         wait_selector,
         timeout_ms,
+    })
+}
+
+fn parse_observe(args: &[&str]) -> Result<SessionCommand, String> {
+    let usage = "observe <tab_id> [--budget N] [--max-actionable N]";
+    let (pos, tab_id) = require_tab_id(args, usage)?;
+
+    let mut budget_tokens: Option<u64> = None;
+    let mut max_actionable: Option<usize> = None;
+    let mut i = 0;
+    while i < pos.len() {
+        match pos[i] {
+            "--budget" => {
+                i += 1;
+                budget_tokens = Some(
+                    pos.get(i)
+                        .ok_or("observe: --budget requires a value")?
+                        .parse::<u64>()
+                        .map_err(|_| "observe: --budget must be a number")?,
+                );
+            }
+            "--max-actionable" => {
+                i += 1;
+                max_actionable = Some(
+                    pos.get(i)
+                        .ok_or("observe: --max-actionable requires a value")?
+                        .parse::<usize>()
+                        .map_err(|_| "observe: --max-actionable must be a number")?,
+                );
+            }
+            other => return Err(format!("observe: unexpected argument: {other}")),
+        }
+        i += 1;
+    }
+
+    Ok(SessionCommand::Observe {
+        tab_id,
+        budget_tokens,
+        max_actionable,
     })
 }
 
@@ -685,6 +733,48 @@ mod tests {
     fn test_parse_state_extra_args() {
         assert!(parse_session_command("save-state a.json b.json").is_err());
         assert!(parse_session_command("load-state a.json b.json").is_err());
+    }
+
+    #[test]
+    fn test_parse_observe_defaults() {
+        let cmd = parse_session_command("observe t1").unwrap();
+        match cmd {
+            SessionCommand::Observe {
+                tab_id,
+                budget_tokens,
+                max_actionable,
+            } => {
+                assert_eq!(tab_id, "t1");
+                assert_eq!(budget_tokens, None);
+                assert_eq!(max_actionable, None);
+            }
+            _ => panic!("expected Observe"),
+        }
+    }
+
+    #[test]
+    fn test_parse_observe_flags() {
+        let cmd = parse_session_command("observe t1 --budget 1500 --max-actionable 8").unwrap();
+        match cmd {
+            SessionCommand::Observe {
+                tab_id,
+                budget_tokens,
+                max_actionable,
+            } => {
+                assert_eq!(tab_id, "t1");
+                assert_eq!(budget_tokens, Some(1500));
+                assert_eq!(max_actionable, Some(8));
+            }
+            _ => panic!("expected Observe"),
+        }
+    }
+
+    #[test]
+    fn test_parse_observe_errors() {
+        assert!(parse_session_command("observe").is_err());
+        assert!(parse_session_command("observe t1 --budget").is_err());
+        assert!(parse_session_command("observe t1 --budget abc").is_err());
+        assert!(parse_session_command("observe t1 --nope 1").is_err());
     }
 
     #[test]

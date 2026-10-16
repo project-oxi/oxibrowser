@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+mod agent;
 mod describe;
 mod mcp;
 mod output;

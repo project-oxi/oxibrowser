@@ -164,6 +164,14 @@ impl Tab {
         self.tab_id
     }
 
+    /// Mutable access to the underlying session, for embedding surfaces
+    /// (agent-plane observation, MCP) that need `Session` APIs beyond the
+    /// `Tab` helpers. Holders must not keep the guard across awaits that do
+    /// not belong to the session.
+    pub async fn lock_session(&self) -> tokio::sync::MutexGuard<'_, Session> {
+        self.inner.lock().await
+    }
+
     /// Emit a `BrowserEvent` if the parent `Browser` wired us up.
     ///
     /// Silently does nothing when the event sink is `None` (e.g. in tests
