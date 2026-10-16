@@ -1,5 +1,10 @@
 # Agent plane 실행 설계 (2026-10-16, 리뷰 반영 v2)
 
+> **상태 (2026-10-17): M0–M5 전 단계 구현 완료** — `feat/agent-m0` 브랜치
+> (e66c3f5 → b165ef6, 10 커밋). 코퍼스 10/10, 최종 행렬: bin 98 단위 ·
+> e2e 18 (loop 5 + repl 10 + obs 3) · core lib 707 · cdp lib 75 · core
+> 통합 25. 실모델 스모크는 `--ignored` 등급으로 대기.
+
 > [2026-10-16-agent-first-browser.md](2026-10-16-agent-first-browser.md)의 단계(P0–P3)를
 > 코드 수준으로 전개한 실행 계획. v2는 2026-10-16 코드 대조 리뷰(치명 2·중간 7·경미 4)
 > 를 반영해 consent 흐름을 3개 메커니즘으로 분리하고, bash를 v1에서 제외하며, 폼
