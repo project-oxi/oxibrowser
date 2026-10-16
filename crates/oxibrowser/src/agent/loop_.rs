@@ -31,6 +31,9 @@ use super::world::World;
 #[derive(Debug, Clone)]
 pub struct LoopConfig {
     pub task: String,
+    /// Task id: persists the transcript under the state dir and enables
+    /// `agent resume <id>` (M4). `None` = ephemeral run.
+    pub task_id: Option<String>,
     pub max_steps: usize,
     pub budget_tokens: u64,
     /// Transcript chars above this trigger compaction (chars ≈ 4×tokens).
@@ -43,6 +46,7 @@ impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             task: String::new(),
+            task_id: None,
             max_steps: 25,
             budget_tokens: 200_000,
             compaction_chars: 80_000,
@@ -122,8 +126,23 @@ pub async fn run(
     consent_prompt: &dyn ConsentPrompt,
     consent: ConsentHandles,
 ) -> LoopOutcome {
+    if let Some(id) = cfg.task_id.as_deref() {
+        save_task_meta(id, &cfg.task);
+    }
     let mut transcript: Vec<ChatMessage> = vec![ChatMessage::system(prompt::SYSTEM_PROMPT)];
-    let mut history: Vec<ChatMessage> = vec![ChatMessage::user(prompt::task_message(&cfg.task))];
+    // Resume: replay the saved turns (the task message is already in
+    // there from the first run); fresh runs start from the task message.
+    let mut history: Vec<ChatMessage> = match cfg.task_id.as_deref() {
+        Some(id) => {
+            let saved = load_history(id);
+            if saved.is_empty() {
+                vec![ChatMessage::user(prompt::task_message(&cfg.task))]
+            } else {
+                saved
+            }
+        }
+        None => vec![ChatMessage::user(prompt::task_message(&cfg.task))],
+    };
     let mut steps = 0usize;
     let mut model_calls = 0usize;
     let mut approx_tokens = prompt::prompt_tokens() as u64;
@@ -172,6 +191,9 @@ pub async fn run(
         }
 
         steps += 1;
+        if let Some(id) = cfg.task_id.as_deref() {
+            append_turn(id, "assistant", &program);
+        }
         history.push(ChatMessage::assistant(program.clone()));
 
         // Blocking eval: parks this task thread for the program duration (same
@@ -189,6 +211,9 @@ pub async fn run(
                             .unwrap_or(result_json.len()),
                     );
                     result_json.push_str("…[truncated]");
+                }
+                if let Some(id) = cfg.task_id.as_deref() {
+                    append_turn(id, "user", &format!("RESULT: {result_json}"));
                 }
                 history.push(ChatMessage::user(format!("RESULT: {result_json}")));
                 if let Some(done) = done {
@@ -366,6 +391,85 @@ async fn compact(
         ))),
     );
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Transcript persistence (M4): `agent resume <id>` replays the saved
+// history and continues the loop from the last observation.
+// ---------------------------------------------------------------------------
+
+fn task_dir(id: &str) -> Option<std::path::PathBuf> {
+    if id.is_empty() {
+        return None;
+    }
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = std::env::var_os("OXIBROWSER_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = std::env::var_os("HOME").unwrap_or_default();
+            std::path::PathBuf::from(home).join(".local/state/oxibrowser")
+        });
+    Some(base.join("tasks").join(safe))
+}
+
+/// Save the task metadata (for resume prompts).
+fn save_task_meta(id: &str, task: &str) {
+    if let Some(dir) = task_dir(id) {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join("task.json"),
+            serde_json::json!({"task": task}).to_string(),
+        );
+    }
+}
+
+/// Load a saved task string.
+pub fn load_task_meta(id: &str) -> Option<String> {
+    let dir = task_dir(id)?;
+    let text = std::fs::read_to_string(dir.join("task.json")).ok()?;
+    serde_json::from_str::<Value>(&text).ok()?["task"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Append one transcript turn.
+fn append_turn(id: &str, role: &str, content: &str) {
+    let Some(dir) = task_dir(id) else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("transcript.jsonl"))
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            f,
+            "{}",
+            serde_json::json!({"role": role, "content": content})
+        );
+    }
+}
+
+/// Load a saved transcript as loop history (resume).
+pub fn load_history(id: &str) -> Vec<ChatMessage> {
+    let Some(dir) = task_dir(id) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join("transcript.jsonl")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<ChatMessage>(l).ok())
+        .collect()
 }
 
 #[cfg(test)]

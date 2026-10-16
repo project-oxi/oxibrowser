@@ -29,18 +29,55 @@ pub enum AgentCommand {
         #[arg(long, default_value_t = 200_000)]
         budget_tokens: u64,
     },
+    /// Resume a saved task run by id: the transcript is replayed and the
+    /// loop continues from where it stopped.
+    Resume {
+        task_id: String,
+        #[arg(long, default_value_t = 25)]
+        max_steps: usize,
+        #[arg(long, default_value_t = 200_000)]
+        budget_tokens: u64,
+    },
 }
 
 /// Entry point for `oxibrowser agent …`.
 pub async fn run_agent(command: AgentCommand) -> i32 {
-    let AgentCommand::Run {
-        task,
-        account,
-        allow_private_ips,
-        ref_tag,
-        max_steps,
-        budget_tokens,
-    } = command;
+    let (task, account, allow_private_ips, ref_tag, max_steps, budget_tokens, task_id) =
+        match command {
+            AgentCommand::Run {
+                task,
+                account,
+                allow_private_ips,
+                ref_tag,
+                max_steps,
+                budget_tokens,
+            } => (
+                task,
+                account,
+                allow_private_ips,
+                ref_tag,
+                max_steps,
+                budget_tokens,
+                format!(
+                    "t-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0)
+                ),
+            ),
+            AgentCommand::Resume {
+                task_id,
+                max_steps,
+                budget_tokens,
+            } => {
+                let Some(task) = super::loop_::load_task_meta(&task_id) else {
+                    eprintln!("no saved task {task_id:?}");
+                    return 1;
+                };
+                (task, None, true, None, max_steps, budget_tokens, task_id)
+            }
+        };
 
     let provider = match provider_from_env() {
         Ok(p) => p,
@@ -77,6 +114,7 @@ pub async fn run_agent(command: AgentCommand) -> i32 {
 
     let cfg = LoopConfig {
         task,
+        task_id: Some(task_id.clone()),
         max_steps,
         budget_tokens,
         ..LoopConfig::default()
@@ -121,6 +159,7 @@ pub async fn run_agent(command: AgentCommand) -> i32 {
         }),
     };
     let _ = setup.shutdown().await;
+    eprintln!("task id: {task_id}");
     println!("{}", serde_json::to_string(&result).unwrap_or_default());
     if result["ok"].as_bool().unwrap_or(false) {
         0

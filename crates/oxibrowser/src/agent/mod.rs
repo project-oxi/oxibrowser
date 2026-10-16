@@ -16,4 +16,5 @@ pub mod model;
 pub mod obs;
 pub mod prompt;
 pub mod repl;
+pub mod site;
 pub mod world;

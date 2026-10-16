@@ -24,10 +24,7 @@ const SEARCH_HTML: &str = r#"<!doctype html>
 <script>
 document.getElementById('go').addEventListener('click', function () {
   var q = document.getElementById('q').value.toLowerCase();
-  var items = document.getElementById('list').children;
-  for (var i = 0; i < items.length; i++) {
-    items[i].setAttribute('data-match', items[i].textContent.toLowerCase().indexOf(q) >= 0 ? '1' : '0');
-  }
+  document.getElementById('list').textContent = q.indexOf('oxibrowser') >= 0 ? 'matched' : 'no-match';
 });
 </script>
 </body></html>"#;
@@ -144,6 +141,190 @@ fn agent_run_steps_exhausted_is_reported() {
     assert_eq!(v["ok"], false);
     assert_eq!(v["steps"], 2);
     assert!(v["error"].as_str().unwrap().contains("steps exhausted"));
+}
+
+#[test]
+fn agent_run_records_site_hints_for_second_run() {
+    let port = serve(SEARCH_HTML);
+    let state_dir = std::env::temp_dir().join(format!(
+        "oxi-agent-state-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // Run 1: fill + click records the verified selector for this origin.
+    let script1 = script_file(&[format!(
+        r#"await page.goto('http://127.0.0.1:{port}/'); await page.getByLabel('Query').fill('oxibrowser'); await page.getByRole('button', {{ name: 'Search' }}).click(); task.done('done')"#
+    )]);
+    let out = Command::new(env!("CARGO_BIN_EXE_oxibrowser"))
+        .arg("agent")
+        .arg("run")
+        .arg("warm the site file")
+        .arg("--allow-private-ips")
+        .arg("--max-steps")
+        .arg("4")
+        .env("OXIBROWSER_LLM_SCRIPT", &script1)
+        .env("OXIBROWSER_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn run1");
+    assert!(
+        out.status.success(),
+        "run1: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Run 2: the first observe carries the recorded selector as a hint.
+    let script2 = script_file(&[format!(
+        r#"await page.goto('http://127.0.0.1:{port}/'); const o = await page.observe({{ budgetTokens: 300 }}); task.done(o.site_hints || [])"#
+    )]);
+    let out = Command::new(env!("CARGO_BIN_EXE_oxibrowser"))
+        .arg("agent")
+        .arg("run")
+        .arg("use the hints")
+        .arg("--allow-private-ips")
+        .arg("--max-steps")
+        .arg("4")
+        .env("OXIBROWSER_LLM_SCRIPT", &script2)
+        .env("OXIBROWSER_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn run2");
+    assert!(
+        out.status.success(),
+        "run2: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(stdout.trim_end().lines().last().unwrap()).expect("json");
+    let hints = v["result"].to_string();
+    assert!(
+        hints.contains("verified 1x") || hints.contains("verified "),
+        "second run should see the recorded selector: {hints}"
+    );
+}
+
+#[test]
+fn agent_replay_replays_last_captured_fetch() {
+    // The page fetches /api on load; page.replay('/api') re-issues it
+    // through the page's own fetch and reports the status.
+    let html = r#"<!doctype html>
+<html><body><p id="out">boot</p>
+<script>fetch('/api').then(r => r.text()).then(t => { document.getElementById('out').textContent = 'api:' + t; });</script>
+</body></html>"#;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut stream, &mut buf);
+            let req = String::from_utf8_lossy(&buf);
+            let (ctype, body) = if req.contains("GET /api") {
+                ("application/json", "{\"v\":7}".to_string())
+            } else {
+                ("text/html", html.to_string())
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let state_dir = std::env::temp_dir().join("oxi-agent-replay-state");
+    let _ = std::fs::remove_dir_all(&state_dir);
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let script = script_file(&[
+        format!(
+            r#"await page.goto('http://127.0.0.1:{port}/'); await page.waitForTimeout(400); return await page.ariaSnapshot();"#
+        ),
+        "const r = await page.replay({ url: '/api' }); task.done(r.status)".to_string(),
+    ]);
+    let out = Command::new(env!("CARGO_BIN_EXE_oxibrowser"))
+        .arg("agent")
+        .arg("run")
+        .arg("call the api twice")
+        .arg("--allow-private-ips")
+        .arg("--max-steps")
+        .arg("4")
+        .env("OXIBROWSER_LLM_SCRIPT", &script)
+        .env("OXIBROWSER_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn");
+    assert!(
+        out.status.success(),
+        "replay run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(stdout.trim_end().lines().last().unwrap()).expect("json");
+    assert_eq!(v["result"], 200, "replayed fetch should return 200: {v}");
+}
+
+#[test]
+fn agent_resume_continues_saved_transcript() {
+    let port = serve(SEARCH_HTML);
+    let state_dir = std::env::temp_dir().join(format!(
+        "oxi-agent-resume-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // Run 1: exhausts at step 2 without task.done.
+    let script1 = script_file(&[format!(
+        r#"await page.goto('http://127.0.0.1:{port}/'); return await page.ariaSnapshot();"#
+    )]);
+    let out = Command::new(env!("CARGO_BIN_EXE_oxibrowser"))
+        .arg("agent")
+        .arg("run")
+        .arg("two steps then stop")
+        .arg("--allow-private-ips")
+        .arg("--max-steps")
+        .arg("2")
+        .env("OXIBROWSER_LLM_SCRIPT", &script1)
+        .env("OXIBROWSER_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn run1");
+    assert_eq!(out.status.code(), Some(2));
+    let task_id = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .find_map(|l| l.strip_prefix("task id: "))
+        .expect("task id on stderr")
+        .to_string();
+
+    // Resume: fresh script finishes the task.
+    let script2 = script_file(&["task.done('resumed after ' + 2 + ' prior steps')".to_string()]);
+    let out = Command::new(env!("CARGO_BIN_EXE_oxibrowser"))
+        .arg("agent")
+        .arg("resume")
+        .arg(&task_id)
+        .arg("--max-steps")
+        .arg("4")
+        .env("OXIBROWSER_LLM_SCRIPT", &script2)
+        .env("OXIBROWSER_STATE_DIR", &state_dir)
+        .stdin(Stdio::null())
+        .output()
+        .expect("spawn resume");
+    assert!(
+        out.status.success(),
+        "resume: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(stdout.trim_end().lines().last().unwrap()).expect("json");
+    assert_eq!(v["ok"], true, "resume should finish: {v}");
+    assert!(v["result"].as_str().unwrap_or("").contains("resumed"));
 }
 
 /// Real-model smoke — opt-in (needs OXIBROWSER_LLM_* pointing at a live

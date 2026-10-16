@@ -77,6 +77,11 @@ pub enum WorldCmd {
         account_id: String,
         resp: Reply,
     },
+    Replay {
+        /// Substring match on the captured URL (empty = most recent).
+        url: String,
+        resp: Reply,
+    },
 }
 
 /// Locator action kinds.
@@ -99,6 +104,13 @@ pub struct ReplHost {
     /// Pre-cloned dialog gate: resolution never needs the session lock
     /// (a blocking `alert()` holds the write lock).
     pub dialog_gate: oxibrowser_core::js::DialogGate,
+}
+
+/// scheme://host[:port] of a URL string, when parseable.
+fn origin_of(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .map(|u| u.origin().ascii_serialization())
 }
 
 fn gate_err(e: GateError) -> Value {
@@ -125,6 +137,10 @@ impl ReplHost {
                     resp,
                 } => {
                     let mut guard = self.session.write().await;
+                    let url_now = guard
+                        .current_url()
+                        .map(|u| u.to_string())
+                        .unwrap_or_default();
                     let res = obs::observe_session(
                         &mut guard,
                         &ObsOpts {
@@ -136,6 +152,15 @@ impl ReplHost {
                     .map_err(|e| err("OBSERVE_ERROR", e))
                     .and_then(|r| {
                         serde_json::to_value(r).map_err(|e| err("SERIALIZE_ERROR", e.to_string()))
+                    })
+                    .map(|mut v| {
+                        if let Some(origin) = origin_of(&url_now) {
+                            let hints = super::site::hints(&origin);
+                            if !hints.is_empty() {
+                                v["site_hints"] = serde_json::json!(hints);
+                            }
+                        }
+                        v
                     });
                     drop(guard);
                     (res, resp)
@@ -179,6 +204,7 @@ impl ReplHost {
                     (Ok(json!({"resolved": true})), resp)
                 }
                 WorldCmd::Login { account_id, resp } => (self.login(&account_id).await, resp),
+                WorldCmd::Replay { url, resp } => (self.replay(&url).await, resp),
             };
             let _ = resp.send(result);
         }
@@ -280,6 +306,9 @@ impl ReplHost {
                     &self.events,
                 )
                 .await?;
+                if let Some(origin) = origin_of(&url) {
+                    super::site::record_selector(&origin, &el.selector);
+                }
                 Ok(json!({
                     "acted": true, "ref": r#ref, "generation": generation,
                     "callbacks": receipt.callbacks,
@@ -345,6 +374,73 @@ impl ReplHost {
                  the page may be busy; re-observe and retry",
             )),
         }
+    }
+
+    /// `page.replay({ url })` — replay the last captured network request
+    /// matching `url` through the page's own `fetch` (same session, same
+    /// cookies, same fingerprint — the site cannot tell it apart).
+    async fn replay(&self, url_sub: &str) -> Result<Value, HostError> {
+        let mut guard = self.session.write().await;
+        let log = guard.network_log_snapshot();
+        let entry = log
+            .iter()
+            .rev()
+            .find(|r| {
+                r.resource_type != "Document" && url_sub.is_empty()
+                    || r.url.contains(url_sub) && !r.url.contains("data:")
+            })
+            .ok_or_else(|| {
+                err(
+                    "REPLAY_TARGET_NOT_FOUND",
+                    format!("no captured request matches {url_sub:?} — navigate/interact first"),
+                )
+            })?;
+        let (url, method, headers, body) = (
+            entry.url.clone(),
+            entry.method.clone(),
+            entry.request_headers.clone(),
+            entry.post_body.clone(),
+        );
+        let header_json = serde_json::to_string(
+            &headers
+                .iter()
+                .map(|(k, v)| (k, v))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap_or_else(|_| "{}".into());
+        let body_json = serde_json::to_string(
+            &body
+                .as_deref()
+                .map(String::from_utf8_lossy)
+                .unwrap_or_default(),
+        )
+        .unwrap_or_else(|_| "null".into());
+        let js = format!(
+            r#"(async () => {{
+                const r = await fetch({url:?}, {{
+                    method: {method:?},
+                    headers: {header_json},
+                    body: {method:?} === 'GET' || {method:?} === 'HEAD' ? undefined : {body_json},
+                }});
+                const text = await r.text();
+                return JSON.stringify({{ status: r.status, body: text.slice(0, 4000) }});
+            }})()"#,
+            url = url,
+            method = method,
+        );
+        let result = guard
+            .evaluate_js_with_await(&js, true)
+            .await
+            .map_err(|e| err("REPLAY_FAILED", e.to_string()))?;
+        let payload = result
+            .value
+            .and_then(|v| v.as_str().map(str::to_string))
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(json!({"status": 0, "body": ""}));
+        if let Some(origin) = origin_of(&url) {
+            super::site::record_endpoint(&origin, &format!("{method} {url}"));
+        }
+        Ok(payload)
     }
 
     /// `page.login(account)` — agent-driven login inside the account's
@@ -712,6 +808,7 @@ mod tests {
             crate::agent::events::EventHub::attach(browser.clone(), context.clone(), &mut guard)
         };
         ReplHost {
+            browser: browser.clone(),
             context,
             surface,
             session,

@@ -206,8 +206,8 @@ mod tests {
             .block_on(f)
     }
 
-    #[tokio::test]
-    async fn scripted_provider_replays_in_order_and_repeats_last() {
+    #[test]
+    fn scripted_provider_replays_in_order_and_repeats_last() {
         let p = ScriptedProvider::new(vec!["one".into(), "two".into()]);
         let req = ChatRequest {
             messages: vec![ChatMessage::user("hi")],
