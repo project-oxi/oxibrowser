@@ -1835,6 +1835,16 @@ impl Session {
                         self.reload().await?;
                     }
                 }
+                DomMutation::NavigatePost {
+                    url,
+                    body,
+                    content_type,
+                } => {
+                    tracing::debug!(url = %url, "JS-triggered POST navigation");
+                    if allow_navigation {
+                        self.post(&url, &body, &content_type).await?;
+                    }
+                }
                 _ => {} // DOM edits handled directly on the RenderDocument.
             }
         }

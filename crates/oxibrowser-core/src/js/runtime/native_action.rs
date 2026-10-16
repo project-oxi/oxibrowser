@@ -47,7 +47,14 @@ impl NativeObservation {
 #[derive(Debug, Clone)]
 pub enum NativeInput {
     Click,
+    /// Literal text fill. Password controls are denied — only the
+    /// broker-resolved [`NativeInput::FillCredential`] may fill those.
     Fill(String),
+    /// Broker-authorized credential fill (`OXI.fillCredential` / the REPL
+    /// host): the caller resolved the value through the credential broker
+    /// (policy + consent + audit) before constructing this input. May fill
+    /// `input[type=password]`; the value never transits page JS.
+    FillCredential(String),
 }
 
 #[derive(Debug, Clone)]
@@ -127,10 +134,12 @@ pub(super) fn observe(doc: &mut RenderDocument, document_id: u64, url: &str) -> 
 }
 
 pub(super) fn pending_navigation(mutations: &Arc<RwLock<Vec<DomMutation>>>) -> bool {
-    mutations
-        .read()
-        .iter()
-        .any(|m| matches!(m, DomMutation::Navigate { .. } | DomMutation::Reload))
+    mutations.read().iter().any(|m| {
+        matches!(
+            m,
+            DomMutation::Navigate { .. } | DomMutation::NavigatePost { .. } | DomMutation::Reload
+        )
+    })
 }
 
 /// A bounded pump for the native path. Does not use page eval or inspect thenables.
@@ -249,7 +258,7 @@ fn event(
     let cancel = prevented.clone();
     function(ctx, &obj, "preventDefault", unsafe {
         NativeFunction::from_closure(move |_, _, _| {
-            if kind == "click" {
+            if kind == "click" || kind == "submit" {
                 cancel.set(true);
             }
             Ok(JsValue::undefined())
@@ -273,6 +282,7 @@ fn deliver(
     target: &NativeTarget,
     kind: &'static str,
     callbacks: &mut usize,
+    prevented: &Rc<Cell<bool>>,
 ) -> std::result::Result<(), Failure> {
     let route = {
         let mut cell = render_doc.borrow_mut();
@@ -297,7 +307,6 @@ fn deliver(
     };
     let stopped = Rc::new(Cell::new(false));
     let immediate = Rc::new(Cell::new(false));
-    let prevented = Rc::new(Cell::new(false));
     for (node, token, attachment) in route {
         if stopped.get() || pending_navigation(mutations) {
             break;
@@ -357,6 +366,7 @@ pub(super) fn act(
     document_id: u64,
     target: &NativeTarget,
     input: NativeInput,
+    page_url: &str,
 ) -> std::result::Result<NativeReceipt, Failure> {
     if pending_navigation(mutations) {
         return Err(stale());
@@ -391,7 +401,9 @@ pub(super) fn act(
             .unwrap_or_default()
             .to_ascii_lowercase();
         if doc.node_attr(id, "disabled").is_some()
-            || matches!(ty.as_str(), "password" | "file" | "hidden")
+            || matches!(ty.as_str(), "file" | "hidden")
+            || (ty == "password" && !matches!(input, NativeInput::FillCredential(_)))
+            || (ty != "password" && matches!(input, NativeInput::FillCredential(_)))
         {
             return Err(failed("NATIVE_CONTROL_DENIED", false));
         }
@@ -416,20 +428,111 @@ pub(super) fn act(
                 return Err(failed("TARGET_NOT_FILLABLE", false));
             }
         }
+        if let NativeInput::FillCredential(value) = &input {
+            // The target check above already pinned this to input[type=password].
+            if doc.node_attr(id, "readonly").is_some() {
+                return Err(failed("TARGET_NOT_FILLABLE", false));
+            }
+            doc.set_attribute(id, "value", value);
+        }
     }
     dirty.store(true, Ordering::Relaxed);
     let mut callbacks = 0;
+    let prevented = Rc::new(Cell::new(false));
     match input {
-        NativeInput::Click => deliver(
-            ctx,
-            render_doc,
-            dirty,
-            mutations,
-            target,
-            "click",
-            &mut callbacks,
-        )?,
-        NativeInput::Fill(_) => {
+        NativeInput::Click => {
+            deliver(
+                ctx,
+                render_doc,
+                dirty,
+                mutations,
+                target,
+                "click",
+                &mut callbacks,
+                &prevented,
+            )?;
+            // Click default action: a submit control activates its owner form
+            // unless a listener called preventDefault (on click or on the
+            // synthetic submit event).
+            if !prevented.get()
+                && let Ok(page) = url::Url::parse(page_url)
+            {
+                let form_info = {
+                    let mut cell = render_doc.borrow_mut();
+                    match cell.as_mut() {
+                        Some(doc) => {
+                            let snapshot = DomSnapshot::from_render_document(doc, "", "");
+                            snapshot.nodes.get(&target.node_id).and_then(|n| {
+                                let ty = n.attributes.get("type").map(|x| x.as_str()).unwrap_or("");
+                                if crate::js::form_activation::is_submit_control(&n.tag, ty) {
+                                    crate::js::form_activation::nearest_form(
+                                        &snapshot,
+                                        target.node_id,
+                                    )
+                                    .map(|form_id| {
+                                        (
+                                            form_id,
+                                            doc.node_incarnation(form_id as usize)
+                                                .unwrap_or_default(),
+                                            doc.node_attachment_revision(form_id as usize),
+                                        )
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                        }
+                        None => None,
+                    }
+                };
+                if let Some((form_id, form_token, _form_attachment)) = form_info {
+                    let submit_prevented = Rc::new(Cell::new(false));
+                    let handlers = registry_get_native(form_id, form_token, "submit");
+                    if !handlers.is_empty() {
+                        let stopped = Rc::new(Cell::new(false));
+                        let immediate = Rc::new(Cell::new(false));
+                        let (event, this) = event(
+                            ctx,
+                            render_doc,
+                            dirty,
+                            form_id as usize,
+                            form_id as usize,
+                            "submit",
+                            &stopped,
+                            &immediate,
+                            &submit_prevented,
+                        );
+                        for callback in handlers {
+                            if immediate.get() {
+                                break;
+                            }
+                            if callback.call(&this, &[event.clone().into()], ctx).is_err() {
+                                return Err(failed("NATIVE_LISTENER_ERROR", true));
+                            }
+                        }
+                    }
+                    if !submit_prevented.get() {
+                        let mutation = {
+                            let mut cell = render_doc.borrow_mut();
+                            match cell.as_mut() {
+                                Some(doc) => {
+                                    let snapshot =
+                                        DomSnapshot::from_render_document_unmasked(doc, "", "");
+                                    crate::js::form_activation::submit_mutation(
+                                        &snapshot, form_id, &page,
+                                    )
+                                }
+                                None => None,
+                            }
+                        };
+                        if let Some(m) = mutation {
+                            mutations.write().push(m);
+                        }
+                    }
+                }
+            }
+        }
+        NativeInput::Fill(_) | NativeInput::FillCredential(_) => {
             deliver(
                 ctx,
                 render_doc,
@@ -438,6 +541,7 @@ pub(super) fn act(
                 target,
                 "input",
                 &mut callbacks,
+                &prevented,
             )?;
             if pending_navigation(mutations) {
                 return Err(failed("NATIVE_NAVIGATION_DURING_FILL", true));
@@ -463,6 +567,7 @@ pub(super) fn act(
                 target,
                 "change",
                 &mut callbacks,
+                &prevented,
             )?;
         }
     }

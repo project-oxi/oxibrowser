@@ -42,10 +42,12 @@ use serde_json::Value;
 use crate::css::LayoutEngine;
 use crate::error::{CoreError, Result};
 use crate::js::dom_snapshot::{DomMutation, DomNode, DomSnapshot, ScriptSource};
+use crate::js::form_activation;
 use crate::js::job_queue::TokioJobQueue;
 use crate::network::cookie::CookieJar;
 use crate::network::ws::{WsData, WsEvent};
 use oxibrowser_render::{CaptureOpts, RenderDocument, RenderError, Viewport};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -2350,6 +2352,7 @@ fn js_thread_loop(
                         native_document_id,
                         &target,
                         input,
+                        &current_page_url,
                     )?;
                     native_action::pump(&mut ctx, &job_queue)?;
                     r.navigation_requested = native_action::pending_navigation(&mutations);
@@ -6716,6 +6719,8 @@ fn create_render_element_object(
     };
 
     let dispatch_fn = unsafe {
+        let rd_disp = render_doc.clone();
+        let dirty_disp = dom_dirty.clone();
         NativeFunction::from_closure(move |_this, args, ctx| {
             let event = args.first().cloned().unwrap_or(JsValue::undefined());
             let event_type = event
@@ -6726,6 +6731,55 @@ fn create_render_element_object(
             if !event_type.is_empty() {
                 for cb in registry_get(node_id as u32, &event_type) {
                     let _ = cb.call(&JsValue::undefined(), std::slice::from_ref(&event), ctx);
+                }
+            }
+            // Click default action: a submit control activates its owner form
+            // unless a listener called preventDefault (on click or on the
+            // synthetic submit event).
+            let prevented = event
+                .as_object()
+                .and_then(|o| {
+                    o.get(js_string!("defaultPrevented"), ctx)
+                        .ok()
+                        .and_then(|v| v.as_boolean())
+                })
+                .unwrap_or(false);
+            if event_type == "click"
+                && !prevented
+                && let Some(page_url) = form_activation::page_url_from_ctx(ctx)
+            {
+                let form_id = {
+                    let cell = rd_disp.borrow();
+                    match cell.as_ref() {
+                        Some(doc) => {
+                            let snap = DomSnapshot::from_render_document(doc, "", "");
+                            snap.nodes.get(&(node_id as u32)).and_then(|n| {
+                                let ty = n.attributes.get("type").map(|x| x.as_str()).unwrap_or("");
+                                if form_activation::is_submit_control(&n.tag, ty) {
+                                    form_activation::nearest_form(&snap, node_id as u32)
+                                } else {
+                                    None
+                                }
+                            })
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(form_id) = form_id {
+                    let this_value = create_render_element_object(
+                        ctx,
+                        rd_disp.clone(),
+                        form_id as usize,
+                        dirty_disp.clone(),
+                    );
+                    if !run_submit_event(ctx, this_value, form_id) {
+                        if let Ok(v) = ctx.global_object().get(js_string!("__oxiFormSubmit"), ctx)
+                            && let Some(fobj) = v.as_object()
+                        {
+                            let _ =
+                                fobj.call(&JsValue::undefined(), &[JsValue::from(form_id)], ctx);
+                        }
+                    }
                 }
             }
             Ok(JsValue::from(true))
@@ -6879,6 +6933,30 @@ fn create_render_element_object(
         .function(make_noop(), js_string!("focus"), 0)
         .function(make_noop(), js_string!("blur"), 0)
         .function(make_noop(), js_string!("scrollIntoView"), 0)
+        .function(
+            {
+                let submit_node = node_id;
+                unsafe {
+                    NativeFunction::from_closure(move |_this, _args, ctx| {
+                        // Delegate to the host-side form activation global
+                        // (`__oxiFormSubmit`), which serializes the owner form
+                        // and journals the navigation.
+                        if let Ok(v) = ctx.global_object().get(js_string!("__oxiFormSubmit"), ctx)
+                            && let Some(fobj) = v.as_object()
+                        {
+                            let _ = fobj.call(
+                                &JsValue::undefined(),
+                                &[JsValue::from(submit_node as u32)],
+                                ctx,
+                            );
+                        }
+                        Ok(JsValue::undefined())
+                    })
+                }
+            },
+            js_string!("submit"),
+            0,
+        )
         .accessor(
             js_string!("style"),
             Some(style_getter_fn),
@@ -8027,6 +8105,43 @@ fn register_document_object(
     let _ = ctx.register_global_property(js_string!("document"), document_obj, Attribute::all());
 }
 
+/// Dispatch a synthetic `submit` event with `this_value` as the form element
+/// and run all registered listeners. Returns `true` when a listener called
+/// `preventDefault` (the form submission must then be suppressed).
+fn run_submit_event(ctx: &mut Context, this_value: JsValue, form_node_id: u32) -> bool {
+    let prevented = Rc::new(Cell::new(false));
+    let event_obj = boa_engine::object::ObjectInitializer::new(ctx)
+        .property(
+            js_string!("type"),
+            JsValue::from(JsString::from("submit")),
+            Attribute::all(),
+        )
+        .property(js_string!("bubbles"), JsValue::from(true), Attribute::all())
+        .property(
+            js_string!("cancelable"),
+            JsValue::from(true),
+            Attribute::all(),
+        )
+        .function(
+            {
+                let prevented = prevented.clone();
+                unsafe {
+                    NativeFunction::from_closure(move |_, _, _| {
+                        prevented.set(true);
+                        Ok(JsValue::undefined())
+                    })
+                }
+            },
+            js_string!("preventDefault"),
+            0,
+        )
+        .build();
+    for callback in registry_get(form_node_id, "submit") {
+        let _ = callback.call(&this_value, &[event_obj.clone().into()], ctx);
+    }
+    prevented.get()
+}
+
 /// Create a JS element object from a DomNode.
 fn create_element_object(
     snapshot: &DomSnapshot,
@@ -8188,6 +8303,7 @@ fn create_element_object(
     // dispatchEvent — calls all registered callbacks for the event type
     let node_id_disp = node.id;
     let snap_disp = dom_snapshot_arc.clone();
+    let disp_mut = mutations.clone();
     let dispatch_event_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let event = args.first().cloned().unwrap_or(JsValue::undefined());
@@ -8319,6 +8435,52 @@ fn create_element_object(
                 .ok()
                 .and_then(|v| v.as_boolean())
                 .unwrap_or(false);
+
+            // Click default action: a submit control activates its owner form
+            // unless preventDefault was called (on click or on the synthetic
+            // submit event).
+            if event_type == "click"
+                && !prevented
+                && let Some(page_url) = form_activation::page_url_from_ctx(ctx)
+            {
+                let target_form = {
+                    let snap = snap_disp.read();
+                    match &*snap {
+                        Some(s) => s
+                            .nodes
+                            .get(&node_id_disp)
+                            .filter(|n| {
+                                let ty = n.attributes.get("type").map(|x| x.as_str()).unwrap_or("");
+                                form_activation::is_submit_control(&n.tag, ty)
+                            })
+                            .and_then(|_| form_activation::nearest_form(s, node_id_disp)),
+                        None => None,
+                    }
+                };
+                if let Some(form_id) = target_form {
+                    let this_value = {
+                        let snap = snap_disp.read();
+                        match &*snap {
+                            Some(s) => match s.nodes.get(&form_id) {
+                                Some(n) => create_element_object(s, n, ctx, &disp_mut, &snap_disp),
+                                None => JsValue::undefined(),
+                            },
+                            None => JsValue::undefined(),
+                        }
+                    };
+                    if !run_submit_event(ctx, this_value, form_id)
+                        && let Some(mutation) = {
+                            let snap = snap_disp.read();
+                            match &*snap {
+                                Some(s) => form_activation::submit_mutation(s, form_id, &page_url),
+                                None => None,
+                            }
+                        }
+                    {
+                        disp_mut.write().push(mutation);
+                    }
+                }
+            }
 
             Ok(JsValue::from(!prevented))
         })
@@ -9202,8 +9364,23 @@ fn create_element_object(
         unsafe { NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::undefined())) };
     let blur_fn =
         unsafe { NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::undefined())) };
-    let submit_fn =
-        unsafe { NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::undefined())) };
+    let submit_dom = dom_snapshot_arc.clone();
+    let submit_mutations = mutations.clone();
+    let submit_node_id = node.id;
+    let submit_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            if let Some(page_url) = form_activation::page_url_from_ctx(ctx) {
+                let snap = submit_dom.read();
+                if let Some(s) = &*snap
+                    && let Some(m) =
+                        form_activation::form_submit_mutation(s, submit_node_id, &page_url)
+                {
+                    submit_mutations.write().push(m);
+                }
+            }
+            Ok(JsValue::undefined())
+        })
+    };
 
     // value getter
     // value getter — reads from live snapshot (reflects value setter)
@@ -11135,6 +11312,50 @@ fn register_window_globals(
         JsValue::from(prefer_dark),
         Attribute::all(),
     );
+    // Full document URL for host closures that need relative-URL resolution
+    // (form activation). Registered before the history/location bootstrap.
+    let _ = ctx.register_global_property(
+        js_string!("__oxiPageUrl"),
+        JsValue::from(JsString::from(page_url)),
+        Attribute::all(),
+    );
+    // Host-side form activation: serializes the form owning `nodeId` from the
+    // live RenderDocument and journals the resulting navigation (`Navigate`
+    // for GET, `NavigatePost` for POST). Called by the render-element
+    // `form.submit()` binding and by the click default action.
+    {
+        let fs_rd = render_doc_cell.clone();
+        let fs_mut = mutations.clone();
+        let fs_url = url_owned.clone();
+        let form_submit_global = unsafe {
+            NativeFunction::from_closure(move |_this, args, _ctx| {
+                let node_id = args
+                    .first()
+                    .and_then(|v| v.as_number())
+                    .map(|n| n as u32)
+                    .unwrap_or(0);
+                if node_id != 0
+                    && let Ok(page) = url::Url::parse(&fs_url)
+                {
+                    let mutation = {
+                        let cell = fs_rd.borrow_mut();
+                        match cell.as_ref() {
+                            Some(doc) => {
+                                let snap = DomSnapshot::from_render_document_unmasked(doc, "", "");
+                                form_activation::form_submit_mutation(&snap, node_id, &page)
+                            }
+                            None => None,
+                        }
+                    };
+                    if let Some(m) = mutation {
+                        fs_mut.write().push(m);
+                    }
+                }
+                Ok(JsValue::undefined())
+            })
+        };
+        let _ = ctx.register_global_callable(js_string!("__oxiFormSubmit"), 1, form_submit_global);
+    }
     let bootstrap = HISTORY_LOCATION_BOOTSTRAP.replace("/*PAGE_URL*/", &page_url_json);
     if let Err(e) = ctx.eval(Source::from_bytes(&bootstrap)) {
         tracing::warn!(error = %e, "history/location bootstrap failed");

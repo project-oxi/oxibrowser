@@ -149,6 +149,13 @@ pub enum DomMutation {
     Navigate { url: String },
     /// Page reload triggered from JS (`location.reload`).
     Reload,
+    /// POST navigation triggered from JS (`form.submit()` / submit-control
+    /// default action). Handled by `Session::post` like `Navigate`.
+    NavigatePost {
+        url: String,
+        body: String,
+        content_type: String,
+    },
 }
 
 /// Serializable DOM node.
@@ -329,6 +336,28 @@ impl DomSnapshot {
         url: &str,
         title: &str,
     ) -> Self {
+        Self::build_from_render(rd, url, title, true)
+    }
+
+    /// Like [`Self::from_render_document`] but without password-value masking.
+    ///
+    /// INTERNAL ONLY: for form-activation serialization, where the submitted
+    /// body must carry the live (real) field values. The resulting snapshot
+    /// must never be exposed to JS or observation surfaces.
+    pub fn from_render_document_unmasked(
+        rd: &oxibrowser_render::RenderDocument,
+        url: &str,
+        title: &str,
+    ) -> Self {
+        Self::build_from_render(rd, url, title, false)
+    }
+
+    fn build_from_render(
+        rd: &oxibrowser_render::RenderDocument,
+        url: &str,
+        title: &str,
+        mask_passwords: bool,
+    ) -> Self {
         use oxibrowser_render::BaseDocument;
         let doc: &BaseDocument = rd.document();
         let mut nodes: HashMap<u32, DomNode> = HashMap::new();
@@ -359,7 +388,9 @@ impl DomSnapshot {
         // reader (OXI.getInteractiveElements, HTML serialization, extract).
         // Fill uses selectors + explicit values and never reads the snapshot,
         // so masking here is observation-only.
-        mask_password_inputs(&mut nodes);
+        if mask_passwords {
+            mask_password_inputs(&mut nodes);
+        }
 
         let (id_index, class_index, tag_index) = build_indices(&nodes, &order);
         Self {
