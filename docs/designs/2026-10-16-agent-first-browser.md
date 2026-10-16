@@ -190,6 +190,8 @@ Aside 테제 4의 구현체다. 보강점:
 
 평가는 로드맵 2번(공개 호환 벤치마크)과 병행 — 하니스 품질은 코퍼스 통과율로만 말한다.
 
+코드 수준 전개(파일·심볼·완료 기준 명령)는 [2026-10-16-agent-plane-execution.md](2026-10-16-agent-plane-execution.md)에서 — P0=실행 문서 M0+M1, P1=M2+M3, P2=M4, P3=M5. §8의 1번(bash 스코프)과 4번(레인 전환)은 실행 문서 §1에서 잠정 결정(기본 `--shell none`, `--shell workspace` 옵트인; `--trust full|restricted` 단일 플래그).
+
 ## 8. 열린 질문
 
 1. REPL 실행 컨텍스트의 샌드박스 강도 — 전력 레인에서 `bash`를 어디까지 줄 것인가
