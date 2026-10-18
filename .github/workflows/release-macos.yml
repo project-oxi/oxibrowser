@@ -98,24 +98,33 @@ jobs:
           codesign --verify --strict --verbose=2 dist/$BIN
           codesign -dvv dist/$BIN 2>&1 | grep -E 'Identifier|Authority=Developer ID Application|TeamIdentifier' || true
 
-      - name: Ad-hoc signature (no Apple credentials)
-        if: env.APPLE_CERT_PRESENT != 'true'
+      - name: Ad-hoc signature (no Apple credentials, or notarization failed)
+        if: env.APPLE_CERT_PRESENT != 'true' || steps.notarize.outcome != 'success'
         run: |
           set -euo pipefail
-          # No Developer ID credentials: stamp an ad-hoc signature so the
-          # binary carries a stable local identity and passes strict
-          # verification, and mark the artifacts -unsigned. Gatekeeper will
-          # prompt on first launch (right-click → Open, or
+          # Ship unsigned: stamp an ad-hoc signature so the binary carries a
+          # stable local identity and passes strict verification, and mark
+          # the artifacts -unsigned. This also REPLACES a Developer ID
+          # signature when notarization is unavailable — a Developer-ID-
+          # signed but un-notarized binary hard-blocks Gatekeeper, while
+          # ad-hoc merely prompts (right-click → Open, or
           # xattr -d com.apple.quarantine). `cargo install` is unaffected.
           codesign --force --sign - dist/$BIN
           codesign --verify --strict --verbose=2 dist/$BIN
+          echo "SHIP_UNSIGNED=1" >> "$GITHUB_ENV"
 
       - name: Zip
         run: |
           ditto -c -k --keepParent dist/$BIN dist/$BIN.zip
 
       - name: Notarize (notarytool)
+        id: notarize
         if: env.APPLE_CERT_PRESENT == 'true'
+        # The Developer ID certificate secret can outlive the Apple account
+        # (expired membership/agreements → notarytool 403). A failed
+        # notarization downgrades the run to the unsigned path below
+        # instead of failing the release.
+        continue-on-error: true
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -133,7 +142,7 @@ jobs:
             --wait
 
       - name: Verify the binary inside the notarized zip
-        if: env.APPLE_CERT_PRESENT == 'true'
+        if: env.APPLE_CERT_PRESENT == 'true' && steps.notarize.outcome == 'success'
         run: |
           set -euo pipefail
           # macOS 15 runners: `spctl -a` cannot assess a bare Mach-O without
@@ -155,7 +164,7 @@ jobs:
         working-directory: dist
         run: |
           set -euo pipefail
-          if [ "$APPLE_CERT_PRESENT" = "true" ]; then
+          if [ "$APPLE_CERT_PRESENT" = "true" ] && [ -z "${SHIP_UNSIGNED:-}" ]; then
             OUT="$BIN"
           else
             OUT="$BIN-unsigned"
@@ -183,7 +192,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          if [ "$APPLE_CERT_PRESENT" = "true" ]; then
+          if [ "$APPLE_CERT_PRESENT" = "true" ] && [ -z "${SHIP_UNSIGNED:-}" ]; then
             NOTES="macOS Developer ID signed + notarized build"
           else
             NOTES="macOS universal build — UNSIGNED (ad-hoc signature; no Apple Developer credentials).
