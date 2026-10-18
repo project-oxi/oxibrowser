@@ -223,7 +223,12 @@ impl Page {
     /// page mutably. Returns the new token, which is unique within the
     /// process (drawn from the same counter as fresh pages).
     pub fn bump_generation(&self) -> u64 {
-        let next = GLOBAL_DOC_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+        // Dispense exactly one counter slot (like a fresh page). The old
+        // `fetch_add(1) + 1` double-counted: the bumped value collided
+        // with the NEXT construction draw, breaking the "unique within
+        // the process" invariant the ref-epoch system relies on (found by
+        // running the test in isolation — full-suite runs masked it).
+        let next = GLOBAL_DOC_GENERATION.fetch_add(1, Ordering::Relaxed);
         self.generation.store(next, Ordering::Relaxed);
         next
     }

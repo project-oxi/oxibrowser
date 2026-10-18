@@ -12,10 +12,10 @@
 # is deprecated upstream and used only by `run` script parsing
 # (core/src/script/parser.rs); no adopted successor exists yet — revisit
 # when one clears community review.
-# RUSTSEC-2026-0370/0371 (zvariant, zbus_names): folded into the zbus
-# monorepo; reachable only through keyring 4.2.0 (latest) → secret-service
-# → zbus 4 on non-macOS keychain paths. Unblock when keyring ships a
-# zbus 5-based release.
+# RUSTSEC-2026-0370/0371/0372 (zvariant, zbus_names, zvariant_derive):
+# folded into the zbus monorepo; reachable only through keyring 4.2.0
+# (latest) → secret-service → zbus 4 on non-macOS keychain paths. Unblock
+# when keyring ships a zbus 5-based release.
 ignore = [
     "RUSTSEC-2024-0436",
     "RUSTSEC-2026-0192",
@@ -24,6 +24,7 @@ ignore = [
     "RUSTSEC-2024-0449",
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
 ]
 
 [licenses]
