@@ -3,19 +3,43 @@
 > Living roadmap. Historical milestone plans (v0.5 era) live in git history;
 > dated design docs live in `designs/`.
 
-## Current state (v0.24)
+## Current state (v0.26 — agent plane shipped)
 
 | | |
 |---|---|
 | Crates | 5 (`oxibrowser`, `oxibrowser-cdp`, `oxibrowser-core`, `oxibrowser-credentials`, `oxibrowser-render`) |
-| Rust LOC | ~55k |
-| Tests | ~700 (unit + CDP e2e + acceptance); real-website suite `--ignored` (cli 11 · integration 7 · smoke 3, measured 2026-09-29) |
+| Rust LOC | ~62k |
+| Tests | ~840 (unit + CDP e2e + agent-plane e2e 18 + corpus 10/10); real-website suite `--ignored` |
 | Render stack | Blitz (Stylo CSS, Taffy layout, Parley text, vello_cpu paint) |
-| JS | boa_engine 0.20 (ES2024+), wasmi WASM bridge, dedicated JS thread |
-| Protocols | CDP (WebSocket), Puppeteer/Playwright compatible; stdio MCP (`serve --mcp`, 12 tools) |
+| JS | boa_engine 0.20 (ES2024+), wasmi WASM bridge, dedicated JS thread; form activation (submit → encoded POST/GET on all three action paths) |
+| Protocols | CDP (WebSocket), Puppeteer/Playwright compatible; stdio MCP (`serve --mcp`, 12 tools); ghost restricted MCP lane (`--ghost`) |
+| Agent plane | `oxibrowser repl` (Playwright-shaped JS REPL over native actions: locators/strict-mode/error contract, `oxi.fillCredential`, `page.mouse.click` CUA, steering events dialog/popup/download/console) + `oxibrowser agent run/resume/eval` (model-agnostic loop: token budgets, compaction, consent flows, site-file memory, network replay, corpus `agent eval corpus` — see `designs/2026-10-16-agent-plane-execution.md`) |
 | Anti-bot | wreq TLS fingerprint impersonation, stealth navigator surface, challenge handling |
-| Security | Redaction by default, JSONL audit (schema v1: per-event `schema_version`/`event_id`/`ref`), origin-policy primitives, consent/policy engine |
-| Accounts | Registry + AEAD session envelopes (OXSESS1), login orchestration (import/wizard/viewer/agent), agent-scoped grants, `account exec` volatile grants, per-account flock, irreversible-pattern gate |
+| Security | Redaction by default (passwords `__REDACTED__` in every observation surface), JSONL audit (schema v1), origin-policy primitives, consent/policy engine, native-action-only input (page scripts cannot forge targets/descriptors) |
+| Accounts | Registry + AEAD session envelopes (OXSESS1), login orchestration (import/wizard/viewer/agent), agent-scoped grants, `account exec` volatile grants, per-account flock, irreversible-pattern gate, `page.login` in the REPL |
+
+Recently shipped (agent plane — `designs/2026-10-16-agent-first-browser.md`):
+
+- M0: `observe` — token-budgeted aria YAML + actionable refs (one
+  observation = one consistent `e{n}` namespace).
+- M1: Oxiwright REPL — dedicated boa agent-world (page runtime untouched),
+  Playwright locator subset on the native action path, snapshot-derived
+  gates (password literals denied everywhere at the native layer; only
+  broker-authorized `FillCredential` writes one).
+- M1.5: form activation (submit controls drive encoded POST/GET
+  navigation; `form.submit()` resolved).
+- M2: steering — `waitForEvent`, dialog-deadlock-free action bridge,
+  page-driven popups (`window.open` / `target=_blank` + `TabSpawned`
+  observer contract), downloads.
+- M3: the agent loop — `ModelProvider` (OpenAI-compatible or scripted),
+  10K-token prompt discipline (CI-enforced), compaction, the two consent
+  flows (credential grants via the file-replay ConsentStore; irreversible
+  via live `mark_irreversible`), `agent run`/`resume`.
+- M4: site files (verified selectors/markers/endpoints per origin),
+  transcript resume, `page.replay` (captured request → in-page fetch).
+- M5: CUA fallback (`page.mouse.click` via layout hit-test), 1440×900
+  agent viewport, `agent eval` corpus runner (10/10),
+  `OXIBROWSER_BYTES_PER_TOKEN` calibration.
 
 Recently shipped (account process model — `designs/2026-09-29-account-process-execution.md`):
 
@@ -39,29 +63,33 @@ Recently shipped (account process model — `designs/2026-09-29-account-process-
 
 ## Next
 
-Prioritized by agent-workload impact. Storage completeness (IndexedDB) is
-**priority-raised**: in the CLI process model every run restores from the
-envelope, so sites whose auth tokens live in IndexedDB lose the session on
-every invocation — the single biggest real-site reliability gap (FM-L5).
+Prioritized by agent-workload impact — the agent plane raises the floor of
+what the harness can do; engine compatibility is now the ceiling.
 
-1. **IndexedDB** — ✅ v1 shipped (2026-09-30): JS `indexedDB` API subset
-   (open/upgrade/createObjectStore/transaction/put/get/getAll/delete/count)
-   with origin-keyed state carried in the envelope (`OriginState.indexed_db`)
-   — IDB-auth tokens survive restore. Deferred-event pump, string keys,
-   JSON-serialized values; indexes/cursors on demand. Remaining: full
-   spec surface for non-JSON payloads.
-2. **Public compatibility benchmark** — committed corpus runner (WPT subset
+1. **Public compatibility benchmark** — committed corpus runner (WPT subset
    or fixed public-URL set) aggregated in CI, publishing a pass-rate number.
-   Everything else on this list is judged by it.
-3. **Login viewer hardening** — the `/viewer` reference page is functional;
-   next: clipboard-safe token handoff, mobile viewport input, i18n.
-4. **ReadableStream** — completes `fetch().body`; frequent in modern scripts.
-5. **Web platform gaps, small batch** — `crypto.subtle`, `history` breadth,
-   `requestSubmit`, form validation API.
-6. **Web Workers** — dedicated + shared worker contexts over the existing
+   Everything else on this list is judged by it. The agent plane's own
+   harness quality is already measured by `agent eval corpus` (10/10).
+2. **Real-model smoke + corpus on live sites** — `agent run` against a live
+   `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
+   grow the corpus beyond loopback (login-gated tasks once accounts are in
+   place).
+3. **IndexedDB remainder** — full spec surface for non-JSON payloads
+   (v1 shipped 2026-09-30: core subset with envelope-carried state).
+4. **Login viewer hardening** — the `/viewer` reference page is functional;
+   next: clipboard-safe token handoff, mobile viewport input, i18n; wire
+   agent-loop consent cards into it (today `agent run` consents via the
+   terminal).
+5. **ReadableStream** — completes `fetch().body`; frequent in modern scripts
+   (also unlocks `page.replay` on streaming endpoints).
+6. **Web platform gaps, small batch** — `crypto.subtle`, `history` breadth,
+   `requestSubmit`, form validation API; native-path input extensions
+   (press/check on `NativeInput`).
+7. **Web Workers** — dedicated + shared worker contexts over the existing
    per-frame context machinery.
-7. **WebDriver BiDi** — second automation protocol on the same serve endpoint.
-8. **HTTP Basic `Fetch.authRequired`** (stretch) — event + `continueWithAuth`
+8. **WebDriver BiDi** (deprioritized behind the agent plane) — second
+   automation protocol on the same serve endpoint.
+9. **HTTP Basic `Fetch.authRequired`** (stretch) — event + `continueWithAuth`
    wired to broker credentials; today only the JS `fetch()` bridge retries
    with globally-configured credentials and navigation does not retry.
 
