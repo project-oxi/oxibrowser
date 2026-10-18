@@ -15,10 +15,13 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   BIN: oxibrowser
+  # Secrets cannot appear in step `if:` conditions directly; this env
+  # passthrough routes between the signed and unsigned paths.
+  APPLE_CERT_PRESENT: ${{ secrets.APPLE_CERTIFICATE != '' }}
 
 jobs:
   macos:
-    name: Sign, notarize, publish macOS binary
+    name: Build, sign (when credentials exist), publish macOS binary
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +53,7 @@ jobs:
           file dist/$BIN
 
       - name: Import Developer ID certificate into a temporary keychain
+        if: env.APPLE_CERT_PRESENT == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -84,6 +88,7 @@ jobs:
           rm -f "$CERT_PATH"
 
       - name: Sign (hardened runtime, secure timestamp)
+        if: env.APPLE_CERT_PRESENT == 'true'
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
@@ -93,11 +98,24 @@ jobs:
           codesign --verify --strict --verbose=2 dist/$BIN
           codesign -dvv dist/$BIN 2>&1 | grep -E 'Identifier|Authority=Developer ID Application|TeamIdentifier' || true
 
-      - name: Zip for notarization
+      - name: Ad-hoc signature (no Apple credentials)
+        if: env.APPLE_CERT_PRESENT != 'true'
+        run: |
+          set -euo pipefail
+          # No Developer ID credentials: stamp an ad-hoc signature so the
+          # binary carries a stable local identity and passes strict
+          # verification, and mark the artifacts -unsigned. Gatekeeper will
+          # prompt on first launch (right-click → Open, or
+          # xattr -d com.apple.quarantine). `cargo install` is unaffected.
+          codesign --force --sign - dist/$BIN
+          codesign --verify --strict --verbose=2 dist/$BIN
+
+      - name: Zip
         run: |
           ditto -c -k --keepParent dist/$BIN dist/$BIN.zip
 
       - name: Notarize (notarytool)
+        if: env.APPLE_CERT_PRESENT == 'true'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
@@ -115,6 +133,7 @@ jobs:
             --wait
 
       - name: Verify the binary inside the notarized zip
+        if: env.APPLE_CERT_PRESENT == 'true'
         run: |
           set -euo pipefail
           # macOS 15 runners: `spctl -a` cannot assess a bare Mach-O without
@@ -132,28 +151,47 @@ jobs:
           codesign -dv --entitlements - "$BIN_PATH" 2>&1 | \
             grep -E 'Identifier=|TeamIdentifier=' || true
 
-      - name: Checksums
+      - name: Stage artifacts + checksums
         working-directory: dist
         run: |
-          shasum -a 256 $BIN > $BIN.sha256
-          shasum -a 256 $BIN.zip > $BIN.zip.sha256
-          cat $BIN.sha256 $BIN.zip.sha256
+          set -euo pipefail
+          if [ "$APPLE_CERT_PRESENT" = "true" ]; then
+            OUT="$BIN"
+          else
+            OUT="$BIN-unsigned"
+            mv "$BIN" "$OUT"
+            rm -f "$BIN.zip"
+            ditto -c -k --keepParent "$OUT" "$OUT.zip"
+          fi
+          shasum -a 256 "$OUT" > "$OUT.sha256"
+          shasum -a 256 "$OUT.zip" > "$OUT.zip.sha256"
+          cat "$OUT.sha256" "$OUT.zip.sha256"
+          echo "STAGED_OUT=$OUT" >> "$GITHUB_ENV"
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oxibrowser-macos
           path: |
-            dist/${{ env.BIN }}
-            dist/${{ env.BIN }}.zip
-            dist/${{ env.BIN }}.sha256
-            dist/${{ env.BIN }}.zip.sha256
+            dist/${{ env.STAGED_OUT }}
+            dist/${{ env.STAGED_OUT }}.zip
+            dist/${{ env.STAGED_OUT }}.sha256
+            dist/${{ env.STAGED_OUT }}.zip.sha256
 
       - name: Attach to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          if [ "$APPLE_CERT_PRESENT" = "true" ]; then
+            NOTES="macOS Developer ID signed + notarized build"
+          else
+            NOTES="macOS universal build — UNSIGNED (ad-hoc signature; no Apple Developer credentials).
+          Gatekeeper will prompt on first launch: right-click → Open, or remove the quarantine bit:
+          xattr -d com.apple.quarantine oxibrowser-unsigned && chmod +x oxibrowser-unsigned
+          The signed/notarized path returns once Developer ID credentials are configured again.
+          \`cargo install oxibrowser\` installs without any of this."
+          fi
           # The Publish workflow (crates.io + release notes) may still be
           # running — create the release if it does not exist yet, then
           # upload with --clobber for idempotent retries.
@@ -163,8 +201,8 @@ jobs:
             sleep 30
           done
           gh release view "$TAG" > /dev/null 2>&1 || \
-            gh release create "$TAG" --title "$TAG" --verify-tag \
-              --notes "macOS Developer ID signed + notarized build"
+            gh release create "$TAG" --title "$TAG" --verify-tag --notes "$NOTES"
           gh release upload "$TAG" \
-            dist/$BIN dist/$BIN.zip dist/$BIN.sha256 dist/$BIN.zip.sha256 \
+            "dist/$STAGED_OUT" "dist/$STAGED_OUT.zip" \
+            "dist/$STAGED_OUT.sha256" "dist/$STAGED_OUT.zip.sha256" \
             --clobber
