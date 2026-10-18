@@ -63,6 +63,19 @@ session, and two engine fixes found while building it.
 - Agent-plane logical viewport fixed at 1440×900 for repl/agent processes
   (process-global override; they are dedicated processes by design).
 
+### Fixed
+- **Generation-token off-by-one**: `Page::bump_generation`'s
+  `fetch_add(1)+1` double-counted a slot, so a bumped epoch collided with
+  the next fresh page's draw — breaking the process-unique invariant the
+  ref-epoch (stale-ref) system relies on. Reproduced 100/100 in test
+  isolation; full-suite runs masked it.
+- rustls 0.23.45 → 0.23.46 (RUSTSEC-2026-0346/0347/0348 + the
+  classical-KEX downgrade); chacha20 0.10.1 (yanked) → 0.10.2.
+- Real-website test suite: example.com dropped its only link (2026-10), so
+  the four link-dependent tests moved to iana.org; `real_model_smoke`
+  skips without `OXIBROWSER_LLM_*` instead of failing blanket `--ignored`
+  runs.
+
 ### Security
 - Password values are `__REDACTED__` in every observation surface
   (snapshots, aria YAML); literal fills into password controls are denied
