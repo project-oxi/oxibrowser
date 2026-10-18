@@ -697,10 +697,10 @@ pub(crate) fn print_error_details(
         resp.print_json();
     } else {
         eprintln!("Error: {msg}");
-        if let Some(details) = details {
-            if let Ok(line) = serde_json::to_string(&details) {
-                eprintln!("{line}");
-            }
+        if let Some(details) = details
+            && let Ok(line) = serde_json::to_string(&details)
+        {
+            eprintln!("{line}");
         }
     }
     code

@@ -264,8 +264,9 @@ struct McpAccounts {
 }
 
 impl McpAccounts {
+    #[cfg(test)]
     fn empty() -> Self {
-        McpAccounts {
+        Self {
             registry: None,
             agent: None,
             primary: None,

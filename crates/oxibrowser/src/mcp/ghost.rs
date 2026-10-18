@@ -137,7 +137,7 @@ impl GhostTab {
         {
             let s = &observation.snapshot;
             title = cap(&s.title, 256);
-            let full_tree = oxibrowser_core::css::render_accessibility_tree(&s);
+            let full_tree = oxibrowser_core::css::render_accessibility_tree(s);
             tree_truncated = full_tree.len() > 8000;
             tree = cap(&full_tree, 8000);
             for el in s.interactive_elements() {
@@ -635,13 +635,12 @@ pub async fn run_ghost_stdio(
     };
     let scope = runtime.scope.clone();
     let mut state = handoff::State::new(task);
-    if let Some(h) = &mut host {
-        if !h
+    if let Some(h) = &mut host
+        && !h
             .send(json!({"jsonrpc":"2.0","method":"ghost/ready","params":state.status(&scope)}))
             .await
-        {
-            return 1;
-        }
+    {
+        return 1;
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
     std::thread::spawn(move || {
@@ -923,8 +922,8 @@ mod tests {
         let mut ledger = Ledger {
             entries: HashMap::new(),
         };
-        assert_eq!(ledger.begin(&req).unwrap(), true);
-        assert_eq!(ledger.begin(&req).unwrap(), false);
+        assert!(ledger.begin(&req).unwrap());
+        assert!(!ledger.begin(&req).unwrap());
         let response = rpc_result(req.id.clone(), json!({"tab_id":"t1"}));
         ledger.finish(&req, response.clone());
         assert_eq!(ledger.begin(&req).unwrap_err(), response);

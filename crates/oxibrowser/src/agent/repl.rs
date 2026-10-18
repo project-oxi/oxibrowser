@@ -287,9 +287,7 @@ impl ReplHost {
         );
 
         match action {
-            ActKind::RefOnly => {
-                return Ok(json!({"ref": r#ref, "generation": generation}));
-            }
+            ActKind::RefOnly => Ok(json!({"ref": r#ref, "generation": generation})),
             ActKind::Click => {
                 let url = guard
                     .current_url()
@@ -538,6 +536,15 @@ impl ReplHost {
             tracing::warn!(error = %e, "login session close failed");
         }
         self.browser.cleanup_closed_sessions();
+        if outcome.is_ok()
+            && let Some(origin) = session
+                .read()
+                .await
+                .current_url()
+                .map(|u| u.origin().ascii_serialization())
+        {
+            super::site::record_login_marker(&origin, &format!("account:{account_id}"));
+        }
         match outcome {
             Ok(o) => Ok(json!({
                 "account_id": account_id,
@@ -785,10 +792,11 @@ impl WorldSetup {
     }
 }
 
-/// Account binding for the REPL: restored-envelope credential-mode context
-/// + `bind_direct` (the local user launched this process, so
-/// pattern-matched irreversible actions are allowed — same semantics as
-/// `session/serve --account`) + the broker for `oxi.fillCredential`.
+/// Account binding for the REPL: restored-envelope credential-mode
+/// context + `bind_direct` (the local user launched this process, so
+/// pattern-matched irreversible actions are allowed — same semantics
+/// as `session/serve --account`) + the broker for
+/// `oxi.fillCredential`.
 async fn setup_account(
     browser: &std::sync::Arc<oxibrowser_core::Browser>,
     id: &str,

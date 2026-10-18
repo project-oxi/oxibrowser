@@ -91,7 +91,7 @@ OxiBrowser is built for exactly that use case:
 
 See **[CHANGELOG.md](CHANGELOG.md)** for the full version history and **[GitHub Releases](https://github.com/project-oxi/oxibrowser/releases)** for release notes.
 
-Recent milestones (v0.17–v0.20): per-frame JS execution contexts (iframe isolation), Shadow DOM (open/closed/declarative/slots), async `fetch`/`XMLHttpRequest`/`WebSocket`, CORS + preflight, cookie PSL/prefixes, multi-tab, PDF export, `@font-face` webfonts, Blitz/Stylo/Taffy/Parley rendering pipeline, stealth bot-detection, Canvas 2D, custom-element lifecycle, and a 12-domain CDP server.
+Recent milestones (v0.25–v0.26): **the agent plane** — `repl` (Playwright-shaped JS over native actions), `agent run/resume/eval` (model-agnostic loop with token budgets, consent flows, site memory, corpus 10/10), form activation, page-driven popups, the restricted ghost MCP lane, and native-action-only input (page scripts cannot forge targets). Earlier (v0.17–v0.20): per-frame JS contexts, Shadow DOM, async `fetch`/XHR/WebSocket, CORS, multi-tab, PDF export, webfonts, the Blitz/Stylo/Taffy/Parley pipeline, stealth, Canvas 2D, custom elements, 12-domain CDP.
 
 ## 🚀 Quick Start
 
@@ -189,12 +189,37 @@ COMMANDS:
   fetch      Fetch a URL and return content (markdown default)
   extract    Extract structured data (links, text, elements)
   run        Run a YAML automation script
-  session    Interactive stdin/stdout JSON REPL (22 commands)
+  session    Interactive stdin/stdout JSON REPL (23 commands)
+  repl       Interactive JS REPL with a Playwright-shaped API (agents)
+  agent      Autonomous agent: run / resume / eval (model-agnostic loop)
   serve      Start CDP WebSocket server
   search     Web / GitHub / GitHub-issues search (no browser needed)
+  account    Account registry and login-state management
+  credential Keychain-backed agent credentials
   describe   Print CLI schema as JSON (for agents)
   skill      Print agent skill guide
   version    Print version information
+```
+
+### repl — Playwright-shaped JS REPL (agents)
+
+```bash
+# One stdin line = one program (top-level await), one JSON response per line
+: oxibrowser repl --allow-private-ips
+await page.goto('https://example.com')
+await page.getByRole('link', { name: 'More' }).click()
+await page.observe({ budgetTokens: 1500 })   # token-budgeted aria snapshot
+await page.mouse.click(120, 40)              # CUA fallback
+await oxi.fillCredential(page.getByLabel('Password'), 'github')  # needs --account
+```
+
+### agent — autonomous task loop
+
+```bash
+# Model via env: OXIBROWSER_LLM_BASE_URL / OXIBROWSER_LLM_API_KEY / OXIBROWSER_LLM_MODEL
+oxibrowser agent run "find the pricing page and report the tiers" --account github
+oxibrowser agent resume t-1730000000000     # continue a saved transcript
+oxibrowser agent eval corpus                # deterministic corpus (10/10)
 ```
 
 ### fetch — One-shot page fetch

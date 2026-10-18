@@ -27,7 +27,8 @@ async fn test_fetch_example_com() {
 #[ignore]
 async fn test_extract_links_from_example() {
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://example.com").await.unwrap();
+    // example.com dropped its link (2026-10); iana.org carries stable links.
+    let session = browser.new_page("https://www.iana.org").await.unwrap();
 
     let guard = session.read().await;
     let page = guard.page().expect("page should be loaded");
@@ -88,7 +89,8 @@ async fn test_js_document_query_on_real_page() {
 #[ignore]
 async fn test_markdown_conversion() {
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://example.com").await.unwrap();
+    // example.com dropped its link (2026-10); iana.org carries stable links.
+    let session = browser.new_page("https://www.iana.org").await.unwrap();
 
     let guard = session.read().await;
     let page = guard.page().expect("page should be loaded");
@@ -158,7 +160,8 @@ async fn test_korean_encoding_naver() {
 async fn test_encoding_meta_charset() {
     // Verify a standard UTF-8 page decodes cleanly
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://example.com").await.unwrap();
+    // example.com dropped its link (2026-10); iana.org carries stable links.
+    let session = browser.new_page("https://www.iana.org").await.unwrap();
 
     let guard = session.read().await;
     let page = guard.page().expect("page should be loaded");
@@ -176,7 +179,8 @@ async fn test_encoding_meta_charset() {
 #[tokio::test]
 async fn test_js_create_element_on_real_page() {
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://example.com").await.unwrap();
+    // example.com dropped its link (2026-10); iana.org carries stable links.
+    let session = browser.new_page("https://www.iana.org").await.unwrap();
 
     // Create element and append to body via JS
     let result = {
@@ -204,7 +208,8 @@ async fn test_js_create_element_on_real_page() {
 #[tokio::test]
 async fn test_js_window_globals_on_real_page() {
     let browser = Browser::new(BrowserConfig::headless()).await.unwrap();
-    let session = browser.new_page("https://example.com").await.unwrap();
+    // example.com dropped its link (2026-10); iana.org carries stable links.
+    let session = browser.new_page("https://www.iana.org").await.unwrap();
 
     // Test window, navigator, location, crypto exist
     let result = {

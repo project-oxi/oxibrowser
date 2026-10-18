@@ -6766,7 +6766,7 @@ fn create_render_element_object(
                 .unwrap_or(false);
             if event_type == "click"
                 && !prevented
-                && let Some(page_url) = form_activation::page_url_from_ctx(ctx)
+                && let Some(_page_url) = form_activation::page_url_from_ctx(ctx)
             {
                 let form_id = {
                     let cell = rd_disp.borrow();
@@ -6792,13 +6792,11 @@ fn create_render_element_object(
                         form_id as usize,
                         dirty_disp.clone(),
                     );
-                    if !run_submit_event(ctx, this_value, form_id) {
-                        if let Ok(v) = ctx.global_object().get(js_string!("__oxiFormSubmit"), ctx)
-                            && let Some(fobj) = v.as_object()
-                        {
-                            let _ =
-                                fobj.call(&JsValue::undefined(), &[JsValue::from(form_id)], ctx);
-                        }
+                    if !run_submit_event(ctx, this_value, form_id)
+                        && let Ok(v) = ctx.global_object().get(js_string!("__oxiFormSubmit"), ctx)
+                        && let Some(fobj) = v.as_object()
+                    {
+                        let _ = fobj.call(&JsValue::undefined(), &[JsValue::from(form_id)], ctx);
                     }
                 }
             }

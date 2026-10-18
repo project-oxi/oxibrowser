@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use oxibrowser_cdp::account::LoginSurface;
 use oxibrowser_credentials::{ConsentRecord, ConsentStore, ConsentSubject, CredentialId};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::model::{ChatMessage, ChatRequest, ModelProvider};
 use super::prompt;
@@ -129,7 +129,7 @@ pub async fn run(
     if let Some(id) = cfg.task_id.as_deref() {
         save_task_meta(id, &cfg.task);
     }
-    let mut transcript: Vec<ChatMessage> = vec![ChatMessage::system(prompt::SYSTEM_PROMPT)];
+    let transcript: Vec<ChatMessage> = vec![ChatMessage::system(prompt::SYSTEM_PROMPT)];
     // Resume: replay the saved turns (the task message is already in
     // there from the first run); fresh runs start from the task message.
     let mut history: Vec<ChatMessage> = match cfg.task_id.as_deref() {
@@ -179,6 +179,11 @@ pub async fn run(
             }
         };
         model_calls += 1;
+        if let Some(usage) = reply.usage_tokens {
+            // Provider-reported usage replaces the chars/4 approximation
+            // for this turn (the M5 calibration path).
+            approx_tokens += usage;
+        }
         let program = reply.text.trim().to_string();
         if program.is_empty() {
             last_error = Some("model returned an empty program".into());
@@ -298,7 +303,7 @@ async fn handle_consent(
             {
                 let record = ConsentRecord::new(
                     ConsentSubject::Credential {
-                        credential: CredentialId(credential.into()),
+                        credential: CredentialId(credential),
                     },
                     &origin,
                     &["login"],
@@ -491,9 +496,5 @@ mod tests {
         let cfg = LoopConfig::default();
         assert!(cfg.max_steps >= 10 && cfg.max_steps <= 50);
         assert!(cfg.result_cap_chars >= 2_000);
-    }
-
-    fn _json_shape() -> Value {
-        json!({})
     }
 }

@@ -26,7 +26,10 @@ Rules:
 - Prefer one observe + one coded action over many blind clicks. If a site exposes an obvious form flow, fill it in a single program.
 "#;
 
-/// Total prompt budget in approximate tokens (chars/4).
+/// Total prompt budget in approximate tokens (chars/4). The
+/// `prompt_within_budget` test anchors it — the constant exists to be
+/// tested, release builds do not read it at runtime.
+#[allow(dead_code)]
 pub const PROMPT_TOKEN_BUDGET: usize = 10_000;
 
 /// Approximate token count of the constant prompt surface.

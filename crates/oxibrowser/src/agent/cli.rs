@@ -101,7 +101,7 @@ pub async fn run_agent(command: AgentCommand) -> i32 {
     let setup =
         super::repl::WorldSetup::new(account.as_deref(), allow_private_ips, ref_tag.as_deref())
             .await;
-    let mut setup = match setup {
+    let setup = match setup {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");

@@ -180,11 +180,11 @@ impl State {
         if self.phase != Phase::Refresh || !success {
             return;
         }
-        if name == "browser_snapshot" {
-            if let Some(tab) = args["tab_id"].as_str() {
-                self.fresh.remove(tab);
-                self.inventory = false;
-            }
+        if name == "browser_snapshot"
+            && let Some(tab) = args["tab_id"].as_str()
+        {
+            self.fresh.remove(tab);
+            self.inventory = false;
         }
         if name == "browser_tabs" {
             self.inventory = false;
@@ -246,15 +246,14 @@ impl State {
                     return Err("HANDOFF_SCOPE_MISMATCH");
                 }
             }
-            "ghost/cancel" => {
+            "ghost/cancel"
                 if !matches!(req.params["channel"].as_str(), Some("agent" | "human"))
                     || !req.params["request_id"]
                         .as_str()
                         .is_some_and(|s| !s.is_empty() && s.len() <= 128)
-                        && req.params["request_id"].as_i64().is_none()
-                {
-                    return Err("INVALID_CONTROL_ARGUMENTS");
-                }
+                        && req.params["request_id"].as_i64().is_none() =>
+            {
+                return Err("INVALID_CONTROL_ARGUMENTS");
             }
             _ => {}
         }

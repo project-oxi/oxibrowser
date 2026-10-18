@@ -193,7 +193,7 @@ impl EventHub {
         loop {
             {
                 let mut queue = self.queue.lock();
-                if let Some(pos) = queue.iter().position(|v| matches(v)) {
+                if let Some(pos) = queue.iter().position(matches) {
                     return Some(queue.remove(pos).unwrap());
                 }
             }
@@ -221,9 +221,22 @@ pub fn resolve_dialog(gate: &DialogGate, accept: bool, prompt_text: Option<Strin
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn wait_for_cap_fits_bridge_budget() {
-        // The clamp keeps waitForEvent inside the 30s world bridge budget.
-        assert!(25_000 <= 30_000);
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_for_clamp_fits_bridge_budget() {
+        // The clamp (25s) must stay inside the 30s world bridge budget —
+        // crossing it would turn a busy wait into a bridge timeout.
+        let hub = EventHub {
+            queue: parking_lot::Mutex::new(VecDeque::new()),
+            notify: tokio::sync::Notify::new(),
+            dialog_pending: std::sync::atomic::AtomicBool::new(false),
+            popups: tokio::sync::Mutex::new(HashMap::new()),
+            next_popup: std::sync::atomic::AtomicU64::new(0),
+        };
+        let start = tokio::time::Instant::now();
+        let none = hub.wait_for("popup", 1).await;
+        assert!(none.is_none());
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
     }
 }

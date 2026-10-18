@@ -96,9 +96,7 @@ fn agent_run_completes_three_step_task() {
         format!(
             r#"await page.goto('http://127.0.0.1:{port}/'); return await page.observe({{ budgetTokens: 400 }});"#
         ),
-        format!(
-            r#"await page.getByLabel('Query').fill('oxibrowser'); await page.getByRole('button', {{ name: 'Search' }}).click(); await page.waitForTimeout(300); return await page.ariaSnapshot();"#
-        ),
+        r#"await page.getByLabel('Query').fill('oxibrowser'); await page.getByRole('button', { name: 'Search' }).click(); await page.waitForTimeout(300); return await page.ariaSnapshot();"#.to_string(),
         "const yaml = await page.ariaSnapshot(); task.done(yaml)".to_string(),
     ]);
 
@@ -330,8 +328,13 @@ fn agent_resume_continues_saved_transcript() {
 /// Real-model smoke — opt-in (needs OXIBROWSER_LLM_* pointing at a live
 /// endpoint). Run: cargo test --test agent_loop real_model -- --ignored.
 #[test]
-#[ignore = "requires a live model endpoint via OXIBROWSER_LLM_*"]
 fn real_model_smoke() {
+    if std::env::var_os("OXIBROWSER_LLM_BASE_URL").is_none()
+        && std::env::var_os("OXIBROWSER_LLM_SCRIPT").is_none()
+    {
+        eprintln!("skipped: no OXIBROWSER_LLM_* configuration");
+        return;
+    }
     let port = serve(SEARCH_HTML);
     let out = Command::new(env!("CARGO_BIN_EXE_oxibrowser"))
         .arg("agent")

@@ -202,6 +202,7 @@ fn function(ctx: &mut Context, obj: &JsObject, key: &'static str, native: Native
     readonly(ctx, obj, key, function.into());
 }
 
+#[allow(clippy::too_many_arguments)]
 fn event(
     ctx: &mut Context,
     render_doc: &Rc<RefCell<Option<RenderDocument>>>,
@@ -324,7 +325,7 @@ fn deliver(
             kind,
             &stopped,
             &immediate,
-            &prevented,
+            prevented,
         );
         for callback in handlers {
             if immediate.get() || pending_navigation(mutations) {
@@ -358,6 +359,7 @@ fn deliver(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn act(
     ctx: &mut Context,
     render_doc: &Rc<RefCell<Option<RenderDocument>>>,

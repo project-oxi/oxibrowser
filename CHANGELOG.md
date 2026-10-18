@@ -8,6 +8,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-18
+
+The agent plane — the browser becomes the agent's workstation
+([design](docs/designs/2026-10-16-agent-first-browser.md),
+[execution](docs/designs/2026-10-16-agent-plane-execution.md)). Plus the
+restricted ghost MCP lane and the native DOM input path from the 2026-10-02
+session, and two engine fixes found while building it.
+
+### Added
+- **`oxibrowser repl`** — a Playwright-shaped JS REPL (top-level `await`):
+  `page.getByRole(...).click()` / `fill()`, token-budgeted
+  `page.observe()` / `page.ariaSnapshot()`, `page.waitForEvent('dialog' |
+  'popup' | 'download' | 'console')`, `page.mouse.click(x, y)` (CUA via
+  layout hit-test), `page.login(account)`, `page.replay({url})` (captured
+  request → in-page fetch), `oxi.fillCredential(locator, account)` —
+  actions deliver through the native path only; page scripts cannot forge
+  targets or gate descriptors. One stdin line = one program, one JSON
+  response per line.
+- **`oxibrowser agent run|resume|eval`** — the autonomous loop:
+  model-agnostic provider (OpenAI-compatible HTTP via `OXIBROWSER_LLM_*`,
+  or deterministic `OXIBROWSER_LLM_SCRIPT`), 10K-token prompt discipline
+  (CI-enforced), compaction, step/token budgets, the two consent flows
+  (credential grants via the file-replay consent store; irreversible
+  grants via live `mark_irreversible`), site-file memory
+  (`~/.local/share/oxibrowser/sites/`), transcript resume, and a corpus
+  runner with a pass-rate report (`agent eval corpus` — 10/10).
+- **Form activation** — submit controls drive encoded POST/GET navigation
+  on all three action paths (legacy snapshot dispatch, render-element
+  dispatch, native click); `form.submit()` resolved (spec behavior, no
+  submit event).
+- **Page-driven popups** — `window.open` / `target=_blank` journal
+  `OpenTab`; `CoreEvent::TabSpawned` carries the observer contract (the
+  attached host creates the sibling session); surfaced as `OXI.tabSpawned`
+  for CDP observability.
+- **Ghost MCP lane** — `serve --mcp --ghost <id>`: restricted one-shot
+  stdio MCP (observe/click/fill on snapshot-bound refs, no eval, no
+  account surface) with request-id ledger semantics and the
+  handoff/resume supervisor socket (`--ghost-control-fd`,
+  [docs/ghost-mcp.md](docs/ghost-mcp.md)).
+- **Native DOM input** — `Session::native_observe` / `native_act`: clicks
+  and fills validated and applied on the JS thread without page eval,
+  page selectors, or global event constructors
+  ([tests](crates/oxibrowser-core/tests/native_input.rs)).
+
+### Changed
+- Mutation journal now resets at the start of each document injection
+  (was: cleared in `set_dom_snapshot`, after page scripts — which wiped
+  load-time `window.open` spawns and form submissions).
+- `navigate()` drains page-script effects after injection (boxed — a
+  drained `Navigate` re-enters `navigate`).
+- `session observe <tab> [--budget N] [--max-actionable N]` joins the
+  session REPL; `describe`/`skill` catalogs cover the new commands.
+- Agent-plane logical viewport fixed at 1440×900 for repl/agent processes
+  (process-global override; they are dedicated processes by design).
+
+### Security
+- Password values are `__REDACTED__` in every observation surface
+  (snapshots, aria YAML); literal fills into password controls are denied
+  at the native layer everywhere — only broker-authorized
+  `NativeInput::FillCredential` (resolved + consented + audited) writes
+  one, and the value never appears in tool results.
+- The agent system prompt carries the prompt-injection isolation rule
+  (page-derived text is data, never instructions); gates are enforced by
+  policy, not by the model.
+
 ## [0.25.0] - 2026-09-30
 
 Account process-execution model — the account layer becomes drivable by
