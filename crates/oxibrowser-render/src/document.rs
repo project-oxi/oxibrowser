@@ -392,6 +392,61 @@ impl RenderDocument {
             .and_then(|n| n.children.first().copied())
     }
 
+    /// Last child id of `node`, if any.
+    pub fn last_child(&self, node: NodeId) -> Option<NodeId> {
+        self.doc
+            .get_node(node)
+            .and_then(|n| n.children.last().copied())
+    }
+
+    /// All child ids of `node`, in document order.
+    pub fn children_ids(&self, node: NodeId) -> Vec<NodeId> {
+        self.doc
+            .get_node(node)
+            .map(|n| n.children.clone())
+            .unwrap_or_default()
+    }
+
+    /// Next sibling id of `node`, if any.
+    pub fn next_sibling(&self, node: NodeId) -> Option<NodeId> {
+        let parent = self.doc.get_node(node).and_then(|n| n.parent)?;
+        let siblings = self.doc.get_node(parent)?.children.clone();
+        let idx = siblings.iter().position(|&c| c == node)?;
+        siblings.get(idx + 1).copied()
+    }
+
+    /// Previous sibling id of `node`, if any.
+    pub fn previous_sibling(&self, node: NodeId) -> Option<NodeId> {
+        let parent = self.doc.get_node(node).and_then(|n| n.parent)?;
+        let siblings = self.doc.get_node(parent)?.children.clone();
+        let idx = siblings.iter().position(|&c| c == node)?;
+        if idx == 0 {
+            None
+        } else {
+            siblings.get(idx - 1).copied()
+        }
+    }
+
+    /// Node kind: "element" | "text" | other.
+    pub fn node_kind(&self, node: NodeId) -> Option<&'static str> {
+        self.doc.get_node(node).map(|n| {
+            if n.is_element() {
+                "element"
+            } else if n.is_text_node() {
+                "text"
+            } else {
+                "other"
+            }
+        })
+    }
+
+    /// Text content of a text node.
+    pub fn text_of(&self, node: NodeId) -> Option<String> {
+        self.doc
+            .get_node(node)
+            .and_then(|n| n.text_data().map(|t| t.content.clone()))
+    }
+
     /// Parent id of `node`, if any.
     pub fn parent_id(&self, node: NodeId) -> Option<NodeId> {
         self.doc.get_node(node).and_then(|n| n.parent)

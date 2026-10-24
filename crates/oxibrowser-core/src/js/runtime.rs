@@ -34,6 +34,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use base64::Engine;
 use boa_engine::builtins::promise::ResolvingFunctions;
 use boa_engine::object::builtins::{JsArray, JsPromise};
+use boa_engine::object::builtins::JsFunction;
 use boa_engine::object::{FunctionObjectBuilder, JsObject};
 use boa_engine::property::Attribute;
 use boa_engine::{Context, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source, js_string};
@@ -6457,6 +6458,63 @@ fn create_context(
                 orientation: { type: 'landscape-primary', angle: 0 },
             };
         }
+        if (typeof window !== 'undefined') {
+            if (window.innerWidth === undefined) {
+                Object.defineProperty(window, 'innerWidth', { value: 1280, configurable: true });
+                Object.defineProperty(window, 'innerHeight', { value: 720, configurable: true });
+                Object.defineProperty(window, 'outerWidth', { value: 1280, configurable: true });
+                Object.defineProperty(window, 'outerHeight', { value: 720, configurable: true });
+                Object.defineProperty(window, 'devicePixelRatio', { value: 1, configurable: true });
+            }
+        }
+        // fetch-classes: bundles construct them for request/response handling
+        // (measured: spotify web-player + React-adjacent libs). Data
+        // containers only — the native fetch bridge is not built on them.
+        if (typeof globalThis.Headers === 'undefined') {
+            globalThis.Headers = function(init) {
+                var map = {};
+                if (init) {
+                    if (typeof init.forEach === 'function') {
+                        init.forEach(function(v, k) { map[String(k).toLowerCase()] = String(v); });
+                    } else {
+                        Object.keys(init).forEach(function(k) { map[k.toLowerCase()] = String(init[k]); });
+                    }
+                }
+                this.get = function(k) { k = String(k).toLowerCase(); return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : null; };
+                this.set = function(k, v) { map[String(k).toLowerCase()] = String(v); };
+                this.has = function(k) { return String(k).toLowerCase() in map; };
+                this.delete = function(k) { delete map[String(k).toLowerCase()]; };
+                this.forEach = function(cb, thisArg) {
+                    var self = this;
+                    Object.keys(map).forEach(function(k) { cb.call(thisArg || self, map[k], k, self); });
+                };
+                this.entries = function() { return Object.keys(map).map(function(k) { return [k, map[k]]; }); };
+                this.keys = function() { return Object.keys(map); };
+                this.values = function() { return Object.keys(map).map(function(k) { return map[k]; }); };
+                Object.defineProperty(this, '__map', { value: map });
+            };
+        }
+        if (typeof globalThis.Request === 'undefined') {
+            globalThis.Request = function(input, init) {
+                init = init || {};
+                this.url = String(input);
+                this.method = String(init.method || 'GET').toUpperCase();
+                this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
+                this.body = init.body !== undefined ? init.body : null;
+            };
+        }
+        if (typeof globalThis.Response === 'undefined') {
+            globalThis.Response = function(body, init) {
+                init = init || {};
+                this.status = init.status !== undefined ? init.status : 200;
+                this.ok = this.status >= 200 && this.status < 300;
+                this.statusText = init.statusText || '';
+                this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers || {});
+                var b = body === undefined ? null : body;
+                this.text = function() { return Promise.resolve(b === null || b === undefined ? '' : (typeof b === 'string' ? b : JSON.stringify(b))); };
+                this.json = function() { return this.text().then(function(t) { return JSON.parse(t); }); };
+            };
+        }
         // iframe.contentWindow / contentDocument: same-origin iframes get the
         // parent window/document (no frame tree in oxi; same-origin policy is
         // moot for automation). recaptcha's render path reads
@@ -7358,6 +7416,45 @@ fn create_render_element_object(
         .name(js_string!("get assignedSlot"))
         .build();
 
+    // Child wrapper: element children get full element objects, text children
+    // get a minimal text-node surface. ParentNode/tree accessors depend on it.
+    fn child_wrapper(
+        ctx: &mut Context,
+        rd: &Rc<RefCell<Option<RenderDocument>>>,
+        dirty: &Arc<AtomicBool>,
+        child_id: usize,
+    ) -> JsValue {
+        let kind = rd.borrow().as_ref().and_then(|d| d.node_kind(child_id));
+        match kind {
+            Some("element") => {
+                create_render_element_object(ctx, rd.clone(), child_id, dirty.clone())
+            }
+            Some("text") => {
+                let text = rd
+                    .borrow()
+                    .as_ref()
+                    .and_then(|d| d.text_of(child_id))
+                    .unwrap_or_default();
+                JsValue::from(
+                    boa_engine::object::ObjectInitializer::new(ctx)
+                        .property(js_string!("nodeType"), JsValue::from(3), Attribute::all())
+                        .property(
+                            js_string!("nodeName"),
+                            JsValue::from(JsString::from("#text")),
+                            Attribute::all(),
+                        )
+                        .property(
+                            js_string!("textContent"),
+                            JsValue::from(JsString::from(text.as_str())),
+                            Attribute::all(),
+                        )
+                        .build(),
+                )
+            }
+            _ => JsValue::null(),
+        }
+    }
+
     // parentNode — live parent element (render-doc-backed), or null at the
     // top of the tree. recaptcha's loader walks s.parentNode.insertBefore.
     let rd_pn = render_doc.clone();
@@ -7382,6 +7479,138 @@ fn create_render_element_object(
     .name(js_string!("get parentNode"))
     .build();
 
+    // ── Tree accessors (childNodes/children/siblings/parent/owner/contains) ──
+    let rd_ta = render_doc.clone();
+    let dirty_ta = dom_dirty.clone();
+    let rel_getter = |label: &'static str,
+                      f: fn(&oxibrowser_render::RenderDocument, usize) -> Option<usize>,
+                      only_elements: bool|
+     -> JsFunction {
+        let rd_rel = rd_ta.clone();
+        let dirty_rel = dirty_ta.clone();
+        FunctionObjectBuilder::new(ctx.realm(), unsafe {
+            NativeFunction::from_closure(move |_this, _args, ctx| {
+                let guard = rd_rel.borrow();
+                let Some(doc) = guard.as_ref() else {
+                    return Ok(JsValue::null());
+                };
+                match f(doc, node_id) {
+                    Some(cid) => {
+                        if only_elements && doc.node_kind(cid) != Some("element") {
+                            return Ok(JsValue::null());
+                        }
+                        drop(guard);
+                        Ok(child_wrapper(ctx, &rd_rel, &dirty_rel, cid))
+                    }
+                    None => Ok(JsValue::null()),
+                }
+            })
+        })
+        .name(js_string!(label))
+        .build()
+    };
+    let first_child_getter_fn = rel_getter("get firstChild", RenderDocument::first_child, false);
+    let last_child_getter_fn = rel_getter("get lastChild", RenderDocument::last_child, false);
+    let next_sibling_getter_fn =
+        rel_getter("get nextSibling", RenderDocument::next_sibling, false);
+    let previous_sibling_getter_fn =
+        rel_getter("get previousSibling", RenderDocument::previous_sibling, false);
+    let parent_element_getter_fn = rel_getter("get parentElement", |doc, id| {
+        doc.parent_id(id)
+            .filter(|pid| doc.node_kind(*pid) == Some("element"))
+    }, false);
+
+    let rd_cn = rd_ta.clone();
+    let dirty_cn = dirty_ta.clone();
+    let child_nodes_getter_fn = FunctionObjectBuilder::new(ctx.realm(), unsafe {
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            let guard = rd_cn.borrow();
+            let Some(doc) = guard.as_ref() else {
+                return Ok(JsValue::null());
+            };
+            let ids = doc.children_ids(node_id);
+            let mut items = Vec::with_capacity(ids.len());
+            for cid in ids {
+                items.push(child_wrapper(ctx, &rd_cn, &dirty_cn, cid));
+            }
+            let arr = JsArray::from_iter(items, ctx);
+            Ok(arr.into())
+        })
+    })
+    .name(js_string!("get childNodes"))
+    .build();
+
+    let rd_ch = rd_ta.clone();
+    let dirty_ch = dirty_ta.clone();
+    let children_getter_fn = FunctionObjectBuilder::new(ctx.realm(), unsafe {
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            let guard = rd_ch.borrow();
+            let Some(doc) = guard.as_ref() else {
+                return Ok(JsValue::null());
+            };
+            let items: Vec<JsValue> = doc
+                .children_ids(node_id)
+                .into_iter()
+                .filter(|cid| doc.node_kind(*cid) == Some("element"))
+                .map(|cid| child_wrapper(ctx, &rd_ch, &dirty_ch, cid))
+                .collect();
+            let arr = JsArray::from_iter(items, ctx);
+            Ok(arr.into())
+        })
+    })
+    .name(js_string!("get children"))
+    .build();
+
+    let owner_document_getter_fn = FunctionObjectBuilder::new(ctx.realm(), unsafe {
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            ctx.global_object().get(js_string!("document"), ctx)
+        })
+    })
+    .name(js_string!("get ownerDocument"))
+    .build();
+
+    let rd_ct = render_doc.clone();
+    let contains_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            let Some(other) = args.first().cloned() else {
+                return Ok(JsValue::from(false));
+            };
+            fn node_id_of_x(node: &JsValue, ctx: &mut Context) -> Option<usize> {
+                node.as_object()
+                    .and_then(|o| o.get(js_string!("__nodeId"), ctx).ok())
+                    .and_then(|v| v.as_number().map(|n| n as usize))
+            }
+            let Some(other_id) = node_id_of_x(&other, ctx) else {
+                return Ok(JsValue::from(false));
+            };
+            let guard = rd_ct.borrow();
+            let mut stack = match guard
+                .as_ref()
+                .map(|doc| doc.children_ids(node_id))
+            {
+                Some(ids) => ids,
+                None => return Ok(JsValue::from(false)),
+            };
+            drop(guard);
+            let mut found = false;
+            let mut visited = 0usize;
+            while let Some(id) = stack.pop() {
+                visited += 1;
+                if visited > 500_000 {
+                    break;
+                }
+                if id == other_id {
+                    found = true;
+                    break;
+                }
+                if let Some(next_guard) = rd_ct.borrow().as_ref().map(|d| d.children_ids(id)) {
+                    stack.extend(next_guard);
+                }
+            }
+            Ok(JsValue::from(found))
+        })
+    };
+
     let obj = boa_engine::object::ObjectInitializer::new(ctx)
         .property(
             js_string!("tagName"),
@@ -7405,6 +7634,55 @@ fn create_render_element_object(
             None,
             Attribute::CONFIGURABLE,
         )
+        .accessor(
+            js_string!("parentElement"),
+            Some(parent_element_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("childNodes"),
+            Some(child_nodes_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("children"),
+            Some(children_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("firstChild"),
+            Some(first_child_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("lastChild"),
+            Some(last_child_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("nextSibling"),
+            Some(next_sibling_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("previousSibling"),
+            Some(previous_sibling_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("ownerDocument"),
+            Some(owner_document_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .function(contains_fn, js_string!("contains"), 1)
         .function(get_attr_fn, js_string!("getAttribute"), 1)
         .function(set_attr_fn, js_string!("setAttribute"), 2)
         .function(remove_attr_fn, js_string!("removeAttribute"), 1)

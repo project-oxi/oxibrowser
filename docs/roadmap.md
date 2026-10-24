@@ -143,6 +143,13 @@ what the harness can do; engine compatibility is now the ceiling.
    boa 0.22 reports phantom line/col on minified bundles, so identification
    needs real debugger positions), daum EMPTY (widget-SDK cascade + JS-render
    extraction), stackoverflow flaky 403 (stealth lever).
+   Iteration 7 (2026-10-24): render-doc elements gained full tree accessors
+   (childNodes/children/firstChild/lastChild/nextSibling/previousSibling/
+   parentElement/ownerDocument/contains — backed by new RenderDocument
+   traversal methods) plus Headers/Request/Response data-container classes
+   and window.innerWidth/innerHeight/outerWidth/outerHeight/devicePixelRatio
+   defaults. spotify error count now 1 (the web-player virtualizer's
+   internal-class construction — see iteration 6 residual).
 2. **Real-model smoke + corpus on live sites** — `agent run` against a live
    `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
    grow the corpus beyond loopback (login-gated tasks once accounts are in
