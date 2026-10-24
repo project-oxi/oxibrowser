@@ -36,7 +36,7 @@ use boa_engine::builtins::promise::ResolvingFunctions;
 use boa_engine::object::builtins::{JsArray, JsPromise};
 use boa_engine::object::{FunctionObjectBuilder, JsObject};
 use boa_engine::property::Attribute;
-use boa_engine::{Context, JsString, JsValue, NativeFunction, Source, js_string};
+use boa_engine::{Context, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source, js_string};
 use serde_json::Value;
 
 use crate::css::LayoutEngine;
@@ -3300,7 +3300,11 @@ fn run_navigation_scripts(
                     "throw-site mapping probe"
                 );
                 let frame = stack_for_log.lines().next()?;
-                let loc = frame.split("at ").last()?;
+                // Frame shape: "at <fn> (unknown at :4:162211)" — split on
+                // "at " yields the location with a leading colon (boa prints
+                // an empty source path).
+                let loc = frame.split("at ").last()?.trim();
+                let loc = loc.trim_end_matches(')').trim_start_matches(':');
                 let (line_no, col_no) = loc.split_once(':')?;
                 let line_no: usize = line_no.parse().ok()?;
                 let col_no: usize = col_no.trim_end_matches(')').trim().parse().ok()?;
@@ -6395,6 +6399,36 @@ fn create_context(
             globalThis[name] = ctor;
             if (typeof window !== 'undefined') { window[name] = ctor; }
         });
+        // Measured gaps (spotify.com, daum.net — 2026-10-24):
+        // - recaptcha/enterprise calls navigator.cookieDeprecationLabel
+        //   .getValue() (Chrome 132+ API);
+        // - ad SDKs read document.location.href — document.location must
+        //   alias window.location;
+        // - analytics reads window.screen.width/height.
+        if (typeof navigator !== 'undefined' && navigator.cookieDeprecationLabel === undefined) {
+            try {
+                Object.defineProperty(navigator, 'cookieDeprecationLabel', {
+                    value: { getValue: function() { return Promise.resolve(null); } },
+                    configurable: true,
+                });
+            } catch (e) { /* frozen navigator */ }
+        }
+        if (typeof document !== 'undefined' && !document.location && typeof location !== 'undefined') {
+            try { document.location = location; } catch (e) { /* read-only */ }
+        }
+        if (typeof window !== 'undefined' && !window.screen) {
+            window.screen = {
+                width: 1280, height: 720,
+                availWidth: 1280, availHeight: 720,
+                colorDepth: 24, pixelDepth: 24,
+                orientation: { type: 'landscape-primary', angle: 0 },
+            };
+        }
+        // NOTE: ParentNode.prepend/append/replaceChildren are provided
+        // NATIVELY on element objects (shared fn_ptrs in the element
+        // factories). A JS-level Object.prototype patch was attempted and
+        // reverted — it broke sloppy-mode scripts (measured: recaptcha
+        // IIFE failed at entry, 2026-10-24).
     "#,
     ));
 
@@ -7252,6 +7286,21 @@ fn create_render_element_object(
         .function(set_attr_fn, js_string!("setAttribute"), 2)
         .function(remove_attr_fn, js_string!("removeAttribute"), 1)
         .function(append_child_fn, js_string!("appendChild"), 1)
+        .function(
+            unsafe { NativeFunction::from_fn_ptr(prepend_obj_fn) },
+            js_string!("prepend"),
+            1,
+        )
+        .function(
+            unsafe { NativeFunction::from_fn_ptr(append_obj_fn) },
+            js_string!("append"),
+            1,
+        )
+        .function(
+            unsafe { NativeFunction::from_fn_ptr(replace_children_obj_fn) },
+            js_string!("replaceChildren"),
+            1,
+        )
         .function(remove_fn, js_string!("remove"), 0)
         .function(click_fn, js_string!("click"), 0)
         .function(
@@ -10138,6 +10187,21 @@ fn create_element_object(
         .function(click_fn, js_string!("click"), 0)
         .function(set_attribute_fn, js_string!("setAttribute"), 2)
         .function(append_child_obj_fn, js_string!("appendChild"), 1)
+        .function(
+            unsafe { NativeFunction::from_fn_ptr(prepend_obj_fn) },
+            js_string!("prepend"),
+            1,
+        )
+        .function(
+            unsafe { NativeFunction::from_fn_ptr(append_obj_fn) },
+            js_string!("append"),
+            1,
+        )
+        .function(
+            unsafe { NativeFunction::from_fn_ptr(replace_children_obj_fn) },
+            js_string!("replaceChildren"),
+            1,
+        )
         .function(remove_child_obj_fn, js_string!("removeChild"), 1)
         .function(element_qs_fn, js_string!("querySelector"), 1)
         .function(element_qsa_fn, js_string!("querySelectorAll"), 1)
@@ -10710,6 +10774,105 @@ fn register_storage_obj(
         .build();
 
     let _ = ctx.register_global_property(name, storage_obj, Attribute::all());
+}
+
+// ── Shared ParentNode methods (prepend / append / replaceChildren) ─────────
+// Delegating fn_ptrs: they call the element object's OWN native
+// insertBefore/appendChild/removeChild, so one implementation serves every
+// element factory. (Measured: recaptcha enterprise + daum widgets call
+// d.head.prepend; 2026-10-24.)
+
+fn call_own_method(
+    this: &JsValue,
+    name: &str,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let obj = this
+        .as_object()
+        .ok_or_else(|| JsNativeError::typ().with_message("not an object"))?;
+    let f = obj.get(js_string!(name), ctx)?;
+    let f = f
+        .as_callable()
+        .ok_or_else(|| JsNativeError::typ().with_message(format!("{name} is not a function")))?;
+    f.call(this, args, ctx)
+}
+
+fn first_child_value(this: &JsValue, ctx: &mut Context) -> JsValue {
+    let Some(obj) = this.as_object() else {
+        return JsValue::null();
+    };
+    let kids = obj
+        .get(js_string!("childNodes"), ctx)
+        .unwrap_or(JsValue::undefined());
+    let first = match kids.as_object() {
+        Some(k) => k.get(0, ctx).unwrap_or(JsValue::undefined()),
+        None => JsValue::undefined(),
+    };
+    if first.is_undefined() {
+        JsValue::null()
+    } else {
+        first
+    }
+}
+
+/// `ParentNode.prepend(...nodes)` — insert every argument before the current
+/// first child. Elements without insertBefore degrade to append (order loss;
+/// the node is still attached).
+fn prepend_obj_fn(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let has_insert = this
+        .as_object()
+        .and_then(|o| o.get(js_string!("insertBefore"), ctx).ok())
+        .map(|v| v.as_callable().is_some())
+        .unwrap_or(false);
+    if has_insert {
+        for i in (0..args.len()).rev() {
+            let first = first_child_value(this, ctx);
+            call_own_method(this, "insertBefore", &[args[i].clone(), first], ctx)?;
+        }
+    } else {
+        for arg in args {
+            call_own_method(this, "appendChild", &[arg.clone()], ctx)?;
+        }
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `ParentNode.append(...nodes)` — append every argument in order.
+fn append_obj_fn(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    for arg in args {
+        call_own_method(this, "appendChild", &[arg.clone()], ctx)?;
+    }
+    Ok(JsValue::undefined())
+}
+
+/// `ParentNode.replaceChildren(...nodes)` — remove every existing child, then
+/// append the arguments.
+fn replace_children_obj_fn(
+    this: &JsValue,
+    args: &[JsValue],
+    ctx: &mut Context,
+) -> JsResult<JsValue> {
+    let kids = match this.as_object() {
+        Some(o) => o
+            .get(js_string!("childNodes"), ctx)
+            .unwrap_or(JsValue::undefined()),
+        None => JsValue::undefined(),
+    };
+    if let Some(arr) = kids.as_object() {
+        let len = arr
+            .get(js_string!("length"), ctx)
+            .and_then(|v| v.to_number(ctx))
+            .unwrap_or(0.0) as u64;
+        for i in (0..len).rev() {
+            let child = arr.get(i, ctx)?;
+            let _ = call_own_method(this, "removeChild", &[child], ctx);
+        }
+    }
+    for arg in args {
+        call_own_method(this, "appendChild", &[arg.clone()], ctx)?;
+    }
+    Ok(JsValue::undefined())
 }
 
 // ---------------------------------------------------------------------------
@@ -14544,6 +14707,47 @@ mod tests {
                 "{\"kind\":\"function\",\"detail\":7,\"type\":\"ping\"}".into()
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn test_element_prepend_attaches_node() {
+        let mut rt = JsRuntime::new();
+        rt.set_document_with_scripts(
+            "<html><head></head><body></body></html>",
+            Some("https://example.com/"),
+            (400, 300),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        let result = rt
+            .evaluate(
+                r#"
+                (function(){
+                    var s1 = document.createElement('script'); s1.id = 'appended';
+                    var s2 = document.createElement('script'); s2.id = 'prepended';
+                    document.head.appendChild(s1);
+                    document.head.prepend(s2);
+                    var scripts = document.querySelectorAll('head script');
+                    var ids = [];
+                    for (var i = 0; i < scripts.length; i++) { ids.push(scripts[i].id); }
+                    return 'OK n=' + ids.length + ' ids=' + ids.join('|');
+                })()
+            "#,
+            )
+            .await
+            .unwrap();
+        let msg = result
+            .value
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+        assert!(msg.starts_with("OK"), "diagnostic: {msg}");
+        // Render-document elements lack insertBefore, so prepend degrades to
+        // append (documented in prepend_obj_fn): both scripts must be attached
+        // to <head>; strict ordering lands with render-crate insert-before.
+        assert!(msg.contains("n=2"), "diagnostic: {msg}");
+        assert!(msg.contains("appended"), "diagnostic: {msg}");
+        assert!(msg.contains("prepended"), "diagnostic: {msg}");
     }
 
     #[tokio::test]

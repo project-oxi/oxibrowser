@@ -112,7 +112,10 @@ what the harness can do; engine compatibility is now the ceiling.
    `Document is not defined`; stubs adopt a live instance's prototype so
    instanceof works, construction throws IllegalConstructor); evaluate/
    nav stack-size defaults raised for 0.22 accounting (1_024 → 4_096,
-   16_384 → 65_536). Findings: encore~web-player standalone loads CLEAN —
+   16_384 → 65_536); native ParentNode prepend/append/replaceChildren on
+   every element object (recaptcha enterprise dies on `d.head.prepend`;
+   a JS Object.prototype patch was attempted first and reverted — it broke
+   sloppy-mode IIFEs). Findings: encore~web-player standalone loads CLEAN —
    the spotify failure is a page-environment cascade (config arrives as
    base64 blobs decoded at runtime; the first failure is a dynamically
    built inline script) → root-causing it needs an in-page debugger (CDP
