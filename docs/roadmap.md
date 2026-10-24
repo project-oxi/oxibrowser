@@ -84,8 +84,21 @@ what the harness can do; engine compatibility is now the ceiling.
    (`css/render.rs` text/markdown/children-text, `deep_text_content`),
    64 MiB JS-thread stack, and a parser nesting guard
    (`MAX_SOURCE_NESTING`, mirrors V8's parser depth limit) — figma.com now
-   renders; spotify.com exits cleanly but renders empty (boa 0.20 ES gaps
-   in its web-player bundle) → boa 0.22 upgrade is the next lever.
+   renders; spotify.com exits cleanly but renders empty.
+   Iteration 2 (2026-10-24): **boa 0.20 → 0.22** (Test262 89.9% → 95.6%,
+   Temporal, ES2026 surface). Migration notes: `JobQueue` → `JobExecutor`
+   with a cooperative sync drain (blocking on a NativeAsyncJob deadlocks
+   when it awaits a sync job; awaiting the poll hangs when it pends
+   externally — hence non-blocking poll + no-op waker + 1_000-pass cap;
+   FinalizationRegistry cleanup jobs pend by design and are dropped),
+   `JsValue` variants → opaque struct (`as_*` accessors), `to_json` wraps
+   in `Option`, `JsArray::new` fallsible, third `EngineError` repr in
+   `format_js_error`, integer JSON normalization restored (0.22 dropped
+   the integer value repr). Suite 708/708 green.
+   Remaining corpus gap: spotify.com still renders empty — the web-player
+   bundle that 0.20 could not *parse* now parses, and the blocker moved
+   to a runtime API gap (`not a constructor` in encore/web-player) →
+   next lever: identify + polyfill the missing constructor.
    Known residual: `set_element_text_recursive`, `copy_node_recursive`,
    `estimate_y_recursive` and the snapshot remove-descendants walk are
    still recursive (iterative-conversion candidates); debug-profile builds

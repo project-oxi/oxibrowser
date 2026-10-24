@@ -5,5 +5,5 @@ https://example.com | static control
 https://news.ycombinator.com | classic SSR
 https://en.wikipedia.org/wiki/Main_Page | large document
 https://developer.chrome.com/docs/devtools | modern SSG
-https://www.spotify.com | heavy SPA — SIGABRT 2026-10-24 AM → EMPTY after isolation fix (boa 0.20 ES gaps block render)
+https://www.spotify.com | heavy SPA — SIGABRT (iter.1 fix) → EMPTY; 0.22 parses web-player, blocker now `not a constructor` (iter.2)
 https://www.figma.com | heavy WASM/worker app — stack-overflow abort 2026-10-24 AM → PASS after isolation fix

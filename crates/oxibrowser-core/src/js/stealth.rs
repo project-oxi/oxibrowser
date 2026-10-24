@@ -638,7 +638,8 @@ fn build_brands_array(ctx: &mut Context, major: &str) -> JsValue {
                 .build(),
         )
     };
-    let arr = boa_engine::object::builtins::JsArray::new(ctx);
+    let arr = boa_engine::object::builtins::JsArray::new(ctx)
+        .expect("creating an empty array with the default prototype must not fail");
     let _ = arr.push(mk("Not)A;Brand", "99", ctx), ctx);
     let _ = arr.push(mk("Chromium", major, ctx), ctx);
     let _ = arr.push(mk("Google Chrome", major, ctx), ctx);
@@ -679,7 +680,8 @@ fn build_high_entropy_payload(
                 .build(),
         )
     };
-    let fvl = boa_engine::object::builtins::JsArray::new(ctx);
+    let fvl = boa_engine::object::builtins::JsArray::new(ctx)
+        .expect("creating an empty array with the default prototype must not fail");
     let _ = fvl.push(mk("Not)A;Brand", "99.0.0.0", ctx), ctx);
     let _ = fvl.push(mk("Chromium", full, ctx), ctx);
     let _ = fvl.push(mk("Google Chrome", full, ctx), ctx);
@@ -867,7 +869,7 @@ fn build_webgl_constructor(ctx: &mut Context, p: &ChromeProfile, is_webgl2: bool
 
     // getParameter(pname) on the prototype.
     let proto = match ctor.get(js_string!("prototype"), ctx) {
-        Ok(v) => v.as_object().cloned(),
+        Ok(v) => v.as_object(),
         Err(_) => None,
     }
     // Functions built via FunctionObjectBuilder always carry a prototype;
@@ -951,7 +953,8 @@ fn build_webgl_constructor(ctx: &mut Context, p: &ChromeProfile, is_webgl2: bool
 
     let supported_fn = unsafe {
         NativeFunction::from_closure(move |_this, _args, ctx| {
-            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            let arr = boa_engine::object::builtins::JsArray::new(ctx)
+                .expect("creating an empty array with the default prototype must not fail");
             for ext in [
                 "ANGLE_instanced_arrays",
                 "EXT_blend_minmax",

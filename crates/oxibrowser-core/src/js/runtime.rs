@@ -977,33 +977,41 @@ fn format_console_number(n: f64) -> String {
 /// precomputed `JsValue::to_string` form (used for object descriptions and
 /// kept consistent for primitives).
 fn classify_console_arg(arg: &JsValue, display: &str, ctx: &mut Context) -> ConsoleArg {
-    match arg {
-        JsValue::String(_) => ConsoleArg::String(display.to_string()),
-        JsValue::Integer(n) => ConsoleArg::Number(*n as f64),
-        JsValue::Rational(n) => ConsoleArg::Number(*n),
-        JsValue::Boolean(b) => ConsoleArg::Boolean(*b),
-        JsValue::Null => ConsoleArg::Null,
-        JsValue::Undefined => ConsoleArg::Undefined,
-        JsValue::Object(obj) => {
-            let class_name = (|| {
-                let ctor = obj.get(js_string!("constructor"), ctx).ok()?;
-                let co = ctor.as_object()?;
-                let name_val = co.get(js_string!("name"), ctx).ok()?;
-                name_val
-                    .as_string()
-                    .map(|s| s.to_std_string_escaped())
-                    .filter(|s| !s.is_empty())
-            })()
-            .unwrap_or_else(|| "Object".to_string());
-            ConsoleArg::Object {
-                class_name,
-                description: display.to_string(),
-            }
-        }
-        JsValue::Symbol(_) | JsValue::BigInt(_) => ConsoleArg::Object {
-            class_name: "Object".to_string(),
+    if arg.is_null() {
+        return ConsoleArg::Null;
+    }
+    if arg.is_undefined() {
+        return ConsoleArg::Undefined;
+    }
+    if let Some(b) = arg.as_boolean() {
+        return ConsoleArg::Boolean(b);
+    }
+    if let Some(n) = arg.as_number() {
+        return ConsoleArg::Number(n);
+    }
+    if let Some(s) = arg.as_string() {
+        return ConsoleArg::String(s.to_std_string_escaped());
+    }
+    if let Some(obj) = arg.as_object() {
+        let class_name = (|| {
+            let ctor = obj.get(js_string!("constructor"), ctx).ok()?;
+            let co = ctor.as_object()?;
+            let name_val = co.get(js_string!("name"), ctx).ok()?;
+            name_val
+                .as_string()
+                .map(|s| s.to_std_string_escaped())
+                .filter(|s| !s.is_empty())
+        })()
+        .unwrap_or_else(|| "Object".to_string());
+        return ConsoleArg::Object {
+            class_name,
             description: display.to_string(),
-        },
+        };
+    }
+    // Symbol / BigInt and anything else: describe via the display form.
+    ConsoleArg::Object {
+        class_name: "Object".to_string(),
+        description: display.to_string(),
     }
 }
 
@@ -2323,7 +2331,7 @@ fn run_eval(
         ctx.eval(Source::from_bytes(expression))
     };
 
-    ctx.run_jobs();
+    let _ = ctx.run_jobs();
     drain_timers(job_queue, ctx);
 
     let act = active_context_id();
@@ -3157,7 +3165,7 @@ fn await_promise_value(
     // Drain microtasks repeatedly until the Promise settles
     // (up to 50 iterations to prevent infinite loops)
     for _ in 0..50 {
-        ctx.run_jobs();
+        let _ = ctx.run_jobs();
         drain_timers(job_queue, ctx);
 
         let settled = ctx
@@ -3268,7 +3276,7 @@ fn run_navigation_scripts(
             tracing::warn!(error = %msg, src = ?script.src_url, "page script threw; continuing");
         }
         // Drain microtasks + already-due timers queued by this script.
-        ctx.run_jobs();
+        let _ = ctx.run_jobs();
         drain_timers(job_queue, ctx);
     }
 
@@ -3294,7 +3302,7 @@ fn fire_lifecycle_event(ctx: &mut Context, event_type: &str) {
         evt = event_type
     );
     let _ = ctx.eval(Source::from_bytes(snippet.as_str()));
-    ctx.run_jobs();
+    let _ = ctx.run_jobs();
 }
 
 /// Pump microtasks and timers until the page is idle: no pending timers and no
@@ -3308,7 +3316,7 @@ fn settle_to_idle(
     budget: Duration,
 ) {
     for _pass in 0..200u32 {
-        ctx.run_jobs();
+        let _ = ctx.run_jobs();
         drain_timers(job_queue, ctx);
 
         let pending_timers = job_queue.timer_count();
@@ -3647,7 +3655,7 @@ fn drain_pending_fetch_responses(ctx: &mut Context) {
     // `.then` reactions) within this pump. Without it, an abort that empties
     // `pending_fetch` suppresses the settle_to_idle loop and leaves the
     // rejection reaction un-drained until the next evaluate.
-    ctx.run_jobs();
+    let _ = ctx.run_jobs();
 }
 /// Drain all available WebSocket events and fire the matching JS callbacks.
 /// Collects into a Vec first to release the `WS_EVENT_RX` borrow before
@@ -3802,7 +3810,7 @@ fn settle_ws_message(id: u64, data: WsData, ctx: &mut Context) {
         WsData::Binary(b) => {
             // Binary arrives as an array of byte values (binaryType-driven
             // ArrayBuffer construction is refined in the binary test task).
-            let arr = JsArray::new(ctx);
+            let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
             for &byte in &b {
                 let _ = arr.push(JsValue::from(byte), ctx);
             }
@@ -4044,7 +4052,7 @@ fn drain_timers(queue: &Rc<TokioJobQueue>, ctx: &mut Context) {
         }
 
         // Timer callbacks may have queued microtasks — drain those too
-        ctx.run_jobs();
+        let _ = ctx.run_jobs();
 
         iterations += 1;
         if iterations > 100 {
@@ -4088,7 +4096,7 @@ fn notify_mutation_observers(ctx: &mut Context, mutation_type: &str, target_id: 
                     // Push to __records
                     let records_val = obs_obj
                         .get(js_string!("__records"), ctx)
-                        .unwrap_or(JsValue::Null);
+                        .unwrap_or(JsValue::null());
                     if let Some(rec_obj) = records_val.as_object()
                         && let Ok(rec_arr) = JsArray::from_object(rec_obj.clone())
                     {
@@ -4116,7 +4124,7 @@ fn create_context(
 ) -> (Context, Rc<TokioJobQueue>) {
     let job_queue = Rc::new(TokioJobQueue::new());
     let mut context = Context::builder()
-        .job_queue(job_queue.clone())
+        .job_executor(job_queue.clone())
         .build()
         .expect("failed to build boa Engine context");
 
@@ -4205,7 +4213,7 @@ fn create_context(
             let delay_ms = clamp_delay_ms(args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0));
             let cb_args: Vec<JsValue> = args[2..].to_vec();
 
-            if let Some(func) = callback.as_object().cloned()
+            if let Some(func) = callback.as_object()
                 && func.is_callable()
             {
                 let deadline = timer_deadline_after(delay_ms);
@@ -4226,7 +4234,7 @@ fn create_context(
             let delay_ms = clamp_delay_ms(args.get(1).and_then(|v| v.as_number()).unwrap_or(0.0));
             let cb_args: Vec<JsValue> = args[2..].to_vec();
 
-            if let Some(func) = callback.as_object().cloned()
+            if let Some(func) = callback.as_object()
                 && func.is_callable()
             {
                 let deadline = timer_deadline_after(delay_ms);
@@ -4340,7 +4348,7 @@ fn create_context(
                 .get(1)
                 .and_then(|v| v.as_object())
                 .and_then(|opts| opts.get(js_string!("signal"), ctx).ok())
-                .and_then(|v| v.as_object().cloned());
+                .and_then(|v| v.as_object());
             if let Some(sig) = &signal_obj
                 && let Ok(aborted) = sig.get(js_string!("aborted"), ctx)
                 && aborted.as_boolean() == Some(true)
@@ -4762,9 +4770,9 @@ fn create_context(
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_default();
-            let protocols: Vec<String> = match args.get(1) {
-                Some(JsValue::String(s)) => vec![s.to_std_string_escaped()],
-                _ => vec![],
+            let protocols: Vec<String> = match args.get(1).and_then(|v| v.as_string()) {
+                Some(s) => vec![s.to_std_string_escaped()],
+                None => vec![],
             };
 
             let id = next_ws_id();
@@ -4773,11 +4781,16 @@ fn create_context(
             let send_id = id;
             let send_fn = NativeFunction::from_closure(move |_this, args, ctx| {
                 let data = match args.first() {
-                    Some(JsValue::String(s)) => WsData::Text(s.to_std_string_escaped()),
-                    Some(v) => match extract_binary_bytes(v, ctx) {
-                        Some(bytes) => WsData::Binary(bytes),
-                        None => WsData::Text(format!("{}", v.display())),
-                    },
+                    Some(v) => {
+                        if let Some(s) = v.as_string() {
+                            WsData::Text(s.to_std_string_escaped())
+                        } else {
+                            match extract_binary_bytes(v, ctx) {
+                                Some(bytes) => WsData::Binary(bytes),
+                                None => WsData::Text(format!("{}", v.display())),
+                            }
+                        }
+                    }
                     None => return Ok(JsValue::undefined()),
                 };
                 if event_sink_attached() {
@@ -4839,9 +4852,9 @@ fn create_context(
                         let key = JsString::from(format!("__listeners_{t}").as_str());
                         let existing = obj.get(key.clone(), ctx).unwrap_or(JsValue::null());
                         let arr = if let Some(o) = existing.as_object() {
-                            JsArray::from_object(o.clone()).unwrap_or_else(|_| JsArray::new(ctx))
+                            JsArray::from_object(o.clone()).unwrap_or_else(|_| JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail"))
                         } else {
-                            JsArray::new(ctx)
+                            JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail")
                         };
                         let _ = arr.push(cb.clone(), ctx);
                         let _ = obj.set(key, JsValue::from(arr), false, ctx);
@@ -4923,7 +4936,7 @@ fn create_context(
                 NativeFunction::from_closure(move |_this, _args, ctx| {
                     if let Some(obj) = _this.as_object() {
                         let _ = obj.set(js_string!("__observing"), JsValue::from(false), true, ctx);
-                        let empty_arr = JsArray::new(ctx);
+                        let empty_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
                         let _ =
                             obj.set(js_string!("__records"), JsValue::from(empty_arr), true, ctx);
                     }
@@ -4943,7 +4956,7 @@ fn create_context(
                         let registry = ctx
                             .global_object()
                             .get(js_string!("__moRegistry"), ctx)
-                            .unwrap_or(JsValue::Null);
+                            .unwrap_or(JsValue::null());
                         if let Some(reg_obj) = registry.as_object()
                             && let Ok(reg_arr) = JsArray::from_object(reg_obj.clone())
                         {
@@ -4959,19 +4972,19 @@ fn create_context(
                     if let Some(obj) = _this.as_object() {
                         let records = obj
                             .get(js_string!("__records"), ctx)
-                            .unwrap_or(JsValue::Null);
+                            .unwrap_or(JsValue::null());
                         // Clear records
-                        let empty_arr = JsArray::new(ctx);
+                        let empty_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
                         let _ =
                             obj.set(js_string!("__records"), JsValue::from(empty_arr), true, ctx);
                         return Ok(records);
                     }
-                    let arr = JsArray::new(ctx);
+                    let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
                     Ok(JsValue::from(arr))
                 })
             };
 
-            let empty_arr = JsArray::new(ctx);
+            let empty_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
             let obj = boa_engine::object::ObjectInitializer::new(ctx)
                 .property(js_string!("__callback"), callback, Attribute::all())
                 .property(
@@ -4995,7 +5008,8 @@ fn create_context(
     let _ = context.register_global_callable(js_string!("MutationObserver"), 1, mo_ctor);
 
     // Global MutationObserver registry — tracks all active observers
-    let mo_registry = JsArray::new(&mut context);
+    let mo_registry = JsArray::new(&mut context)
+        .expect("creating an empty array with the default prototype must not fail");
     let _ = context.register_global_property(
         js_string!("__moRegistry"),
         JsValue::from(mo_registry),
@@ -5458,7 +5472,7 @@ fn create_context(
                     };
 
                     // Store params in an array for methods to use
-                    let params_arr = JsArray::new(ctx);
+                    let params_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
                     for (k, v) in &params {
                         let entry = boa_engine::object::ObjectInitializer::new(ctx)
                             .property(
@@ -5645,7 +5659,7 @@ fn create_context(
     {
         let globals = context.global_object().clone();
         if let Ok(url_val) = globals.get(js_string!("URL"), &mut context)
-            && let Some(url_obj) = url_val.as_object().cloned()
+            && let Some(url_obj) = url_val.as_object()
         {
             let _ = url_obj.set(
                 js_string!("createObjectURL"),
@@ -5702,7 +5716,7 @@ fn create_context(
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_default();
             let bytes = input.as_bytes();
-            let arr = JsArray::new(ctx);
+            let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
             for &b in bytes {
                 let _ = arr.push(JsValue::from(b), ctx);
             }
@@ -5735,7 +5749,8 @@ fn create_context(
                         .map(|s| s.to_std_string_escaped())
                         .unwrap_or_default();
                     let bytes = input.as_bytes();
-                    let arr = JsArray::new(ctx2);
+                    let arr = JsArray::new(ctx2)
+                        .expect("creating an empty array with the default prototype must not fail");
                     for &b in bytes {
                         let _ = arr.push(JsValue::from(b), ctx2);
                     }
@@ -5830,7 +5845,7 @@ fn create_context(
                 return Ok(JsArray::from_iter([source], ctx).into());
             }
 
-            Ok(JsArray::new(ctx).into())
+            Ok(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail").into())
         })
     };
     let _ = context.register_global_callable(js_string!("ArrayFrom"), 1, array_from_fn);
@@ -5849,7 +5864,7 @@ fn create_context(
             let Some(callback) = args.first().cloned() else {
                 return Ok(JsValue::undefined());
             };
-            if let Some(func) = callback.as_object().cloned()
+            if let Some(func) = callback.as_object()
                 && func.is_callable()
             {
                 let deadline = Instant::now() + Duration::from_millis(16);
@@ -5893,7 +5908,7 @@ fn create_context(
             let Some(callback) = args.first().cloned() else {
                 return Ok(JsValue::undefined());
             };
-            if let Some(func) = callback.as_object().cloned()
+            if let Some(func) = callback.as_object()
                 && func.is_callable()
             {
                 let timeout_ms = args
@@ -6550,7 +6565,7 @@ fn create_render_element_object(
                 let frag_children = child
                     .as_object()
                     .and_then(|o| o.get(js_string!("childNodes"), ctx).ok())
-                    .and_then(|v| v.as_object().cloned())
+                    .and_then(|v| v.as_object())
                     .map(JsArray::from_object);
                 let children: Vec<JsValue> = match frag_children {
                     Some(Ok(arr)) => arr
@@ -6611,7 +6626,7 @@ fn create_render_element_object(
                 && let Some(frag_obj) = child.as_object()
                 && let Err(e) = frag_obj.set(
                     js_string!("childNodes"),
-                    JsValue::from(JsArray::new(ctx)),
+                    JsValue::from(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail")),
                     true,
                     ctx,
                 )
@@ -6841,7 +6856,7 @@ fn create_render_element_object(
                 .and_then(|v| v.as_string())
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_default();
-            if let Some(cb) = args.get(1).and_then(|v| v.as_object().cloned()) {
+            if let Some(cb) = args.get(1).and_then(|v| v.as_object()) {
                 if let Some(token) = rd_listener
                     .borrow_mut()
                     .as_mut()
@@ -7524,7 +7539,7 @@ fn register_document_object(
             // Get or create __listeners object
             let listeners_val = this_obj
                 .get(js_string!("__listeners"), ctx)
-                .unwrap_or(JsValue::Null);
+                .unwrap_or(JsValue::null());
             // Create __listeners if missing
             if listeners_val.as_object().is_none() {
                 let obj = boa_engine::object::ObjectInitializer::new(ctx).build();
@@ -7532,7 +7547,7 @@ fn register_document_object(
             }
             let lv2 = this_obj
                 .get(js_string!("__listeners"), ctx)
-                .unwrap_or(JsValue::Null);
+                .unwrap_or(JsValue::null());
             let listeners_obj = match lv2.as_object() {
                 Some(o) => o,
                 None => return Ok(JsValue::undefined()),
@@ -7542,12 +7557,12 @@ fn register_document_object(
             let arr_key = JsString::from(event_type.as_str());
             let ev = listeners_obj
                 .get(arr_key.clone(), ctx)
-                .unwrap_or(JsValue::Null);
+                .unwrap_or(JsValue::null());
             if ev.as_object().is_none() {
-                let a: JsValue = JsValue::from(JsArray::new(ctx));
+                let a: JsValue = JsValue::from(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail"));
                 let _ = listeners_obj.set(arr_key.clone(), a, true, ctx);
             }
-            let arr_val = listeners_obj.get(arr_key, ctx).unwrap_or(JsValue::Null);
+            let arr_val = listeners_obj.get(arr_key, ctx).unwrap_or(JsValue::null());
             if let Some(arr_obj) = arr_val.as_object()
                 && let Ok(arr) = JsArray::from_object(arr_obj.clone())
             {
@@ -7572,7 +7587,7 @@ fn register_document_object(
             {
                 let _ = l_obj.set(
                     JsString::from(event_type.as_str()),
-                    JsValue::Null,
+                    JsValue::null(),
                     true,
                     ctx,
                 );
@@ -7603,7 +7618,7 @@ fn register_document_object(
             {
                 let arr_val = l_obj
                     .get(JsString::from(event_type.as_str()), ctx)
-                    .unwrap_or(JsValue::Null);
+                    .unwrap_or(JsValue::null());
                 if let Some(arr_obj) = arr_val.as_object()
                     && let Ok(arr) = JsArray::from_object(arr_obj.clone())
                     && let Ok(len) = arr.length(ctx)
@@ -8378,14 +8393,14 @@ fn create_element_object(
             // Ensure __listeners exists
             let lv = this_obj
                 .get(js_string!("__listeners"), ctx)
-                .unwrap_or(JsValue::Null);
+                .unwrap_or(JsValue::null());
             if lv.as_object().is_none() {
                 let obj = boa_engine::object::ObjectInitializer::new(ctx).build();
                 let _ = this_obj.set(js_string!("__listeners"), JsValue::from(obj), true, ctx);
             }
             let listeners_val2 = this_obj
                 .get(js_string!("__listeners"), ctx)
-                .unwrap_or(JsValue::Null);
+                .unwrap_or(JsValue::null());
             let listeners_obj = match listeners_val2.as_object() {
                 Some(o) => o,
                 None => return Ok(JsValue::undefined()),
@@ -8394,12 +8409,12 @@ fn create_element_object(
             let arr_key = JsString::from(event_type.as_str());
             let ev = listeners_obj
                 .get(arr_key.clone(), ctx)
-                .unwrap_or(JsValue::Null);
+                .unwrap_or(JsValue::null());
             if ev.as_object().is_none() {
-                let a: JsValue = JsValue::from(JsArray::new(ctx));
+                let a: JsValue = JsValue::from(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail"));
                 let _ = listeners_obj.set(arr_key.clone(), a, true, ctx);
             }
-            let arr_val = listeners_obj.get(arr_key, ctx).unwrap_or(JsValue::Null);
+            let arr_val = listeners_obj.get(arr_key, ctx).unwrap_or(JsValue::null());
             if let Some(arr_obj) = arr_val.as_object()
                 && let Ok(arr) = JsArray::from_object(arr_obj.clone())
             {
@@ -8434,7 +8449,7 @@ fn create_element_object(
             {
                 let _ = l_obj.set(
                     JsString::from(event_type.as_str()),
-                    JsValue::Null,
+                    JsValue::null(),
                     true,
                     ctx,
                 );
@@ -8477,7 +8492,7 @@ fn create_element_object(
             {
                 let arr_val = l_obj
                     .get(JsString::from(event_type.as_str()), ctx)
-                    .unwrap_or(JsValue::Null);
+                    .unwrap_or(JsValue::null());
                 if let Some(arr_obj) = arr_val.as_object()
                     && let Ok(arr) = JsArray::from_object(arr_obj.clone())
                     && let Ok(len) = arr.length(ctx)
@@ -9980,7 +9995,7 @@ fn create_element_object(
                             let arr = JsArray::from_iter(items, ctx);
                             return Ok(arr.into());
                         }
-                        let arr = JsArray::new(ctx);
+                        let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
                         Ok(arr.into())
                     })
                 }
@@ -10153,38 +10168,47 @@ fn json_to_js_value(value: &Value, context: &mut Context) -> JsValue {
 
 /// Convert a boa_engine JsValue to serde_json::Value.
 fn js_value_to_json(value: &JsValue, context: &mut Context) -> Value {
-    match value {
-        JsValue::Null | JsValue::Undefined => Value::Null,
-        JsValue::Boolean(b) => Value::Bool(*b),
-        JsValue::Integer(n) => Value::Number(serde_json::Number::from(*n)),
-        JsValue::Rational(n) => serde_json::Number::from_f64(*n)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        JsValue::String(s) => Value::String(s.to_std_string_escaped()),
-        JsValue::Symbol(_) => Value::String("[symbol]".to_string()),
-        JsValue::BigInt(_) => {
-            let s = value
-                .to_string(context)
-                .unwrap_or_else(|_| JsString::from("0n"));
-            Value::String(s.to_std_string_escaped())
-        }
-        JsValue::Object(obj) => {
-            if obj.is_array()
-                && let Ok(arr) = JsArray::from_object(obj.clone())
-            {
-                let len = arr.length(context).unwrap_or(0) as usize;
-                let mut vec = Vec::with_capacity(len);
-                for i in 0..len {
-                    match arr.at(i as i64, context) {
-                        Ok(elem) => vec.push(js_value_to_json(&elem, context)),
-                        Err(_) => vec.push(Value::Null),
-                    }
-                }
-                return Value::Array(vec);
-            }
-            object_to_json_via_stringify(obj, context)
-        }
+    if value.is_null() || value.is_undefined() {
+        return Value::Null;
     }
+    if let Some(b) = value.as_boolean() {
+        return Value::Bool(b);
+    }
+    if let Some(n) = value.as_number() {
+        // boa 0.22 dropped the integer value representation — every number
+        // is an f64. Keep whole numbers as JSON integers so downstream
+        // consumers (tests, CDP payloads, agents) see stable numeric types.
+        if n.fract() == 0.0 && n.abs() < 9_007_199_254_740_992.0 {
+            return Value::Number(serde_json::Number::from(n as i64));
+        }
+        return serde_json::Number::from_f64(n)
+            .map(Value::Number)
+            .unwrap_or(Value::Null);
+    }
+    if let Some(s) = value.as_string() {
+        return Value::String(s.to_std_string_escaped());
+    }
+    if let Some(obj) = value.as_object() {
+        if obj.is_array()
+            && let Ok(arr) = JsArray::from_object(obj.clone())
+        {
+            let len = arr.length(context).unwrap_or(0) as usize;
+            let mut vec = Vec::with_capacity(len);
+            for i in 0..len {
+                match arr.at(i as i64, context) {
+                    Ok(elem) => vec.push(js_value_to_json(&elem, context)),
+                    Err(_) => vec.push(Value::Null),
+                }
+            }
+            return Value::Array(vec);
+        }
+        return object_to_json_via_stringify(&obj, context);
+    }
+    // Symbol / BigInt: fall back to their string form.
+    let s = value
+        .to_string(context)
+        .unwrap_or_else(|_| JsString::from("0n"));
+    Value::String(s.to_std_string_escaped())
 }
 
 /// Convert a JS object to JSON via `JSON.stringify`.
@@ -10524,7 +10548,7 @@ fn register_storage_obj(
 
 fn format_js_error(err: &boa_engine::JsError, context: &mut Context) -> String {
     if let Some(native) = err.as_native() {
-        let kind = format!("{:?}", native.kind).to_lowercase();
+        let kind = format!("{:?}", native.kind()).to_lowercase();
         let msg = native.message();
         if msg.is_empty() {
             return kind;
@@ -10554,6 +10578,15 @@ fn format_js_error(err: &boa_engine::JsError, context: &mut Context) -> String {
             }
         }
         return format!("Error: {:?}", opaque);
+    }
+
+    // boa 0.22 added a third repr — `EngineError` (RuntimeLimitError and
+    // friends) — which is neither native nor opaque. Its Display carries the
+    // actionable text; keep the first line (Display appends backtrace frames).
+    let rendered = err.to_string();
+    let first_line = rendered.lines().next().unwrap_or_default().trim();
+    if !first_line.is_empty() {
+        return first_line.to_string();
     }
 
     "Unknown JavaScript error".to_string()
@@ -14283,10 +14316,10 @@ mod tests {
         assert!(!result.is_ok(), "infinite recursion should fail");
         let msg = result.exception.unwrap();
         assert!(
-            msg.to_lowercase().contains("exceeded")
-                || msg.to_lowercase().contains("recursion")
-                || msg.to_lowercase().contains("stack"),
-            "error should mention stack/recursion limit, got: {msg}"
+            msg.contains("recursive calls")
+                || msg.contains("recursion")
+                || msg.contains("stack"),
+            "error should mention the recursion limit, got: {msg}"
         );
     }
 
@@ -14319,8 +14352,8 @@ mod tests {
         assert!(!result.is_ok(), "infinite loop should fail");
         let msg = result.exception.unwrap();
         assert!(
-            msg.contains("loop iteration limit"),
-            "error should mention loop iteration limit, got: {msg}"
+            msg.contains("iteration loops") || msg.contains("loop"),
+            "error should mention the loop iteration limit, got: {msg}"
         );
     }
 

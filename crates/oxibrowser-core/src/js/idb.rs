@@ -87,7 +87,7 @@ fn data_error(msg: impl std::fmt::Display) -> JsError {
 }
 
 fn json_of(value: &JsValue, ctx: &mut Context) -> Option<Json> {
-    value.to_json(ctx).ok()
+    value.to_json(ctx).ok().flatten()
 }
 
 /// Build an `IDBRequest`-shaped object carrying `result`, queueing its
@@ -258,7 +258,8 @@ fn make_store(
                         .collect()
                 })
                 .unwrap_or_default();
-            let arr = boa_engine::object::builtins::JsArray::new(ctx);
+            let arr = boa_engine::object::builtins::JsArray::new(ctx)
+                .expect("creating an empty array with the default prototype must not fail");
             for v in &records {
                 arr.push(json_value(v, ctx), ctx).ok();
             }

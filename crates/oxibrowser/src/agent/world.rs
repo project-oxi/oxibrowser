@@ -269,15 +269,23 @@ Promise.resolve(globalThis.__replP).then(
                     "(function (v) { delete globalThis.__taskDone; return v; })(globalThis.__taskDone === undefined ? null : globalThis.__taskDone)",
                 ))
                 .ok()
-                .and_then(|v| if v.is_null_or_undefined() { None } else { v.to_json(ctx).ok() });
+                .and_then(|v| {
+                    if v.is_null_or_undefined() {
+                        None
+                    } else {
+                        v.to_json(ctx).ok().flatten()
+                    }
+                });
             return if ok {
                 let value = if v.is_undefined() {
                     // Programs without an explicit `return` settle to
                     // undefined; boa's to_json panics on it.
                     Value::Null
                 } else {
+                    // boa 0.22 to_json wraps in Option (undefined → None).
                     v.to_json(ctx)
                         .map_err(|e| format!("result serialization: {e}"))?
+                        .unwrap_or(Value::Null)
                 };
                 Ok((value, done))
             } else {

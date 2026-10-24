@@ -164,7 +164,6 @@ fn wasm_error_ctor(kind: &str, ctx: &mut boa_engine::Context) -> Option<JsObject
         .get(js_string!(kind), ctx)
         .ok()?
         .as_object()
-        .cloned()
 }
 
 /// Mint a fresh empty JS object with the default object prototype.
@@ -326,7 +325,7 @@ pub fn register_wasm_globals(ctx: &mut boa_engine::Context) -> JsResult<()> {
     let validate_fn = NativeFunction::from_fn_ptr(|_this, args, ctx| {
         let bytes = extract_bytes(args.get_or_undefined(0), ctx).unwrap_or_default();
         let ok = WASM_ENGINE.with(|eng| wasmi::Module::validate(eng, &bytes).is_ok());
-        Ok(JsValue::Boolean(ok))
+        Ok(JsValue::from(ok))
     });
     ctx.register_global_callable(js_string!("__wasmValidate"), 1, validate_fn)?;
 
@@ -382,7 +381,7 @@ fn build_instance(args: &[JsValue], ctx: &mut boa_engine::Context) -> JsResult<J
         .get_or_undefined(0)
         .as_object()
         .ok_or_else(|| type_err("expected a WebAssembly.Module"))?;
-    let module_id = get_handle(module_obj, "__wasm_module", ctx)
+    let module_id = get_handle(&module_obj, "__wasm_module", ctx)
         .ok_or_else(|| type_err("invalid WebAssembly.Module"))?;
     let module = WASM_MODULES
         .with(|reg| reg.borrow().get(&module_id).cloned())
@@ -507,7 +506,8 @@ fn make_export_callable(
                     } else if outputs.len() == 1 {
                         Ok(val_to_jsval(&outputs[0]))
                     } else {
-                        let arr = JsArray::new(ctx);
+                        let arr = JsArray::new(ctx)
+                            .expect("creating an empty array with the default prototype must not fail");
                         for v in &outputs {
                             arr.push(val_to_jsval(v), ctx)?;
                         }
@@ -543,7 +543,7 @@ fn resolve_imports(
     for imp in module.imports() {
         let module_name = imp.module();
         let field_name = imp.name();
-        let val = match import_root {
+        let val = match &import_root {
             Some(root) => root
                 .get(js_string!(module_name), ctx)
                 .ok()
@@ -573,7 +573,7 @@ fn resolve_imports(
             }
             wasmi::ExternType::Memory(_) => {
                 if let Some(o) = val.as_ref().and_then(|v| v.as_object())
-                    && let Some(id) = get_handle(o, "__wasm_memory", ctx)
+                    && let Some(id) = get_handle(&o, "__wasm_memory", ctx)
                 {
                     let mem = WASM_MEMORIES
                         .with(|reg| reg.borrow().get(&id).cloned())
@@ -585,7 +585,7 @@ fn resolve_imports(
             }
             wasmi::ExternType::Table(_) => {
                 if let Some(o) = val.as_ref().and_then(|v| v.as_object())
-                    && let Some(id) = get_handle(o, "__wasm_table", ctx)
+                    && let Some(id) = get_handle(&o, "__wasm_table", ctx)
                 {
                     let tab = WASM_TABLES
                         .with(|reg| reg.borrow().get(&id).cloned())
@@ -689,7 +689,7 @@ fn build_memory(args: &[JsValue], ctx: &mut boa_engine::Context) -> JsResult<JsV
                     // Refresh the `.buffer` snapshot to the new size.
                     let new_bytes = memory_size(&mem);
                     if let Some(this_obj) = _this.as_object() {
-                        set_buffer_view(this_obj, new_bytes, ctx)?;
+                        set_buffer_view(&this_obj, new_bytes, ctx)?;
                     }
                     Ok(JsValue::from(old_pages))
                 }
@@ -836,7 +836,7 @@ mod tests {
         register_wasm_globals(&mut ctx).unwrap();
         let js = format!("WebAssembly.validate({})", js_bytes(&minimal_wasm()));
         let result = ctx.eval(Source::from_bytes(&js)).unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result.as_boolean(), Some(true));
     }
 
     #[test]
@@ -848,7 +848,7 @@ mod tests {
                 "WebAssembly.validate(new Uint8Array([0,0,0,0]))",
             ))
             .unwrap();
-        assert_eq!(result, JsValue::Boolean(false));
+        assert_eq!(result.as_boolean(), Some(false));
     }
 
     #[test]
@@ -860,7 +860,7 @@ mod tests {
             js_bytes(&minimal_wasm())
         );
         let result = ctx.eval(Source::from_bytes(&js)).unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result.as_boolean(), Some(true));
     }
 
     // ── Task 3: Instance + exported function calls ──────────────────────────
@@ -989,7 +989,7 @@ mod tests {
             b = js_bytes(&minimal_wasm())
         );
         let result = ctx.eval(Source::from_bytes(&js)).unwrap();
-        assert_eq!(result, JsValue::Boolean(true));
+        assert_eq!(result.as_boolean(), Some(true));
     }
 
     #[test]
