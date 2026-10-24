@@ -121,8 +121,17 @@ what the harness can do; engine compatibility is now the ceiling.
    built inline script) → root-causing it needs an in-page debugger (CDP
    Debugger domain), not more stubs. stackoverflow 403 reproduces with
    plain curl + Chrome UA → IP/ TLS-class bot wall, stealth-plane work.
+   Iteration 5 (2026-10-24): **sub-resource decompression fixed** — the
+   Chrome emulation profile injects `Accept-Encoding: gzip, deflate, br,
+   zstd` but wreq was compiled WITHOUT the matching decoder features, so
+   every compressed sub-resource (scripts, stylesheets, fonts, XHR bodies)
+   arrived as raw compressed bytes ("unexpected '' at 1:1" on any
+   compressed CDN script). wreq features gzip/brotli/deflate/zstd enabled
+   + client `.gzip/.brotli/.deflate/.zstd(true)`. Local gzip repro passes;
+   gtm/retargeting empty-source class eliminated; stackoverflow flipped
+   403 → 200 on one run (bot wall now flaky rather than constant).
    Known residual: spotify×2 + daum EMPTY (in-page debugger lever),
-   stackoverflow FETCH_ERR (stealth lever).
+   stackoverflow flaky 403 (stealth lever).
 2. **Real-model smoke + corpus on live sites** — `agent run` against a live
    `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
    grow the corpus beyond loopback (login-gated tasks once accounts are in

@@ -12359,15 +12359,29 @@ fn register_window_globals(
     var th = opts && opts.threshold != null ? opts.threshold : 0;
     this.thresholds = typeof th === 'number' ? [th] : [0];
   }
+  // Callbacks fire ASYNCHRONOUSLY (microtask), matching the spec's
+  // post-layout delivery. Synchronous delivery broke real bundles:
+  // spotify.com's virtualizer observed during bundle evaluation, and the
+  // callback ran before a later-in-source class was initialized
+  // (TypeError swallowed by the try/catch below, leaving the player dead).
+  function defer(cb, self, entries, label) {
+    Promise.resolve().then(function () {
+      try {
+        cb.call(self, entries, self);
+      } catch (e) {
+        if (typeof console !== 'undefined' && console.error) {
+          console.error(label + ' callback threw: ' + e);
+        }
+      }
+    });
+  }
   IO.prototype.observe = function (t) {
-    try {
-      this.__cb([{
-        target: t, isIntersecting: true, isVisible: true, intersectionRatio: 1,
-        time: Date.now(), rootBounds: null,
-        intersectionRect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 1, height: 1 },
-        boundingClientRect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 1, height: 1 }
-      }], this);
-    } catch (e) {}
+    defer(this.__cb, this, [{
+      target: t, isIntersecting: true, isVisible: true, intersectionRatio: 1,
+      time: Date.now(), rootBounds: null,
+      intersectionRect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 1, height: 1 },
+      boundingClientRect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 1, height: 1 }
+    }], 'IntersectionObserver');
     return this;
   };
   IO.prototype.unobserve = function () { return this; };
@@ -12380,15 +12394,13 @@ fn register_window_globals(
     this.__cb = cb;
   }
   RO.prototype.observe = function (t) {
-    try {
-      this.__cb([{
-        target: t,
-        contentRect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 1, height: 1 },
-        borderBoxSize: [{ inlineSize: 1, blockSize: 1 }],
-        contentBoxSize: [{ inlineSize: 1, blockSize: 1 }],
-        devicePixelContentBoxSize: [{ inlineSize: 1, blockSize: 1 }]
-      }], this);
-    } catch (e) {}
+    defer(this.__cb, this, [{
+      target: t,
+      contentRect: { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 1, height: 1 },
+      borderBoxSize: [{ inlineSize: 1, blockSize: 1 }],
+      contentBoxSize: [{ inlineSize: 1, blockSize: 1 }],
+      devicePixelContentBoxSize: [{ inlineSize: 1, blockSize: 1 }]
+    }], 'ResizeObserver');
     return this;
   };
   RO.prototype.unobserve = function () { return this; };

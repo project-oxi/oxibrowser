@@ -220,6 +220,15 @@ impl HttpClient {
 
         let mut builder = Client::builder()
             .emulation(Emulation::Chrome149)
+            // The Chrome emulation profile injects `Accept-Encoding: gzip,
+            // deflate, br, zstd` — without the matching decoder features
+            // wreq passes compressed bodies through RAW, so every compressed
+            // sub-resource (script/stylesheet/XHR) arrived as binary garbage
+            // (measured: spotifycdn gtm.js empty source, 2026-10-24).
+            .gzip(true)
+            .brotli(true)
+            .deflate(true)
+            .zstd(true)
             .user_agent(&config.user_agent)
             .pool_max_idle_per_host(config.connection_pool_size)
             .timeout(config.default_timeout)

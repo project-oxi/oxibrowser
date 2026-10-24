@@ -31,7 +31,7 @@ thiserror = "2"
 tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-wreq = { version = "=6.0.0-rc.29", features = ["json", "form", "stream", "cookies"] }
+wreq = { version = "=6.0.0-rc.29", features = ["json", "form", "stream", "cookies", "gzip", "brotli", "deflate", "zstd"] }
 wreq-util = "3.0.0-rc"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
