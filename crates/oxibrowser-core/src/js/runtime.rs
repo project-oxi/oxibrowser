@@ -6592,14 +6592,17 @@ fn create_context(
         // and die on it ("cannot convert null/undefined to object" —
         // measured: spotify.com web-player chunk chain at URLSearchParams).
         // Give every function-valued global a prototype object when missing.
-        try {
-            Object.getOwnPropertyNames(globalThis).forEach(function(name) {
-                try {
-                    var C = globalThis[name];
-                    if (typeof C === 'function' && !C.prototype) { C.prototype = {}; }
-                } catch (e) { /* getter threw — skip */ }
-            });
-        } catch (e) { /* ignore */ }
+        // DISABLED: the global prototype filler broke dispatchEvent
+        // (measured: CustomEvent test, 2026-10-24). Needs a targeted
+        // approach instead of blanket prototype assignment.
+        // try {
+        //     Object.getOwnPropertyNames(globalThis).forEach(function(name) {
+        //         try {
+        //             var C = globalThis[name];
+        //             if (typeof C === 'function' && !C.prototype) { C.prototype = {}; }
+        //         } catch (e) { }
+        //     });
+        // } catch (e) { }
         // Intl constructors missing from boa 0.22 (measured: spotify web-player
         // module 40608 = locale-data chunk dies on `new Intl.Locale`, taking
         // the whole virtualizer with it). Functional English-fallback
@@ -6687,29 +6690,30 @@ fn create_context(
                 };
             }
         }
+        // Dynamic <script src> execution: SPA chunk loaders (rspack/webpack)
+        // insert <script> elements to load code asynchronously; the browser
+        // fetches and evaluates them. Without this the chunk never loads and
+        // the app stays silent (measured: spotify.com web-player).
+        // NOTE: createElement wrapper for iframe.contentWindow injection was
+        // attempted and reverted — it broke dispatchEvent in the test suite
+        // (measured: CustomEvent test failure, 2026-10-24). iframe
+        // contentWindow support needs a native-level fix instead.
+        if (typeof window !== 'undefined' && typeof window.fetch === 'function' && typeof window.__oxi_load_script === 'undefined') {
+            window.__oxi_load_script = function(src) {
+                fetch(src).then(function(r) { return r.text(); }).then(function(code) {
+                    if (code) { (0, eval)(code); }
+                }).catch(function(e) {
+                    if (typeof console !== 'undefined' && console.error) { console.error('dynamic script ' + src + ': ' + e); }
+                });
+            };
+        }
         // iframe.contentWindow / contentDocument: same-origin iframes get the
         // parent window/document (no frame tree in oxi; same-origin policy is
         // moot for automation). recaptcha's render path reads
         // iframe.contentWindow.document and dies on undefined otherwise.
-        if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
-            var __oxiCreateEl = document.createElement;
-            document.createElement = function(tag, opts) {
-                var el = __oxiCreateEl.call(this, tag, opts);
-                try {
-                    if (el && String(tag).toLowerCase() === 'iframe'
-                        && el.contentWindow === undefined) {
-                        Object.defineProperty(el, 'contentWindow', {
-                            get: function() { return window; }, configurable: true,
-                        });
-                        Object.defineProperty(el, 'contentDocument', {
-                            get: function() { return document; }, configurable: true,
-                        });
-                    }
-                } catch (e) { /* keep the plain element */ }
-                return el;
-            };
-        }
-        // NOTE: ParentNode.prepend/append/replaceChildren are provided
+        // NOTE: createElement wrapper for iframe.contentWindow was attempted
+        // and reverted - it broke dispatchEvent (measured: CustomEvent test).
+        // ParentNode.prepend/append/replaceChildren are provided
         // NATIVELY on element objects (shared fn_ptrs in the element
         // factories). A JS-level Object.prototype patch was attempted and
         // reverted — it broke sloppy-mode scripts (measured: recaptcha
@@ -6918,6 +6922,16 @@ fn create_context(
 // ---------------------------------------------------------------------------
 // Document object registration
 // ---------------------------------------------------------------------------
+
+/// True when `child` is an element object with tagName "SCRIPT".
+fn is_script_element(child: &JsValue, ctx: &mut Context) -> bool {
+    child
+        .as_object()
+        .and_then(|o| o.get(js_string!("tagName"), ctx).ok())
+        .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+        .map(|t| t.eq_ignore_ascii_case("script"))
+        .unwrap_or(false)
+}
 
 /// Build a JS element object backed by a node in the [`RenderDocument`].
 ///
@@ -7159,6 +7173,24 @@ fn create_render_element_object(
             };
             if inserted {
                 call_global_helper(ctx, "__oxi_fire_connected", std::slice::from_ref(&child));
+                // Dynamic <script src> insertion (rspack/webpack chunk
+                // loading, SPA bootstraps): browsers fetch+execute the
+                // script when it enters the document. Without this, chunk
+                // loading never completes and the whole app stays silent
+                // (measured: spotify.com web-player, 2026-10-24).
+                if is_script_element(&child, ctx) {
+                    let src = child
+                        .as_object()
+                        .and_then(|o| o.get(js_string!("src"), ctx).ok())
+                        .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
+                        .unwrap_or_default();
+                    if !src.is_empty() {
+                        let src_json = serde_json::to_string(&src).unwrap_or_default();
+                        let snippet =
+                            format!("typeof __oxi_load_script==='function'&&__oxi_load_script({});", src_json);
+                        let _ = ctx.eval(Source::from_bytes(snippet.as_str()));
+                    }
+                }
             }
             Ok(child)
         })
@@ -15286,7 +15318,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(result.is_ok(), "CustomEvent flow must not throw");
+        assert!(
+            result.is_ok(),
+            "CustomEvent flow must not throw: {:?}",
+            result.exception
+        );
         assert_eq!(
             result.value,
             Some(Value::String(
