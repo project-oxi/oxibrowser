@@ -1,13 +1,13 @@
 # Compatibility corpus report
 
-Generated from `crates/oxibrowser/tests/data/compat_corpus.txt` (epoch 1792838944).
+Generated from `crates/oxibrowser/tests/data/compat_corpus.txt` (epoch 1792840197).
 
 | URL | status | bytes | JS errors | note / detail |
 |---|---|---|---|---|
 | https://example.com | PASS | 156 | 1 | static control |
 | https://example.org | PASS | 156 | 1 | static control |
-| https://news.ycombinator.com | PASS | 4323 | 0 | classic SSR |
-| https://en.wikipedia.org/wiki/Main_Page | PASS | 16159 | 0 | large document |
+| https://news.ycombinator.com | PASS | 4333 | 0 | classic SSR |
+| https://en.wikipedia.org/wiki/Main_Page | PASS | 16011 | 0 | large document |
 | https://en.wikipedia.org/wiki/JavaScript | PASS | 76346 | 0 | very large document |
 | https://developer.chrome.com/docs/devtools | PASS | 9812 | 1 | modern SSG |
 | https://developer.mozilla.org/en-US/docs/Web/API | PASS | 28313 | 5 | MDN SSR + hydration |
@@ -17,10 +17,10 @@ Generated from `crates/oxibrowser/tests/data/compat_corpus.txt` (epoch 179283894
 | https://www.w3.org | PASS | 5807 | 1 | standards org |
 | https://stackoverflow.com/questions/231767 | FETCH_ERR | 0 | 0 | Q&A SSR |
 | https://github.com/microsoft/vscode | PASS | 9183 | 9 | heavy app page |
-| https://news.ycombinator.com/newest | PASS | 4684 | 0 | SSR list |
+| https://news.ycombinator.com/newest | PASS | 4594 | 0 | SSR list |
 | https://naver.com | PASS | 294 | 4 | KR portal |
 | https://www.daum.net | EMPTY | 0 | 8 | KR portal |
-| https://www.bbc.com/news | PASS | 9840 | 13 | heavy media |
+| https://www.bbc.com/news | PASS | 9939 | 13 | heavy media |
 | https://httpbin.org/forms/post | PASS | 181 | 0 | forms |
 | https://open.spotify.com | EMPTY | 0 | 4 | heavy SPA variant |
 | https://www.spotify.com | EMPTY | 0 | 4 | heavy SPA — SIGABRT (iter.1 fix) → EMPTY; 0.22 parses web-player, blocker now `not a constructor` (iter.2) |

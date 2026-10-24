@@ -69,7 +69,7 @@ fn default_js_max_loop_iterations() -> u64 {
 }
 
 fn default_js_max_stack_size() -> usize {
-    1024
+    4_096
 }
 
 fn default_nav_script_timeout_ms() -> u64 {
@@ -85,7 +85,7 @@ fn default_nav_script_max_loop_iterations() -> u64 {
 }
 
 fn default_nav_script_max_stack_size() -> usize {
-    16_384
+    65_536
 }
 
 fn default_navigation_timeout_ms() -> u64 {
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(config.js_timeout_ms, 5000);
         assert_eq!(config.js_max_recursion, 100);
         assert_eq!(config.js_max_loop_iterations, 100_000);
-        assert_eq!(config.js_max_stack_size, 1024);
+        assert_eq!(config.js_max_stack_size, 4_096);
         assert_eq!(config.navigation_timeout_ms, 30_000);
         assert!(
             config.cookie_file.is_none(),

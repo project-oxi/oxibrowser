@@ -6358,6 +6358,43 @@ fn create_context(
             window.CustomEvent = globalThis.CustomEvent;
             window.PointerEvent = globalThis.PointerEvent;
         }
+        // DOM *interface* constructors (Document, Element, Node, ...). Bundles
+        // reference them for instanceof checks and static access
+        // (measured: daum.net dies on `Document is not defined`). Each stub
+        // adopts the prototype of a live instance so instanceof works; we
+        // cannot provide per-interface prototypes in a JS-level polyfill, so
+        // instanceof is intentionally permissive (everything sharing the
+        // instance's prototype passes).
+        ['Document', 'Element', 'Node', 'HTMLElement', 'Window',
+         'Navigator', 'Location', 'History', 'Storage', 'Screen',
+         'Selection', 'Range'].forEach(function(name) {
+            if (typeof globalThis[name] !== 'undefined') { return; }
+            var proto_source = null;
+            try {
+                proto_source = ({
+                    Document: function() { return document; },
+                    Element: function() { return document.documentElement; },
+                    Node: function() { return document.documentElement; },
+                    HTMLElement: function() { return document.body; },
+                    Window: function() { return window; },
+                    Navigator: function() { return navigator; },
+                    Location: function() { return location; },
+                    History: function() { return history; },
+                    Storage: function() { return localStorage; },
+                    Screen: function() { return screen; },
+                    Selection: function() { return getSelection(); },
+                    Range: function() { return document.createRange(); }
+                })[name]();
+            } catch (e) { /* no live instance — bare constructor */ }
+            var ctor = function Interface() {
+                throw new TypeError('Illegal constructor: ' + name);
+            };
+            if (proto_source && typeof proto_source === 'object') {
+                ctor.prototype = Object.getPrototypeOf(proto_source) || ctor.prototype;
+            }
+            globalThis[name] = ctor;
+            if (typeof window !== 'undefined') { window[name] = ctor; }
+        });
     "#,
     ));
 

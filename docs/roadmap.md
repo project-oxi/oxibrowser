@@ -107,6 +107,19 @@ what the harness can do; engine compatibility is now the ceiling.
    inside encore/web-player — boa's stack line/col unreliable on minified
    bundles, suspect set = Workers/AudioContext/fetch-classes/streams),
    daum.net EMPTY (8 JS errors), stackoverflow FETCH_ERR (likely bot wall).
+   Iteration 4 (2026-10-24): DOM *interface* constructor stubs (Document,
+   Element, Node, HTMLElement, Window, ... — daum.net died on
+   `Document is not defined`; stubs adopt a live instance's prototype so
+   instanceof works, construction throws IllegalConstructor); evaluate/
+   nav stack-size defaults raised for 0.22 accounting (1_024 → 4_096,
+   16_384 → 65_536). Findings: encore~web-player standalone loads CLEAN —
+   the spotify failure is a page-environment cascade (config arrives as
+   base64 blobs decoded at runtime; the first failure is a dynamically
+   built inline script) → root-causing it needs an in-page debugger (CDP
+   Debugger domain), not more stubs. stackoverflow 403 reproduces with
+   plain curl + Chrome UA → IP/ TLS-class bot wall, stealth-plane work.
+   Known residual: spotify×2 + daum EMPTY (in-page debugger lever),
+   stackoverflow FETCH_ERR (stealth lever).
 2. **Real-model smoke + corpus on live sites** — `agent run` against a live
    `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
    grow the corpus beyond loopback (login-gated tasks once accounts are in
