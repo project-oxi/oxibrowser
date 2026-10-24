@@ -29,7 +29,11 @@ fn corpus_path() -> String {
 }
 
 fn report_path() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/quality/compat-report.md").to_string()
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/quality/compat-report.md"
+    )
+    .to_string()
 }
 
 fn timeout_secs() -> u64 {
@@ -66,7 +70,10 @@ fn urls() -> Vec<(String, String)> {
 /// Spawn `fetch`, drain pipes on side threads (so a chatty page can't
 /// deadlock us), and wait with a wall-clock cap. Killing on timeout is the
 /// classification, not a test error.
-fn fetch_with_timeout(bin: &str, url: &str) -> (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>, bool) {
+fn fetch_with_timeout(
+    bin: &str,
+    url: &str,
+) -> (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>, bool) {
     let mut child = Command::new(bin)
         .args(["fetch", url, "--format", "text"])
         .stdout(Stdio::piped())
@@ -107,17 +114,30 @@ fn fetch_with_timeout(bin: &str, url: &str) -> (Option<std::process::ExitStatus>
 }
 
 fn js_error_count(stderr: &[u8]) -> usize {
-    String::from_utf8_lossy(stderr).matches("page script threw").count()
+    String::from_utf8_lossy(stderr)
+        .matches("page script threw")
+        .count()
 }
 
-fn classify(url: String, note: String, out: (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>, bool)) -> Outcome {
+fn classify(
+    url: String,
+    note: String,
+    out: (Option<std::process::ExitStatus>, Vec<u8>, Vec<u8>, bool),
+) -> Outcome {
     let (status, stdout, stderr, timed_out) = out;
     let stderr_text = String::from_utf8_lossy(&stderr);
     let js_errors = js_error_count(&stderr);
     let bytes = stdout.len();
 
     if timed_out {
-        return Outcome { url, note, status: "TIMEOUT", bytes, js_errors, detail: format!("killed after {}s", timeout_secs()) };
+        return Outcome {
+            url,
+            note,
+            status: "TIMEOUT",
+            bytes,
+            js_errors,
+            detail: format!("killed after {}s", timeout_secs()),
+        };
     }
     let status = status.expect("timed_out false implies status");
     if !status.success() {
@@ -128,13 +148,39 @@ fn classify(url: String, note: String, out: (Option<std::process::ExitStatus>, V
             Some(_) => "FETCH_ERR",
             None => "CRASH", // signaled
         };
-        let detail: String = stderr_text.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
-        return Outcome { url, note, status: kind, bytes, js_errors, detail };
+        let detail: String = stderr_text
+            .lines()
+            .rev()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Outcome {
+            url,
+            note,
+            status: kind,
+            bytes,
+            js_errors,
+            detail,
+        };
     }
     if bytes == 0 {
-        return Outcome { url, note, status: "EMPTY", bytes, js_errors, detail: "exit 0 but no markdown".into() };
+        return Outcome {
+            url,
+            note,
+            status: "EMPTY",
+            bytes,
+            js_errors,
+            detail: "exit 0 but no markdown".into(),
+        };
     }
-    Outcome { url, note, status: "PASS", bytes, js_errors, detail: String::new() }
+    Outcome {
+        url,
+        note,
+        status: "PASS",
+        bytes,
+        js_errors,
+        detail: String::new(),
+    }
 }
 
 #[test]
@@ -159,7 +205,10 @@ fn compat_corpus_pass_rate_report() {
     let timeouts = outcomes.iter().filter(|o| o.status == "TIMEOUT").count();
     let rate = (passed * 100) / total;
 
-    let epoch = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_secs();
+    let epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
     let mut md = String::new();
     md.push_str("# Compatibility corpus report\n\n");
     md.push_str(&format!(
@@ -167,7 +216,11 @@ fn compat_corpus_pass_rate_report() {
     ));
     md.push_str("| URL | status | bytes | JS errors | note / detail |\n|---|---|---|---|---|\n");
     for o in &outcomes {
-        let detail = if o.note.is_empty() { o.detail.clone() } else { o.note.clone() };
+        let detail = if o.note.is_empty() {
+            o.detail.clone()
+        } else {
+            o.note.clone()
+        };
         md.push_str(&format!(
             "| {} | {} | {} | {} | {} |\n",
             o.url,

@@ -287,7 +287,11 @@ fn render_markdown_step(
                 "CODE" => Some(("`".into(), "` ".into())),
                 "PRE" => Some(("\n```\n".into(), "\n```\n".into())),
                 "A" => {
-                    let href = node.attributes.get("href").map(|s| s.as_str()).unwrap_or("");
+                    let href = node
+                        .attributes
+                        .get("href")
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     let close = if href.is_empty() {
                         "] ".to_string()
                     } else {
@@ -384,7 +388,11 @@ fn child_tasks(snapshot: &DomSnapshot, node_id: u32) -> Vec<Task> {
 
 /// `<ul>`/`<ol>` items: each direct `<li>` emits its marker, renders its
 /// subtree, then a newline. Non-`<li>` children render normally.
-fn list_tasks<F: FnMut() -> String>(snapshot: &DomSnapshot, list_id: u32, mut marker: F) -> Vec<Task> {
+fn list_tasks<F: FnMut() -> String>(
+    snapshot: &DomSnapshot,
+    list_id: u32,
+    mut marker: F,
+) -> Vec<Task> {
     let mut seq = Vec::new();
     if let Some(list) = snapshot.nodes.get(&list_id) {
         for &child_id in &list.children {

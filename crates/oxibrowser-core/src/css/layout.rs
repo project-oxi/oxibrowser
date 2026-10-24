@@ -494,11 +494,19 @@ impl LayoutEngine {
         base_y: f64,
     ) -> Option<f64> {
         enum Task {
-            Siblings { children: Vec<u32>, idx: usize, y: f64 },
+            Siblings {
+                children: Vec<u32>,
+                idx: usize,
+                y: f64,
+            },
             AddHeight(u32),
         }
         let children = snapshot.nodes.get(&parent_id)?.children.clone();
-        let mut stack: Vec<Task> = vec![Task::Siblings { children, idx: 0, y: base_y }];
+        let mut stack: Vec<Task> = vec![Task::Siblings {
+            children,
+            idx: 0,
+            y: base_y,
+        }];
 
         enum Step {
             Pop,
@@ -523,7 +531,10 @@ impl LayoutEngine {
                         if child_id == target_id {
                             return Some(y_now);
                         }
-                        Step::Descend { child: child_id, y: y_now }
+                        Step::Descend {
+                            child: child_id,
+                            y: y_now,
+                        }
                     }
                 }
             };
@@ -535,7 +546,7 @@ impl LayoutEngine {
                         return None;
                     }
                 }
-                
+
                 Step::ApplyHeight(child_id) => {
                     stack.pop(); // the marker itself
                     if let Some(Task::Siblings { y, .. }) = stack.last_mut()
@@ -553,7 +564,11 @@ impl LayoutEngine {
                         .map(|n| n.children.clone())
                         .unwrap_or_default();
                     stack.push(Task::AddHeight(child));
-                    stack.push(Task::Siblings { children: grandchildren, idx: 0, y });
+                    stack.push(Task::Siblings {
+                        children: grandchildren,
+                        idx: 0,
+                        y,
+                    });
                 }
             }
         }

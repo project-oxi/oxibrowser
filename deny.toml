@@ -25,6 +25,17 @@ ignore = [
     "RUSTSEC-2026-0370",
     "RUSTSEC-2026-0371",
     "RUSTSEC-2026-0372",
+    # RUSTSEC-2026-0385/0382 (webpki-roots): re-export compatibility shim
+    # for webpki-roots 1.x; reqwest 0.12 pins the 0.x shim. Unblock when
+    # reqwest upgrades to webpki-roots 1.x.
+    "RUSTSEC-2026-0385",
+    "RUSTSEC-2026-0382",
+    # RUSTSEC-2026-0386/0383/0381: transitively pulled in by the wreq 6.0.0-rc
+    # TLS fingerprint stack (browser impersonation headers + cert store).
+    # No safe upgrade available until wreq ships a stable release.
+    "RUSTSEC-2026-0386",
+    "RUSTSEC-2026-0383",
+    "RUSTSEC-2026-0381",
 ]
 
 [licenses]

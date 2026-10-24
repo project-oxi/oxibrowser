@@ -33,11 +33,13 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use base64::Engine;
 use boa_engine::builtins::promise::ResolvingFunctions;
-use boa_engine::object::builtins::{JsArray, JsPromise};
 use boa_engine::object::builtins::JsFunction;
+use boa_engine::object::builtins::{JsArray, JsPromise};
 use boa_engine::object::{FunctionObjectBuilder, JsObject};
 use boa_engine::property::Attribute;
-use boa_engine::{Context, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source, js_string};
+use boa_engine::{
+    Context, JsNativeError, JsResult, JsString, JsValue, NativeFunction, Source, js_string,
+};
 use serde_json::Value;
 
 use crate::css::LayoutEngine;
@@ -3291,8 +3293,10 @@ fn run_navigation_scripts(
             // backtrace on thrown errors — Display appends "at <frame>"
             // lines — so fall back to its last frames when the JS-visible
             // `.stack` polyfill is empty.
-            let stack_for_log = err_stack.clone().filter(|s| !s.is_empty()).unwrap_or_else(
-                || {
+            let stack_for_log = err_stack
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
                     let rendered = err.to_string();
                     let frames: Vec<&str> = rendered
                         .lines()
@@ -3300,8 +3304,7 @@ fn run_navigation_scripts(
                         .collect();
                     let start = frames.len().saturating_sub(5);
                     frames[start..].join("\n")
-                },
-            );
+                });
             // When the throw site maps into this script's own source, show
             // the offending code inline — the fastest way to identify which
             // constructor/API a minified vendor bundle is missing.
@@ -3315,11 +3318,8 @@ fn run_navigation_scripts(
                 // script source next to the process cwd so minified-bundle
                 // positions can be examined offline.
                 if std::env::var_os("OXI_DUMP_FAILED_SCRIPT").is_some_and(|v| v == "1") {
-                    let dump_name = format!(
-                        "oxi_failed_script_{}_{}b.js",
-                        now_ms(),
-                        script.source.len()
-                    );
+                    let dump_name =
+                        format!("oxi_failed_script_{}_{}b.js", now_ms(), script.source.len());
                     let _ = std::fs::write(&dump_name, &script.source);
                     tracing::warn!(dump = %dump_name, "failed script source dumped");
                 }
@@ -3910,7 +3910,8 @@ fn settle_ws_message(id: u64, data: WsData, ctx: &mut Context) {
         WsData::Binary(b) => {
             // Binary arrives as an array of byte values (binaryType-driven
             // ArrayBuffer construction is refined in the binary test task).
-            let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+            let arr = JsArray::new(ctx)
+                .expect("creating an empty array with the default prototype must not fail");
             for &byte in &b {
                 let _ = arr.push(JsValue::from(byte), ctx);
             }
@@ -5036,7 +5037,9 @@ fn create_context(
                 NativeFunction::from_closure(move |_this, _args, ctx| {
                     if let Some(obj) = _this.as_object() {
                         let _ = obj.set(js_string!("__observing"), JsValue::from(false), true, ctx);
-                        let empty_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+                        let empty_arr = JsArray::new(ctx).expect(
+                            "creating an empty array with the default prototype must not fail",
+                        );
                         let _ =
                             obj.set(js_string!("__records"), JsValue::from(empty_arr), true, ctx);
                     }
@@ -5074,17 +5077,21 @@ fn create_context(
                             .get(js_string!("__records"), ctx)
                             .unwrap_or(JsValue::null());
                         // Clear records
-                        let empty_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+                        let empty_arr = JsArray::new(ctx).expect(
+                            "creating an empty array with the default prototype must not fail",
+                        );
                         let _ =
                             obj.set(js_string!("__records"), JsValue::from(empty_arr), true, ctx);
                         return Ok(records);
                     }
-                    let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+                    let arr = JsArray::new(ctx)
+                        .expect("creating an empty array with the default prototype must not fail");
                     Ok(JsValue::from(arr))
                 })
             };
 
-            let empty_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+            let empty_arr = JsArray::new(ctx)
+                .expect("creating an empty array with the default prototype must not fail");
             let obj = boa_engine::object::ObjectInitializer::new(ctx)
                 .property(js_string!("__callback"), callback, Attribute::all())
                 .property(
@@ -5572,7 +5579,8 @@ fn create_context(
                     };
 
                     // Store params in an array for methods to use
-                    let params_arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+                    let params_arr = JsArray::new(ctx)
+                        .expect("creating an empty array with the default prototype must not fail");
                     for (k, v) in &params {
                         let entry = boa_engine::object::ObjectInitializer::new(ctx)
                             .property(
@@ -5816,7 +5824,8 @@ fn create_context(
                 .map(|s| s.to_std_string_escaped())
                 .unwrap_or_default();
             let bytes = input.as_bytes();
-            let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+            let arr = JsArray::new(ctx)
+                .expect("creating an empty array with the default prototype must not fail");
             for &b in bytes {
                 let _ = arr.push(JsValue::from(b), ctx);
             }
@@ -5945,7 +5954,9 @@ fn create_context(
                 return Ok(JsArray::from_iter([source], ctx).into());
             }
 
-            Ok(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail").into())
+            Ok(JsArray::new(ctx)
+                .expect("creating an empty array with the default prototype must not fail")
+                .into())
         })
     };
     let _ = context.register_global_callable(js_string!("ArrayFrom"), 1, array_from_fn);
@@ -7129,7 +7140,9 @@ fn create_render_element_object(
                 && let Some(frag_obj) = child.as_object()
                 && let Err(e) = frag_obj.set(
                     js_string!("childNodes"),
-                    JsValue::from(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail")),
+                    JsValue::from(JsArray::new(ctx).expect(
+                        "creating an empty array with the default prototype must not fail",
+                    )),
                     true,
                     ctx,
                 )
@@ -7160,8 +7173,7 @@ fn create_render_element_object(
             };
             let reference = args.get(1).cloned().unwrap_or(JsValue::undefined());
             let inserted = if let Some(doc) = rd_ib.borrow_mut().as_mut() {
-                let anchor = node_id_of_v(&reference, ctx)
-                    .or_else(|| doc.first_child(node_id));
+                let anchor = node_id_of_v(&reference, ctx).or_else(|| doc.first_child(node_id));
                 match anchor {
                     Some(anchor_id) => doc.insert_before(anchor_id, child_id),
                     None => doc.append_child(node_id, child_id),
@@ -7186,8 +7198,10 @@ fn create_render_element_object(
                         .unwrap_or_default();
                     if !src.is_empty() {
                         let src_json = serde_json::to_string(&src).unwrap_or_default();
-                        let snippet =
-                            format!("typeof __oxi_load_script==='function'&&__oxi_load_script({});", src_json);
+                        let snippet = format!(
+                            "typeof __oxi_load_script==='function'&&__oxi_load_script({});",
+                            src_json
+                        );
                         let _ = ctx.eval(Source::from_bytes(snippet.as_str()));
                     }
                 }
@@ -7665,10 +7679,7 @@ fn create_render_element_object(
     let dirty_pn = dom_dirty.clone();
     let parent_node_getter_fn = FunctionObjectBuilder::new(ctx.realm(), unsafe {
         NativeFunction::from_closure(move |_this: &JsValue, _args, ctx| {
-            let parent_id = rd_pn
-                .borrow()
-                .as_ref()
-                .and_then(|d| d.parent_id(node_id));
+            let parent_id = rd_pn.borrow().as_ref().and_then(|d| d.parent_id(node_id));
             match parent_id {
                 Some(pid) => Ok(create_render_element_object(
                     ctx,
@@ -7715,14 +7726,20 @@ fn create_render_element_object(
     };
     let first_child_getter_fn = rel_getter("get firstChild", RenderDocument::first_child, false);
     let last_child_getter_fn = rel_getter("get lastChild", RenderDocument::last_child, false);
-    let next_sibling_getter_fn =
-        rel_getter("get nextSibling", RenderDocument::next_sibling, false);
-    let previous_sibling_getter_fn =
-        rel_getter("get previousSibling", RenderDocument::previous_sibling, false);
-    let parent_element_getter_fn = rel_getter("get parentElement", |doc, id| {
-        doc.parent_id(id)
-            .filter(|pid| doc.node_kind(*pid) == Some("element"))
-    }, false);
+    let next_sibling_getter_fn = rel_getter("get nextSibling", RenderDocument::next_sibling, false);
+    let previous_sibling_getter_fn = rel_getter(
+        "get previousSibling",
+        RenderDocument::previous_sibling,
+        false,
+    );
+    let parent_element_getter_fn = rel_getter(
+        "get parentElement",
+        |doc, id| {
+            doc.parent_id(id)
+                .filter(|pid| doc.node_kind(*pid) == Some("element"))
+        },
+        false,
+    );
 
     let rd_cn = rd_ta.clone();
     let dirty_cn = dirty_ta.clone();
@@ -7788,10 +7805,7 @@ fn create_render_element_object(
                 return Ok(JsValue::from(false));
             };
             let guard = rd_ct.borrow();
-            let mut stack = match guard
-                .as_ref()
-                .map(|doc| doc.children_ids(node_id))
-            {
+            let mut stack = match guard.as_ref().map(|doc| doc.children_ids(node_id)) {
                 Some(ids) => ids,
                 None => return Ok(JsValue::from(false)),
             };
@@ -8384,7 +8398,10 @@ fn register_document_object(
                 .get(arr_key.clone(), ctx)
                 .unwrap_or(JsValue::null());
             if ev.as_object().is_none() {
-                let a: JsValue = JsValue::from(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail"));
+                let a: JsValue = JsValue::from(
+                    JsArray::new(ctx)
+                        .expect("creating an empty array with the default prototype must not fail"),
+                );
                 let _ = listeners_obj.set(arr_key.clone(), a, true, ctx);
             }
             let arr_val = listeners_obj.get(arr_key, ctx).unwrap_or(JsValue::null());
@@ -9236,7 +9253,10 @@ fn create_element_object(
                 .get(arr_key.clone(), ctx)
                 .unwrap_or(JsValue::null());
             if ev.as_object().is_none() {
-                let a: JsValue = JsValue::from(JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail"));
+                let a: JsValue = JsValue::from(
+                    JsArray::new(ctx)
+                        .expect("creating an empty array with the default prototype must not fail"),
+                );
                 let _ = listeners_obj.set(arr_key.clone(), a, true, ctx);
             }
             let arr_val = listeners_obj.get(arr_key, ctx).unwrap_or(JsValue::null());
@@ -10835,7 +10855,9 @@ fn create_element_object(
                             let arr = JsArray::from_iter(items, ctx);
                             return Ok(arr.into());
                         }
-                        let arr = JsArray::new(ctx).expect("creating an empty array with the default prototype must not fail");
+                        let arr = JsArray::new(ctx).expect(
+                            "creating an empty array with the default prototype must not fail",
+                        );
                         Ok(arr.into())
                     })
                 }
@@ -15267,9 +15289,7 @@ mod tests {
         assert!(!result.is_ok(), "infinite recursion should fail");
         let msg = result.exception.unwrap();
         assert!(
-            msg.contains("recursive calls")
-                || msg.contains("recursion")
-                || msg.contains("stack"),
+            msg.contains("recursive calls") || msg.contains("recursion") || msg.contains("stack"),
             "error should mention the recursion limit, got: {msg}"
         );
     }
@@ -15365,10 +15385,7 @@ mod tests {
             .unwrap_or_default();
         assert!(msg.starts_with("OK"), "diagnostic: {msg}");
         // insertBefore is native on render-doc elements: true prepend order.
-        assert!(
-            msg.contains("ids=prepended|appended"),
-            "diagnostic: {msg}"
-        );
+        assert!(msg.contains("ids=prepended|appended"), "diagnostic: {msg}");
     }
 
     #[tokio::test]

@@ -5,9 +5,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Instant;
 
+use boa_engine::JsResult;
 use boa_engine::context::Context;
 use boa_engine::job::{Job, JobExecutor};
-use boa_engine::JsResult;
 
 /// Entry in the timer list (sorted by deadline).
 #[derive(Debug, Clone)]
@@ -166,9 +166,7 @@ impl JobExecutor for TokioJobQueue {
             // polling them would burn the drain's pass budget on every page
             // that merely constructs a FinalizationRegistry.
             Job::FinalizationRegistryCleanupJob(_) => {
-                tracing::debug!(
-                    "FinalizationRegistry cleanup job dropped (sync executor)"
-                );
+                tracing::debug!("FinalizationRegistry cleanup job dropped (sync executor)");
             }
             job => self.microtasks.borrow_mut().push_back(job),
         }

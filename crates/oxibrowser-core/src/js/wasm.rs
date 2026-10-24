@@ -506,8 +506,9 @@ fn make_export_callable(
                     } else if outputs.len() == 1 {
                         Ok(val_to_jsval(&outputs[0]))
                     } else {
-                        let arr = JsArray::new(ctx)
-                            .expect("creating an empty array with the default prototype must not fail");
+                        let arr = JsArray::new(ctx).expect(
+                            "creating an empty array with the default prototype must not fail",
+                        );
                         for v in &outputs {
                             arr.push(val_to_jsval(v), ctx)?;
                         }
