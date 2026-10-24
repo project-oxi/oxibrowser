@@ -476,41 +476,88 @@ impl LayoutEngine {
             None => return 0.0,
         };
 
-        Self::estimate_y_recursive(snapshot, body_id, target_id, 0.0).unwrap_or(0.0)
+        Self::estimate_y_under(snapshot, body_id, target_id, 0.0).unwrap_or(0.0)
     }
 
-    /// Recursively search for `target_id` under `parent_id`, accumulating Y
-    /// offsets from preceding siblings. Returns `None` if target not found in
-    /// this subtree.
-    fn estimate_y_recursive(
+    /// Search for `target_id` under `parent_id`, accumulating Y offsets from
+    /// preceding siblings. Returns `None` if target not found in this
+    /// subtree.
+    ///
+    /// Explicit-stack DFS with per-frame running `y` and `AddHeight`
+    /// markers (a subtree's height is added to the enclosing frame only
+    /// after the subtree search completes, exactly like the recursive
+    /// original). No native recursion — deep DOMs must not overflow.
+    fn estimate_y_under(
         snapshot: &DomSnapshot,
         parent_id: u32,
         target_id: u32,
         base_y: f64,
     ) -> Option<f64> {
-        let parent = snapshot.nodes.get(&parent_id)?;
-        let mut y = base_y;
+        enum Task {
+            Siblings { children: Vec<u32>, idx: usize, y: f64 },
+            AddHeight(u32),
+        }
+        let children = snapshot.nodes.get(&parent_id)?.children.clone();
+        let mut stack: Vec<Task> = vec![Task::Siblings { children, idx: 0, y: base_y }];
 
-        for &child_id in &parent.children {
-            if child_id == target_id {
-                return Some(y);
-            }
+        enum Step {
+            Pop,
+            Found(f64),
+            Descend { child: u32, y: f64 },
+            ApplyHeight(u32),
+        }
 
-            // Check if target is a descendant of this child
-            if let Some(found_y) = Self::estimate_y_recursive(snapshot, child_id, target_id, y) {
-                return Some(found_y);
-            }
+        loop {
+            // Peek (read-only) to decide the next step.
+            let step = match stack.last() {
+                None => return None,
+                Some(Task::AddHeight(child_id)) => Step::ApplyHeight(*child_id),
+                Some(Task::Siblings { children, idx, y }) => {
+                    if *idx >= children.len() {
+                        Step::Pop
+                    } else {
+                        let child_id = children[*idx];
+                        let y_now = *y;
+                        if let Some(Task::Siblings { idx: i, .. }) = stack.last_mut() {
+                            *i += 1;
+                        }
+                        if child_id == target_id {
+                            return Some(y_now);
+                        }
+                        Step::Descend { child: child_id, y: y_now }
+                    }
+                }
+            };
 
-            // Accumulate this child's height (lightweight estimate, no recursion)
-            let child_style = Self::compute_style(snapshot, child_id);
-            if let Some(cs) = &child_style
-                && cs.display != "none"
-            {
-                let h = Self::quick_height(snapshot, child_id, cs);
-                y += cs.margin_top + h + cs.margin_bottom;
+            match step {
+                Step::Pop => {
+                    stack.pop();
+                    if stack.is_empty() {
+                        return None;
+                    }
+                }
+                Step::Found(y) => return Some(y),
+                Step::ApplyHeight(child_id) => {
+                    stack.pop(); // the marker itself
+                    if let Some(Task::Siblings { y, .. }) = stack.last_mut()
+                        && let Some(cs) = Self::compute_style(snapshot, child_id)
+                        && cs.display != "none"
+                    {
+                        let h = Self::quick_height(snapshot, child_id, &cs);
+                        *y += cs.margin_top + h + cs.margin_bottom;
+                    }
+                }
+                Step::Descend { child, y } => {
+                    let grandchildren = snapshot
+                        .nodes
+                        .get(&child)
+                        .map(|n| n.children.clone())
+                        .unwrap_or_default();
+                    stack.push(Task::AddHeight(child));
+                    stack.push(Task::Siblings { children: grandchildren, idx: 0, y });
+                }
             }
         }
-        None
     }
 
     /// Quick (non-recursive) height estimate for sibling accumulation.

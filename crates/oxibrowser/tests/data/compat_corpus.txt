@@ -1,9 +1,25 @@
 # Compatibility corpus — one URL per line; `#` comments; optional `| note`.
 # The runner (tests/compat_corpus.rs) measures these in fresh subprocesses.
 # Baseline 2026-10-24 (pre stack-isolation fix): 4/6 pass, 2 SIGABRT crashes.
+# Expanded 2026-10-24 iter.3: +14 URLs (docs, portals, KR, SPAs, stress).
 https://example.com | static control
+https://example.org | static control
 https://news.ycombinator.com | classic SSR
 https://en.wikipedia.org/wiki/Main_Page | large document
+https://en.wikipedia.org/wiki/JavaScript | very large document
 https://developer.chrome.com/docs/devtools | modern SSG
+https://developer.mozilla.org/en-US/docs/Web/API | MDN SSR + hydration
+https://www.rust-lang.org | marketing SSG
+https://doc.rust-lang.org/book/ | docs site
+https://www.python.org | static
+https://www.w3.org | standards org
+https://stackoverflow.com/questions/231767 | Q&A SSR
+https://github.com/microsoft/vscode | heavy app page
+https://news.ycombinator.com/newest | SSR list
+https://naver.com | KR portal
+https://www.daum.net | KR portal
+https://www.bbc.com/news | heavy media
+https://httpbin.org/forms/post | forms
+https://open.spotify.com | heavy SPA variant
 https://www.spotify.com | heavy SPA — SIGABRT (iter.1 fix) → EMPTY; 0.22 parses web-player, blocker now `not a constructor` (iter.2)
 https://www.figma.com | heavy WASM/worker app — stack-overflow abort 2026-10-24 AM → PASS after isolation fix

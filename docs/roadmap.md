@@ -75,10 +75,11 @@ what the harness can do; engine compatibility is now the ceiling.
    else on this list is judged by this number; agent-harness quality stays
    measured by `agent eval corpus` (10/10).
 
-   | metric | baseline 2026-10-24 AM | after loop iteration 1 | target |
-   |---|---|---|---|
-   | corpus pass rate | 4/6 (67%) | **5/6 (83%)** | 100%, then grow the corpus |
-   | SIGABRT crashes | 2 (spotify, figma) | **0** | 0 — hard rule |
+   | metric | baseline 2026-10-24 AM | iter.1 | iter.3 (corpus 6→21) | target |
+   |---|---|---|---|---|
+   | corpus pass rate | 4/6 (67%) | 5/6 (83%) | **17/21 (80%)** | 100%, then grow the corpus |
+   | SIGABRT crashes | 2 (spotify, figma) | **0** | **0** | 0 — hard rule |
+   | timeouts | 0 | 0 | 0 | 0 — hard rule |
 
    Iteration 1 (crash-isolation class): iterative DOM walkers
    (`css/render.rs` text/markdown/children-text, `deep_text_content`),
@@ -95,15 +96,17 @@ what the harness can do; engine compatibility is now the ceiling.
    in `Option`, `JsArray::new` fallsible, third `EngineError` repr in
    `format_js_error`, integer JSON normalization restored (0.22 dropped
    the integer value repr). Suite 708/708 green.
-   Remaining corpus gap: spotify.com still renders empty — the web-player
-   bundle that 0.20 could not *parse* now parses, and the blocker moved
-   to a runtime API gap (`not a constructor` in encore/web-player) →
-   next lever: identify + polyfill the missing constructor.
-   Known residual: `set_element_text_recursive`, `copy_node_recursive`,
-   `estimate_y_recursive` and the snapshot remove-descendants walk are
-   still recursive (iterative-conversion candidates); debug-profile builds
-   inflate frames ~10x, so pathological sources can still overflow them —
-   release is the shipped target.
+   Iteration 3 (2026-10-24): corpus 6→21; constructible-event polyfills
+   (CustomEvent/PointerEvent + event family + Image/Option/Audio — spotify
+   web-player bootstraps through `new CustomEvent`); error WARN now carries
+   boa 0.22 backtrace frames + inline failing-source context; the last four
+   recursive snapshot walkers (`copy_node_ids` — which also fixes a
+   sibling-id collision in the old counter scheme, `estimate_y_under`,
+   `fill_element_text`, `collect_subtree_ids`) converted to explicit
+   stacks. Remaining failure classes: spotify×2 EMPTY (`not a constructor`
+   inside encore/web-player — boa's stack line/col unreliable on minified
+   bundles, suspect set = Workers/AudioContext/fetch-classes/streams),
+   daum.net EMPTY (8 JS errors), stackoverflow FETCH_ERR (likely bot wall).
 2. **Real-model smoke + corpus on live sites** — `agent run` against a live
    `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
    grow the corpus beyond loopback (login-gated tasks once accounts are in

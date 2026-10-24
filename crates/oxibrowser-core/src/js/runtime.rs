@@ -3270,10 +3270,64 @@ fn run_navigation_scripts(
             push_event(CoreEvent::Exception {
                 message: msg.clone(),
                 name: err_name,
-                stack: err_stack,
+                stack: err_stack.clone(),
                 timestamp: now_ms(),
             });
-            tracing::warn!(error = %msg, src = ?script.src_url, "page script threw; continuing");
+            // The stack is the only locator for runtime type errors inside
+            // minified vendor bundles (syntax errors carry line/col in the
+            // boa 0.22 captures its own
+            // backtrace on thrown errors — Display appends "at <frame>"
+            // lines — so fall back to its last frames when the JS-visible
+            // `.stack` polyfill is empty.
+            let stack_for_log = err_stack.clone().filter(|s| !s.is_empty()).unwrap_or_else(
+                || {
+                    let rendered = err.to_string();
+                    let frames: Vec<&str> = rendered
+                        .lines()
+                        .filter(|l| l.trim_start().starts_with("at "))
+                        .collect();
+                    let start = frames.len().saturating_sub(5);
+                    frames[start..].join("\n")
+                },
+            );
+            // When the throw site maps into this script's own source, show
+            // the offending code inline — the fastest way to identify which
+            // constructor/API a minified vendor bundle is missing.
+            let source_context = (|| -> Option<String> {
+                tracing::debug!(
+                    source_lines = script.source.lines().count(),
+                    source_bytes = script.source.len(),
+                    "throw-site mapping probe"
+                );
+                let frame = stack_for_log.lines().next()?;
+                let loc = frame.split("at ").last()?;
+                let (line_no, col_no) = loc.split_once(':')?;
+                let line_no: usize = line_no.parse().ok()?;
+                let col_no: usize = col_no.trim_end_matches(')').trim().parse().ok()?;
+                let line = script.source.lines().nth(line_no.checked_sub(1)?)?;
+                let col = col_no.saturating_sub(1);
+                let start = col.saturating_sub(160);
+                let end = (col + 160).min(line.len());
+                Some(format!(
+                    "src[{}:{}] = …{}⟪{}⟫{}…",
+                    line_no,
+                    col_no,
+                    &line[start..col],
+                    &line[col..end],
+                    ""
+                ))
+            })();
+            match (stack_for_log.as_str(), &source_context) {
+                ("", None) => {
+                    tracing::warn!(error = %msg, src = ?script.src_url, "page script threw; continuing");
+                }
+                (stack, Some(ctx_line)) => {
+                    tracing::warn!(error = %msg, stack = %stack, context = %ctx_line, src = ?script.src_url, "page script threw; continuing");
+                }
+                (stack, None) => {
+                    tracing::warn!(error = %msg, stack = %stack, src = ?script.src_url, "page script threw; continuing");
+                }
+            }
         }
         // Drain microtasks + already-due timers queued by this script.
         let _ = ctx.run_jobs();
@@ -6227,6 +6281,85 @@ fn create_context(
         })
     };
     let _ = context.register_global_callable(js_string!("MouseEvent"), 1, mouse_event_ctor);
+
+    // --- CustomEvent / PointerEvent polyfills ---
+    // Constructible event types real bundles instantiate
+    // (measured: spotify.com web-player `new CustomEvent` → TypeError
+    // "not a constructor", blocking its entire bootstrap). Built on the
+    // native Event factory so dispatchEvent sees the usual event shape.
+    let _ = context.eval(Source::from_bytes(
+        r#"
+        if (typeof globalThis.CustomEvent === 'undefined') {
+            globalThis.CustomEvent = function(type, params) {
+                params = params || {};
+                var ev = Event(type, params);
+                if (ev && typeof ev === 'object') {
+                    ev.detail = ('detail' in params) ? params.detail : null;
+                }
+                return ev;
+            };
+        }
+        if (typeof globalThis.PointerEvent === 'undefined') {
+            globalThis.PointerEvent = function(type, params) {
+                params = params || {};
+                var ev = Event(type, params);
+                if (ev && typeof ev === 'object') {
+                    ev.pointerId = params.pointerId || 0;
+                    ev.pointerType = params.pointerType || '';
+                    ev.isPrimary = params.isPrimary || false;
+                }
+                return ev;
+            };
+        }
+        // Remaining event-family constructors bundles instantiate freely;
+        // all share the Event factory shape (params may add per-type fields).
+        ['InputEvent', 'WheelEvent', 'TouchEvent', 'PopStateEvent',
+         'HashChangeEvent', 'MessageEvent', 'ProgressEvent',
+         'PromiseRejectionEvent', 'BeforeUnloadEvent', 'DragEvent']
+            .forEach(function(name) {
+                if (typeof globalThis[name] === 'undefined') {
+                    globalThis[name] = function(type, params) {
+                        params = params || {};
+                        var ev = Event(type, params);
+                        if (ev && typeof ev === 'object' && params.data !== undefined) {
+                            ev.data = params.data;
+                        }
+                        return ev;
+                    };
+                }
+            });
+        // DOM element shorthand constructors.
+        if (typeof globalThis.Image === 'undefined' && typeof document !== 'undefined') {
+            globalThis.Image = function(w, h) {
+                var img = document.createElement('img');
+                if (w !== undefined) { img.width = w; }
+                if (h !== undefined) { img.height = h; }
+                return img;
+            };
+        }
+        if (typeof globalThis.Option === 'undefined' && typeof document !== 'undefined') {
+            globalThis.Option = function(text, value, defaultSelected, selected) {
+                var opt = document.createElement('option');
+                if (text !== undefined) { opt.text = text; }
+                if (value !== undefined) { opt.value = value; }
+                if (defaultSelected) { opt.defaultSelected = true; }
+                if (selected) { opt.selected = true; }
+                return opt;
+            };
+        }
+        if (typeof globalThis.Audio === 'undefined' && typeof document !== 'undefined') {
+            globalThis.Audio = function(src) {
+                var a = document.createElement('audio');
+                if (src !== undefined) { a.src = src; }
+                return a;
+            };
+        }
+        if (typeof window !== 'undefined') {
+            window.CustomEvent = globalThis.CustomEvent;
+            window.PointerEvent = globalThis.PointerEvent;
+        }
+    "#,
+    ));
 
     // --- KeyboardEvent constructor ---
     let keyboard_event_ctor = unsafe {
@@ -14342,6 +14475,38 @@ mod tests {
         let ok = rt.evaluate("1 + 1").await.unwrap();
         assert!(ok.is_ok());
         assert_eq!(ok.value, Some(Value::Number(2.into())));
+    }
+
+    #[tokio::test]
+    async fn test_custom_event_polyfill_constructs_and_dispatches() {
+        // spotify.com's web-player bootstraps through `new CustomEvent(...)`;
+        // the polyfill must be constructible and dispatch must carry detail.
+        let mut rt = JsRuntime::new();
+        let result = rt
+            .evaluate(
+                r#"
+                (function(){
+                    var caught = null;
+                    document.addEventListener('ping', function(e){ caught = e; });
+                    var ev = new CustomEvent('ping', { detail: { n: 7 } });
+                    document.dispatchEvent(ev);
+                    return JSON.stringify({
+                        kind: typeof CustomEvent,
+                        detail: caught && caught.detail ? caught.detail.n : null,
+                        type: caught ? caught.type : null
+                    });
+                })()
+            "#,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "CustomEvent flow must not throw");
+        assert_eq!(
+            result.value,
+            Some(Value::String(
+                "{\"kind\":\"function\",\"detail\":7,\"type\":\"ping\"}".into()
+            ))
+        );
     }
 
     #[tokio::test]

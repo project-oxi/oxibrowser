@@ -1105,7 +1105,7 @@ impl DomSnapshot {
     ) {
         use std::collections::HashMap;
         let mut id_map: HashMap<u32, u32> = HashMap::new();
-        Self::copy_node_recursive(source, src_root, &mut id_map, id_offset);
+        let _next_free = Self::copy_node_ids(source, src_root, &mut id_map, id_offset);
         // After ids are remapped, transfer the entries into `self.nodes`.
         for (old, new) in &id_map {
             if let Some(node) = source.nodes.get(old) {
@@ -1134,22 +1134,32 @@ impl DomSnapshot {
         }
     }
 
-    fn copy_node_recursive(
+    /// Allocate fresh ids for every node in `src_root`'s subtree.
+    ///
+    /// Explicit-stack DFS with ONE monotonic counter. The old recursive
+    /// version advanced its counter per call frame, so a sibling's fresh id
+    /// collided with ids already handed out inside the preceding sibling's
+    /// subtree — any nested fragment corrupted its own remap.
+    fn copy_node_ids(
         source: &DomSnapshot,
-        src_id: u32,
+        src_root: u32,
         id_map: &mut std::collections::HashMap<u32, u32>,
-        mut next_id: u32,
-    ) {
-        id_map.insert(src_id, next_id);
-        let children = source
-            .nodes
-            .get(&src_id)
-            .map(|n| n.children.clone())
-            .unwrap_or_default();
-        for child in children {
+        first_id: u32,
+    ) -> u32 {
+        let mut next_id = first_id;
+        let mut stack = vec![src_root];
+        while let Some(src_id) = stack.pop() {
+            // Tree — the guard also makes a malformed (cyclic) snapshot safe.
+            if id_map.contains_key(&src_id) {
+                continue;
+            }
+            id_map.insert(src_id, next_id);
             next_id += 1;
-            Self::copy_node_recursive(source, child, id_map, next_id);
+            if let Some(n) = source.nodes.get(&src_id) {
+                stack.extend(n.children.iter().rev());
+            }
         }
+        next_id
     }
     /// Recursively remove `node_id` and all of its descendants from the snapshot.
     ///
@@ -1361,12 +1371,16 @@ fn classify_script_type(type_attr: &str) -> Option<ScriptKind> {
 /// `self.nodes`. Excludes `node_id` itself; callers typically prepend it.
 fn collect_subtree_ids(snap: &DomSnapshot, node_id: u32) -> Vec<u32> {
     let mut out = Vec::new();
-    let Some(node) = snap.nodes.get(&node_id) else {
-        return out;
-    };
-    for &child in &node.children {
-        out.push(child);
-        out.extend(collect_subtree_ids(snap, child));
+    let mut stack: Vec<u32> = snap
+        .nodes
+        .get(&node_id)
+        .map(|n| n.children.clone())
+        .unwrap_or_default();
+    while let Some(id) = stack.pop() {
+        out.push(id);
+        if let Some(n) = snap.nodes.get(&id) {
+            stack.extend(n.children.iter().rev());
+        }
     }
     out
 }
@@ -1618,28 +1632,61 @@ fn collect_slot_ids(nodes: &HashMap<u32, DomNode>, top: &[u32], out: &mut Vec<u3
 
 /// Set each element node's `text_content` to the concatenation of its
 /// descendant text nodes (mirrors the retired `collect_text_content`).
+///
+/// Explicit-stack post-order — framework DOM nests thousands deep and a
+/// recursive walk overflows the native stack (figma.com class).
 fn fill_element_text(nodes: &mut HashMap<u32, DomNode>, root: u32) {
-    set_element_text_recursive(nodes, root);
-}
-
-fn set_element_text_recursive(nodes: &mut HashMap<u32, DomNode>, id: u32) -> String {
-    let (ntype, children, own_text) = match nodes.get(&id) {
-        Some(n) => (n.node_type, n.children.clone(), n.text_content.clone()),
-        None => return String::new(),
-    };
-    if ntype == 3 {
-        return own_text;
+    enum Task {
+        Enter(u32),
+        Assemble(u32, Vec<u32>),
     }
-    let mut text = String::new();
-    for child in children {
-        text.push_str(&set_element_text_recursive(nodes, child));
+    let mut stack = vec![Task::Enter(root)];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Enter(id) => {
+                let Some(node) = nodes.get(&id) else {
+                    continue;
+                };
+                match node.node_type {
+                    // Text leaf: the parent's Assemble reads text_content.
+                    3 => {}
+                    // Element: assemble after the subtree completes.
+                    1 => {
+                        let children = node.children.clone();
+                        stack.push(Task::Assemble(id, children.clone()));
+                        for &child in children.iter().rev() {
+                            stack.push(Task::Enter(child));
+                        }
+                    }
+                    // Document / comment / etc: transparent — descend so the
+                    // subtree is still processed (the recursive original did
+                    // exactly this; the snapshot root is a type-9 document).
+                    _ => {
+                        let children = node.children.clone();
+                        for &child in children.iter().rev() {
+                            stack.push(Task::Enter(child));
+                        }
+                    }
+                }
+            }
+            Task::Assemble(id, children) => {
+                let mut text = String::new();
+                for child in children {
+                    // Element children carry their assembled subtree text;
+                    // text leaves carry their own. Comments et al. contribute
+                    // nothing (matches the recursive original).
+                    if let Some(n) = nodes.get(&child)
+                        && (n.node_type == 1 || n.node_type == 3)
+                    {
+                        text.push_str(&n.text_content);
+                    }
+                }
+                if let Some(n) = nodes.get_mut(&id) {
+                    n.text_content = text;
+                }
+            }
+        }
     }
-    if ntype == 1
-        && let Some(n) = nodes.get_mut(&id)
-    {
-        n.text_content = text.clone();
-    }
-    text
 }
 
 // ── HTML serialization (for compose-then-feed screenshot rasterization) ────
