@@ -6587,6 +6587,19 @@ fn create_context(
             };
             globalThis.ClipboardEvent.prototype = { constructor: globalThis.ClipboardEvent };
         }
+        // Class-like native callables are registered WITHOUT a .prototype
+        // object; core-js-style patchers read `C.prototype` at module scope
+        // and die on it ("cannot convert null/undefined to object" —
+        // measured: spotify.com web-player chunk chain at URLSearchParams).
+        // Give every function-valued global a prototype object when missing.
+        try {
+            Object.getOwnPropertyNames(globalThis).forEach(function(name) {
+                try {
+                    var C = globalThis[name];
+                    if (typeof C === 'function' && !C.prototype) { C.prototype = {}; }
+                } catch (e) { /* getter threw — skip */ }
+            });
+        } catch (e) { /* ignore */ }
         // Intl constructors missing from boa 0.22 (measured: spotify web-player
         // module 40608 = locale-data chunk dies on `new Intl.Locale`, taking
         // the whole virtualizer with it). Functional English-fallback
