@@ -143,6 +143,14 @@ what the harness can do; engine compatibility is now the ceiling.
    boa 0.22 reports phantom line/col on minified bundles, so identification
    needs real debugger positions), daum EMPTY (widget-SDK cascade + JS-render
    extraction), stackoverflow flaky 403 (stealth lever).
+   Forensics closure: nav scripts now evaluate with
+   `Source::with_path(script URL)` — backtrace frames carry the owning
+   bundle. Resolved the attribution question definitively: the spotify
+   throw is inside web-player.f954508a.js's rspack require for a module
+   that IS registered — boa 0.22 mis-attributes cross-chunk throws
+   (upstream span/backtrace fix or CDP Debugger domain; both levers
+   above). Field diagnostic: `OXI_DUMP_FAILED_SCRIPT=1` dumps failing
+   script sources to cwd.
    Iteration 7 (2026-10-24): render-doc elements gained full tree accessors
    (childNodes/children/firstChild/lastChild/nextSibling/previousSibling/
    parentElement/ownerDocument/contains — backed by new RenderDocument
