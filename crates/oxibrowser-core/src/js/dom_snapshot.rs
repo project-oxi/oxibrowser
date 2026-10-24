@@ -865,26 +865,31 @@ impl DomSnapshot {
         result
     }
 
-    /// Recursively collect all text content from a node and its descendants.
+    /// Collect all text content from a node and its descendants.
+    ///
+    /// Explicit stack, not recursion: framework markup nests thousands deep
+    /// and a recursive walk overflows the native stack (figma.com class).
     fn deep_text_content(&self, node_id: u32) -> String {
         let mut text = String::new();
-        self.collect_text_recursive(node_id, &mut text);
-        text.trim().to_string()
-    }
-
-    fn collect_text_recursive(&self, node_id: u32, text: &mut String) {
-        if let Some(node) = self.nodes.get(&node_id) {
-            if node.node_type == 3 {
-                // Text node: text_content holds the text
-                text.push_str(&node.text_content);
-                text.push(' ');
-            } else if node.node_type == 1 {
-                // Element node: recurse into children
-                for &child in &node.children {
-                    self.collect_text_recursive(child, text);
+        let mut stack = vec![node_id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.nodes.get(&id) else {
+                continue;
+            };
+            match node.node_type {
+                3 => {
+                    // Text node: text_content holds the text
+                    text.push_str(&node.text_content);
+                    text.push(' ');
                 }
+                1 => {
+                    // Element node: descend in document order
+                    stack.extend(node.children.iter().rev());
+                }
+                _ => {}
             }
         }
+        text.trim().to_string()
     }
 
     /// Check if a node matches a CSS selector.

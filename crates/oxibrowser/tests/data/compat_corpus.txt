@@ -1,0 +1,9 @@
+# Compatibility corpus — one URL per line; `#` comments; optional `| note`.
+# The runner (tests/compat_corpus.rs) measures these in fresh subprocesses.
+# Baseline 2026-10-24 (pre stack-isolation fix): 4/6 pass, 2 SIGABRT crashes.
+https://example.com | static control
+https://news.ycombinator.com | classic SSR
+https://en.wikipedia.org/wiki/Main_Page | large document
+https://developer.chrome.com/docs/devtools | modern SSG
+https://www.spotify.com | heavy SPA — SIGABRT 2026-10-24 AM → EMPTY after isolation fix (boa 0.20 ES gaps block render)
+https://www.figma.com | heavy WASM/worker app — stack-overflow abort 2026-10-24 AM → PASS after isolation fix

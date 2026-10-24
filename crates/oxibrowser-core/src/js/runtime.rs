@@ -1461,8 +1461,14 @@ impl JsRuntime {
         let user_agent = config.user_agent.clone();
         let telemetry = config.telemetry;
         let _local_storage = Arc::new(RwLock::new(HashMap::<String, String>::new()));
+        // JS frames execute on this thread's native stack; boa's RuntimeLimits
+        // bound logical recursion but not per-frame native consumption, so a
+        // deep framework script can overflow the OS default (2 MiB) and abort
+        // the whole browser (measured: figma.com stack overflow, 2026-10-24).
+        // 64 MiB is virtual — a page pays only for what it touches.
         std::thread::Builder::new()
             .name("oxibrowser-js".into())
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || {
                 js_thread_loop(
                     cmd_rx,
@@ -2167,6 +2173,115 @@ enum EvalOutcome {
     },
 }
 
+/// Maximum bracket nesting accepted in a script source.
+///
+/// boa's parser recurses per nesting level on the native stack, and its
+/// RuntimeLimits cover the VM only, not parsing. Deeply nested source
+/// (present in real minified bundles) therefore overflows the JS thread and
+/// aborts the whole browser (measured: figma.com / spotify.com SIGABRT,
+/// 2026-10-24; 30k-deep literal repro). Real engines guard identically —
+/// V8 throws a RangeError past its parser depth — so sources beyond this
+/// depth are rejected with a SyntaxError and the page continues rendering.
+const MAX_SOURCE_NESTING: usize = 2_048;
+
+/// True when `(`/`[`/`{` nesting in `src` exceeds [`MAX_SOURCE_NESTING`].
+///
+/// Lexing is best-effort: strings (single/double), templates, and line/block
+/// comments are skipped so embedded data (JSON-in-a-string, URLs) does not
+/// inflate the count. Regex literals are scanned as code and template
+/// `${}` expressions are skipped with their literal — both only ever make
+/// the measured depth smaller, never abort the guard.
+fn source_nesting_exceeds(src: &str) -> bool {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lex {
+        Code,
+        Str(u8),
+        Template,
+        LineComment,
+        BlockComment,
+    }
+    let mut lex = Lex::Code;
+    let mut escaped = false;
+    let mut prev_star = false;
+    let mut prev_slash = false;
+    let mut depth = 0usize;
+    for &b in src.as_bytes() {
+        match lex {
+            Lex::Str(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == quote {
+                    lex = Lex::Code;
+                }
+            }
+            Lex::Template => {
+                if escaped {
+                    escaped = false;
+                } else if b == b'\\' {
+                    escaped = true;
+                } else if b == b'`' {
+                    lex = Lex::Code;
+                }
+            }
+            Lex::LineComment => {
+                if b == b'\n' {
+                    lex = Lex::Code;
+                }
+            }
+            Lex::BlockComment => {
+                if b == b'/' && prev_star {
+                    lex = Lex::Code;
+                    prev_star = false;
+                } else {
+                    prev_star = b == b'*';
+                }
+            }
+            Lex::Code => match b {
+                b'\'' | b'"' => {
+                    lex = Lex::Str(b);
+                    prev_slash = false;
+                }
+                b'`' => {
+                    lex = Lex::Template;
+                    prev_slash = false;
+                }
+                b'/' if prev_slash => {
+                    lex = Lex::LineComment;
+                    prev_slash = false;
+                }
+                b'*' if prev_slash => {
+                    lex = Lex::BlockComment;
+                    prev_slash = false;
+                }
+                b'/' => {
+                    prev_slash = true;
+                    prev_star = false;
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    prev_slash = false;
+                    prev_star = false;
+                    if depth > MAX_SOURCE_NESTING {
+                        return true;
+                    }
+                }
+                b')' | b']' | b'}' => {
+                    depth = depth.saturating_sub(1);
+                    prev_slash = false;
+                    prev_star = false;
+                }
+                _ => {
+                    prev_slash = false;
+                    prev_star = false;
+                }
+            },
+        }
+    }
+    false
+}
+
 /// Core eval logic shared by the main frame and child frames. Does everything
 /// except context recreation on timeout (the caller handles that, since main
 /// and child frames recreate differently).
@@ -2199,8 +2314,14 @@ fn run_eval(
 
     let timeout = timeout_ms.unwrap_or(5000);
     let start = std::time::Instant::now();
-    let source = Source::from_bytes(expression);
-    let result = ctx.eval(source);
+    let result = if source_nesting_exceeds(expression) {
+        Err(boa_engine::JsError::from_native(
+            boa_engine::JsNativeError::syntax()
+                .with_message("expression nesting depth exceeds the engine limit"),
+        ))
+    } else {
+        ctx.eval(Source::from_bytes(expression))
+    };
 
     ctx.run_jobs();
     drain_timers(job_queue, ctx);
@@ -3128,7 +3249,15 @@ fn run_navigation_scripts(
         // Re-arm limits per script: boa's loop counter can accumulate across
         // evals, and a prior script's runaway would otherwise starve siblings.
         apply_limits(ctx);
-        if let Err(err) = ctx.eval(Source::from_bytes(script.source.as_str())) {
+        let eval_result = if source_nesting_exceeds(&script.source) {
+            Err(boa_engine::JsError::from_native(
+                boa_engine::JsNativeError::syntax()
+                    .with_message("script nesting depth exceeds the engine limit"),
+            ))
+        } else {
+            ctx.eval(Source::from_bytes(script.source.as_str()))
+        };
+        if let Err(err) = eval_result {
             let (msg, err_name, err_stack) = error_sink_details(&err, ctx);
             push_event(CoreEvent::Exception {
                 message: msg.clone(),
@@ -14159,6 +14288,27 @@ mod tests {
                 || msg.to_lowercase().contains("stack"),
             "error should mention stack/recursion limit, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deep_source_nesting_degrades_to_syntax_error() {
+        // 30k-deep bracket nesting used to overflow the parser's native
+        // stack and abort the whole browser (figma.com class). It must
+        // degrade to a JS error and leave the runtime usable.
+        let mut rt = JsRuntime::new();
+        let deep = format!("{}1{}", "(".repeat(50_000), ")".repeat(50_000));
+        let result = rt.evaluate(&deep).await.unwrap();
+        assert!(!result.is_ok(), "pathological nesting must fail, not crash");
+        let msg = result.exception.unwrap();
+        assert!(
+            msg.contains("nesting depth"),
+            "error should mention nesting depth, got: {msg}"
+        );
+
+        // Runtime still functional afterwards.
+        let ok = rt.evaluate("1 + 1").await.unwrap();
+        assert!(ok.is_ok());
+        assert_eq!(ok.value, Some(Value::Number(2.into())));
     }
 
     #[tokio::test]

@@ -66,10 +66,31 @@ Recently shipped (account process model — `designs/2026-09-29-account-process-
 Prioritized by agent-workload impact — the agent plane raises the floor of
 what the harness can do; engine compatibility is now the ceiling.
 
-1. **Public compatibility benchmark** — committed corpus runner (WPT subset
-   or fixed public-URL set) aggregated in CI, publishing a pass-rate number.
-   Everything else on this list is judged by it. The agent plane's own
-   harness quality is already measured by `agent eval corpus` (10/10).
+1. **Public compatibility benchmark — harness shipped 2026-10-24.**
+   `tests/compat_corpus.rs` + `tests/data/compat_corpus.txt` measure fresh
+   subprocesses per URL and write `docs/quality/compat-report.md`; child
+   crashes are data, not failures. Enforce a floor in CI with
+   `OXIBROWSER_CORPUS_ENFORCE=1 OXIBROWSER_CORPUS_MIN_RATE=<n>`. The loop:
+   measure → classify → fix the top failure class → re-measure. Everything
+   else on this list is judged by this number; agent-harness quality stays
+   measured by `agent eval corpus` (10/10).
+
+   | metric | baseline 2026-10-24 AM | after loop iteration 1 | target |
+   |---|---|---|---|
+   | corpus pass rate | 4/6 (67%) | **5/6 (83%)** | 100%, then grow the corpus |
+   | SIGABRT crashes | 2 (spotify, figma) | **0** | 0 — hard rule |
+
+   Iteration 1 (crash-isolation class): iterative DOM walkers
+   (`css/render.rs` text/markdown/children-text, `deep_text_content`),
+   64 MiB JS-thread stack, and a parser nesting guard
+   (`MAX_SOURCE_NESTING`, mirrors V8's parser depth limit) — figma.com now
+   renders; spotify.com exits cleanly but renders empty (boa 0.20 ES gaps
+   in its web-player bundle) → boa 0.22 upgrade is the next lever.
+   Known residual: `set_element_text_recursive`, `copy_node_recursive`,
+   `estimate_y_recursive` and the snapshot remove-descendants walk are
+   still recursive (iterative-conversion candidates); debug-profile builds
+   inflate frames ~10x, so pathological sources can still overflow them —
+   release is the shipped target.
 2. **Real-model smoke + corpus on live sites** — `agent run` against a live
    `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
    grow the corpus beyond loopback (login-gated tasks once accounts are in
