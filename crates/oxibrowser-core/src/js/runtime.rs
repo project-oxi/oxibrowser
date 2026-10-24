@@ -3238,7 +3238,7 @@ fn run_navigation_scripts(
         limits.set_stack_size_limit(stack_limit);
     };
 
-    for script in scripts {
+    for (script_idx, script) in scripts.iter().enumerate() {
         if start.elapsed() >= budget {
             tracing::warn!(
                 elapsed_ms = start.elapsed().as_millis() as u64,
@@ -3264,7 +3264,18 @@ fn run_navigation_scripts(
                     .with_message("script nesting depth exceeds the engine limit"),
             ))
         } else {
-            ctx.eval(Source::from_bytes(script.source.as_str()))
+            // Attach the script URL as the source path so backtrace frames
+            // carry the owning bundle instead of "unknown" — this is what
+            // makes minified-bundle failures attributable (measured:
+            // spotify.com frames were misattributed across bundles).
+            let script_path = match &script.src_url {
+                Some(src) => std::path::PathBuf::from(src),
+                None => std::path::PathBuf::from(format!(
+                    "{}#inline-script-{}",
+                    "about:page", script_idx
+                )),
+            };
+            ctx.eval(Source::from_bytes(script.source.as_str()).with_path(script_path.as_path()))
         };
         if let Err(err) = eval_result {
             let (msg, err_name, err_stack) = error_sink_details(&err, ctx);
@@ -6514,6 +6525,154 @@ fn create_context(
                 this.text = function() { return Promise.resolve(b === null || b === undefined ? '' : (typeof b === 'string' ? b : JSON.stringify(b))); };
                 this.json = function() { return this.text().then(function(t) { return JSON.parse(t); }); };
             };
+        }
+        // File / Blob-lite: constructible container (name/size/type/lastModified).
+        if (typeof globalThis.File === 'undefined') {
+            globalThis.File = function(bits, name, opts) {
+                opts = opts || {};
+                var parts = bits === undefined ? [] : (Array.isArray(bits) ? bits : [bits]);
+                var size = 0;
+                for (var i = 0; i < parts.length; i++) {
+                    var p = parts[i];
+                    size += typeof p === 'string' ? p.length : (p && p.byteLength) || (p && p.size) || 0;
+                }
+                this.name = String(name);
+                this.size = size;
+                this.type = String(opts.type || '');
+                this.lastModified = Number(opts.lastModified || Date.now());
+            };
+            globalThis.File.prototype = { constructor: globalThis.File };
+        }
+        // ImageData: constructible pixel container.
+        if (typeof globalThis.ImageData === 'undefined') {
+            globalThis.ImageData = function(data, width, height) {
+                if (typeof data === 'number') {
+                    height = width;
+                    width = data;
+                    data = null;
+                }
+                this.width = Number(width);
+                this.height = Number(height === undefined ? width : height);
+                var len = this.width * this.height * 4;
+                this.data = data || new Uint8ClampedArray(len);
+            };
+            globalThis.ImageData.prototype = { constructor: globalThis.ImageData };
+        }
+        // DataTransfer: minimal setData/getData/clearData container.
+        if (typeof globalThis.DataTransfer === 'undefined') {
+            globalThis.DataTransfer = function() {
+                var map = {};
+                this.setData = function(type, value) { map[String(type).toLowerCase()] = String(value); };
+                this.getData = function(type) {
+                    var k = String(type).toLowerCase();
+                    return Object.prototype.hasOwnProperty.call(map, k) ? map[k] : '';
+                };
+                this.clearData = function(type) {
+                    if (type === undefined) { map = {}; } else { delete map[String(type).toLowerCase()]; }
+                };
+                this.types = Object.keys(map);
+                this.dropEffect = 'none';
+                this.effectAllowed = 'all';
+            };
+            globalThis.DataTransfer.prototype = { constructor: globalThis.DataTransfer };
+        }
+        // ClipboardEvent: carries a DataTransfer (defaults to a fresh one).
+        if (typeof globalThis.ClipboardEvent === 'undefined') {
+            globalThis.ClipboardEvent = function(type, params) {
+                params = params || {};
+                this.type = String(type);
+                this.bubbles = !!params.bubbles;
+                this.cancelable = !!params.cancelable;
+                this.clipboardData = params.clipboardData || new globalThis.DataTransfer();
+            };
+            globalThis.ClipboardEvent.prototype = { constructor: globalThis.ClipboardEvent };
+        }
+        // Intl constructors missing from boa 0.22 (measured: spotify web-player
+        // module 40608 = locale-data chunk dies on `new Intl.Locale`, taking
+        // the whole virtualizer with it). Functional English-fallback
+        // implementations; full ICU behavior lands with boa's Intl work.
+        if (typeof Intl !== 'undefined') {
+            if (typeof Intl.Locale === 'undefined') {
+                Intl.Locale = function(tag, opts) {
+                    var t = String(tag).replace(/_/g, '-');
+                    var parts = t.split('-');
+                    this.language = (parts[0] || '').toLowerCase();
+                    this.script = (parts[1] && /^[A-Z][a-z]{3}$/.test(parts[1])) ? parts[1] : undefined;
+                    this.region = undefined;
+                    for (var i = 1; i < parts.length; i++) {
+                        if (/^[0-9]{3}$|^[A-Z]{2}$/.test(parts[i]) && i > 0) { this.region = parts[i].toUpperCase(); break; }
+                    }
+                    this.baseName = parts.slice(0, 3).join('-');
+                    if (opts && opts.region) { this.region = String(opts.region); }
+                    this.toString = function() { return t; };
+                    this.maximize = function() { return new Intl.Locale(t); };
+                    this.minimize = function() { return new Intl.Locale(t); };
+                };
+                Intl.Locale.prototype.toString = function() { return this.baseName || ''; };
+            }
+            if (typeof Intl.PluralRules === 'undefined') {
+                Intl.PluralRules = function(locale, opts) {
+                    this.select = function(n) {
+                        var x = Number(n);
+                        if (isNaN(x)) { return 'other'; }
+                        return x === 1 ? 'one' : 'other';
+                    };
+                };
+                Intl.PluralRules.prototype.select = Intl.PluralRules;
+            }
+            if (typeof Intl.RelativeTimeFormat === 'undefined') {
+                Intl.RelativeTimeFormat = function(locale, opts) { this.__locale = locale; };
+                Intl.RelativeTimeFormat.prototype.format = function(value, unit) {
+                    var v = Number(value);
+                    var u = String(unit).replace(/short$|narrow$/, '').replace(/T$/, '');
+                    var abs = Math.abs(v);
+                    var word = (abs === 1) ? u : u + (u === 'day' || u === 'year' ? 's' : 's');
+                    return (v < 0 ? abs + ' ' + word + ' ago' : 'in ' + abs + ' ' + word);
+                };
+                Intl.RelativeTimeFormat.prototype.formatToParts = function(value, unit) {
+                    return [{ type: 'integer', value: this.format(value, unit) }];
+                };
+                Intl.RelativeTimeFormat.prototype.resolvedOptions = function() {
+                    return { locale: this.__locale || 'en', numeric: 'always', style: 'long' };
+                };
+            }
+            if (typeof Intl.ListFormat === 'undefined') {
+                Intl.ListFormat = function(locale, opts) {
+                    this.format = function(list) {
+                        var items = Array.prototype.slice.call(list).map(String);
+                        if (items.length <= 2) { return items.join(' and '); }
+                        return items.slice(0, -1).join(', ') + ', and ' + items[items.length - 1];
+                    };
+                    this.formatToParts = function(list) {
+                        return [{ type: 'element', value: this.format(list) }];
+                    };
+                    this.resolvedOptions = function() { return { type: 'conjunction' }; };
+                };
+            }
+            if (typeof Intl.Segmenter === 'undefined') {
+                Intl.Segmenter = function(locale, opts) {
+                    this.segment = function(str) {
+                        var s = String(str);
+                        var segs = [{ segment: s, index: 0, input: s, isWordLike: false }];
+                        segs[Symbol.iterator] = function() {
+                            var done = false;
+                            return { next: function() {
+                                if (done) { return { done: true }; }
+                                done = true;
+                                return { done: false, value: segs[0] };
+                            } };
+                        };
+                        return segs;
+                    };
+                    this.resolvedOptions = function() { return { granularity: 'grapheme' }; };
+                };
+            }
+            if (typeof Intl.DisplayNames === 'undefined') {
+                Intl.DisplayNames = function(locales, opts) {
+                    this.of = function(code) { return String(code); };
+                    this.resolvedOptions = function() { return { locale: 'en', type: (opts && opts.type) || 'language' }; };
+                };
+            }
         }
         // iframe.contentWindow / contentDocument: same-origin iframes get the
         // parent window/document (no frame tree in oxi; same-origin policy is
