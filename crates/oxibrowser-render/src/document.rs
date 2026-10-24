@@ -378,6 +378,25 @@ impl RenderDocument {
         self.doc.mutate().append_children(parent, &[child]);
     }
 
+    /// Insert `new_node` before `anchor` under the same parent.
+    pub fn insert_before(&mut self, anchor: NodeId, new_node: NodeId) {
+        self.tree_revision += 1;
+        self.mark_attachment_subtree(new_node);
+        self.doc.mutate().insert_nodes_before(anchor, &[new_node]);
+    }
+
+    /// First child id of `node`, if any.
+    pub fn first_child(&self, node: NodeId) -> Option<NodeId> {
+        self.doc
+            .get_node(node)
+            .and_then(|n| n.children.first().copied())
+    }
+
+    /// Parent id of `node`, if any.
+    pub fn parent_id(&self, node: NodeId) -> Option<NodeId> {
+        self.doc.get_node(node).and_then(|n| n.parent)
+    }
+
     /// Set (or replace) an attribute on `node`.
     pub fn set_attribute(&mut self, node: NodeId, name: &str, value: &str) {
         self.doc
