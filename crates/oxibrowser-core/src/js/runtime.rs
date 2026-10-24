@@ -7893,17 +7893,17 @@ fn create_render_element_object(
         .function(append_child_fn, js_string!("appendChild"), 1)
         .function(insert_before_rd_fn, js_string!("insertBefore"), 2)
         .function(
-            unsafe { NativeFunction::from_fn_ptr(prepend_obj_fn) },
+            NativeFunction::from_fn_ptr(prepend_obj_fn),
             js_string!("prepend"),
             1,
         )
         .function(
-            unsafe { NativeFunction::from_fn_ptr(append_obj_fn) },
+            NativeFunction::from_fn_ptr(append_obj_fn),
             js_string!("append"),
             1,
         )
         .function(
-            unsafe { NativeFunction::from_fn_ptr(replace_children_obj_fn) },
+            NativeFunction::from_fn_ptr(replace_children_obj_fn),
             js_string!("replaceChildren"),
             1,
         )
@@ -10794,17 +10794,17 @@ fn create_element_object(
         .function(set_attribute_fn, js_string!("setAttribute"), 2)
         .function(append_child_obj_fn, js_string!("appendChild"), 1)
         .function(
-            unsafe { NativeFunction::from_fn_ptr(prepend_obj_fn) },
+            NativeFunction::from_fn_ptr(prepend_obj_fn),
             js_string!("prepend"),
             1,
         )
         .function(
-            unsafe { NativeFunction::from_fn_ptr(append_obj_fn) },
+            NativeFunction::from_fn_ptr(append_obj_fn),
             js_string!("append"),
             1,
         )
         .function(
-            unsafe { NativeFunction::from_fn_ptr(replace_children_obj_fn) },
+            NativeFunction::from_fn_ptr(replace_children_obj_fn),
             js_string!("replaceChildren"),
             1,
         )
@@ -11438,7 +11438,7 @@ fn prepend_obj_fn(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
         }
     } else {
         for arg in args {
-            call_own_method(this, "appendChild", &[arg.clone()], ctx)?;
+            call_own_method(this, "appendChild", std::slice::from_ref(arg), ctx)?;
         }
     }
     Ok(JsValue::undefined())
@@ -11447,7 +11447,7 @@ fn prepend_obj_fn(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResu
 /// `ParentNode.append(...nodes)` — append every argument in order.
 fn append_obj_fn(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
     for arg in args {
-        call_own_method(this, "appendChild", &[arg.clone()], ctx)?;
+        call_own_method(this, "appendChild", std::slice::from_ref(arg), ctx)?;
     }
     Ok(JsValue::undefined())
 }
@@ -11476,7 +11476,7 @@ fn replace_children_obj_fn(
         }
     }
     for arg in args {
-        call_own_method(this, "appendChild", &[arg.clone()], ctx)?;
+        call_own_method(this, "appendChild", std::slice::from_ref(arg), ctx)?;
     }
     Ok(JsValue::undefined())
 }

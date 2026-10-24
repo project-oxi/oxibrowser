@@ -74,6 +74,7 @@ impl std::error::Error for SearchError {}
 // ---------------------------------------------------------------------------
 
 #[async_trait::async_trait]
+#[allow(clippy::all)]
 pub trait SearchEngine: Send + Sync {
     /// Human-readable engine name (e.g. "DuckDuckGo", "Wikipedia", "Bing").
     fn name(&self) -> &'static str;

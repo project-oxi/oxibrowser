@@ -189,6 +189,7 @@ impl TokioJobQueue {
     /// - blocking on one async future deadlocks when it awaits a sync job;
     /// - awaiting the poll suspends forever when the future pends on an
     ///   external event.
+    ///
     /// Hence: non-blocking poll + no-op waker + pass cap. Past the cap,
     /// incomplete futures are dropped (continuation lost — the same visible
     /// outcome as the pre-upgrade hang, minus the hang).
@@ -207,7 +208,7 @@ impl TokioJobQueue {
                         unreachable!("is_async_job guarantees AsyncJob here");
                     };
                     async_jobs.push(Box::pin(a.call(&cell)));
-                } else if let Err(err) = call_sync_job(job, &mut *cell.borrow_mut()) {
+                } else if let Err(err) = call_sync_job(job, *cell.borrow_mut()) {
                     self.microtasks.borrow_mut().clear();
                     return Err(err);
                 }
@@ -229,7 +230,7 @@ impl TokioJobQueue {
             // One non-blocking poll of the async jobs; anything they enqueue
             // (promise jobs, more async jobs) is drained on the next pass.
             let waker = std::task::Waker::noop();
-            let mut cx = std::task::Context::from_waker(&waker);
+            let mut cx = std::task::Context::from_waker(waker);
             let mut next = async_jobs.next();
             if let std::task::Poll::Ready(Some(Err(err))) =
                 std::pin::Pin::new(&mut next).poll(&mut cx)

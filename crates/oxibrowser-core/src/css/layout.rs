@@ -502,7 +502,6 @@ impl LayoutEngine {
 
         enum Step {
             Pop,
-            Found(f64),
             Descend { child: u32, y: f64 },
             ApplyHeight(u32),
         }
@@ -536,7 +535,7 @@ impl LayoutEngine {
                         return None;
                     }
                 }
-                Step::Found(y) => return Some(y),
+                
                 Step::ApplyHeight(child_id) => {
                     stack.pop(); // the marker itself
                     if let Some(Task::Siblings { y, .. }) = stack.last_mut()
