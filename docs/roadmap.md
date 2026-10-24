@@ -130,8 +130,19 @@ what the harness can do; engine compatibility is now the ceiling.
    + client `.gzip/.brotli/.deflate/.zstd(true)`. Local gzip repro passes;
    gtm/retargeting empty-source class eliminated; stackoverflow flipped
    403 → 200 on one run (bot wall now flaky rather than constant).
-   Known residual: spotify×2 + daum EMPTY (in-page debugger lever),
-   stackoverflow flaky 403 (stealth lever).
+   Iteration 6 (2026-10-24): error WARN now dumps the failing source line
+   inline (boa native backtrace frames preferred; phantom positions guarded)
+   — this located every remaining failure precisely: spotify errors 4 → 1
+   (fixed: `navigator.cookieDeprecationLabel`, `document.location` alias,
+   `window.screen`, DOM interface stubs, native
+   prepend/insertBefore/append/replaceChildren). daum.net confirmed
+   JS-render-only (648 KB body = JS-required notice; real content needs its
+   app scripts, which fail in ad/analytics widget SDKs — per-script traces
+   captured in the WARN stream for the next pass). Known residual: spotify×2
+   EMPTY (one `new <internal class>` inside the web-player virtualizer —
+   boa 0.22 reports phantom line/col on minified bundles, so identification
+   needs real debugger positions), daum EMPTY (widget-SDK cascade + JS-render
+   extraction), stackoverflow flaky 403 (stealth lever).
 2. **Real-model smoke + corpus on live sites** — `agent run` against a live
    `OXIBROWSER_LLM_*` endpoint on the `--ignored` real-website fixtures;
    grow the corpus beyond loopback (login-gated tasks once accounts are in

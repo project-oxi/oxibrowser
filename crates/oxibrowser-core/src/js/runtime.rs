@@ -3299,7 +3299,30 @@ fn run_navigation_scripts(
                     source_bytes = script.source.len(),
                     "throw-site mapping probe"
                 );
-                let frame = stack_for_log.lines().next()?;
+                // Field diagnostics: OXI_DUMP_FAILED_SCRIPT=1 writes the full
+                // script source next to the process cwd so minified-bundle
+                // positions can be examined offline.
+                if std::env::var_os("OXI_DUMP_FAILED_SCRIPT").is_some_and(|v| v == "1") {
+                    let dump_name = format!(
+                        "oxi_failed_script_{}_{}b.js",
+                        now_ms(),
+                        script.source.len()
+                    );
+                    let _ = std::fs::write(&dump_name, &script.source);
+                    tracing::warn!(dump = %dump_name, "failed script source dumped");
+                }
+                // Prefer boa's NATIVE backtrace top frame — independent of
+                // the JS `.stack` polyfill, which pages sometimes override
+                // with non-frame content.
+                let rendered = err.to_string();
+                let frame = rendered
+                    .lines()
+                    .find(|l| l.trim_start().starts_with("at "))
+                    .or_else(|| {
+                        stack_for_log
+                            .lines()
+                            .find(|l| l.trim_start().starts_with("at "))
+                    })?;
                 // Frame shape: "at <fn> (unknown at :4:162211)" — split on
                 // "at " yields the location with a leading colon (boa prints
                 // an empty source path).
@@ -3308,8 +3331,15 @@ fn run_navigation_scripts(
                 let (line_no, col_no) = loc.split_once(':')?;
                 let line_no: usize = line_no.parse().ok()?;
                 let col_no: usize = col_no.trim_end_matches(')').trim().parse().ok()?;
+                // boa 0.22 reports phantom positions on some minified
+                // bundles (line 74 of a 13-line source; col 345204 of an
+                // 8-byte line — both measured). Anything out of range means
+                // "no usable context", never a panic.
                 let line = script.source.lines().nth(line_no.checked_sub(1)?)?;
-                let col = col_no.saturating_sub(1);
+                if col_no == 0 || col_no - 1 > line.len() {
+                    return None;
+                }
+                let col = col_no - 1;
                 let start = col.saturating_sub(160);
                 let end = (col + 160).min(line.len());
                 Some(format!(
@@ -6404,7 +6434,10 @@ fn create_context(
         //   .getValue() (Chrome 132+ API);
         // - ad SDKs read document.location.href — document.location must
         //   alias window.location;
-        // - analytics reads window.screen.width/height.
+        // - analytics reads window.screen.width/height;
+        // - recaptcha renders an <iframe> and reads .contentWindow — oxi
+        //   has no frame tree, so same-origin iframes get the parent
+        //   window/document (automation: same-origin policy is moot).
         if (typeof navigator !== 'undefined' && navigator.cookieDeprecationLabel === undefined) {
             try {
                 Object.defineProperty(navigator, 'cookieDeprecationLabel', {
@@ -6422,6 +6455,28 @@ fn create_context(
                 availWidth: 1280, availHeight: 720,
                 colorDepth: 24, pixelDepth: 24,
                 orientation: { type: 'landscape-primary', angle: 0 },
+            };
+        }
+        // iframe.contentWindow / contentDocument: same-origin iframes get the
+        // parent window/document (no frame tree in oxi; same-origin policy is
+        // moot for automation). recaptcha's render path reads
+        // iframe.contentWindow.document and dies on undefined otherwise.
+        if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+            var __oxiCreateEl = document.createElement;
+            document.createElement = function(tag, opts) {
+                var el = __oxiCreateEl.call(this, tag, opts);
+                try {
+                    if (el && String(tag).toLowerCase() === 'iframe'
+                        && el.contentWindow === undefined) {
+                        Object.defineProperty(el, 'contentWindow', {
+                            get: function() { return window; }, configurable: true,
+                        });
+                        Object.defineProperty(el, 'contentDocument', {
+                            get: function() { return document; }, configurable: true,
+                        });
+                    }
+                } catch (e) { /* keep the plain element */ }
+                return el;
             };
         }
         // NOTE: ParentNode.prepend/append/replaceChildren are provided
@@ -6836,6 +6891,44 @@ fn create_render_element_object(
                 )
             {
                 tracing::warn!("failed to empty fragment after splice: {e}");
+            }
+            Ok(child)
+        })
+    };
+
+    // ── insertBefore (render-doc elements) ──
+    // ParentNode.prepend/append/replaceChildren (shared fn_ptrs) delegate to
+    // this when the element exposes insertBefore. reference null/undefined =
+    // insert as first child.
+    let rd_ib = render_doc.clone();
+    let dirty_ib = dom_dirty.clone();
+    let insert_before_rd_fn = unsafe {
+        NativeFunction::from_closure(move |_this: &JsValue, args, ctx| {
+            let child = args.first().cloned().unwrap_or(JsValue::undefined());
+            fn node_id_of_v(node: &JsValue, ctx: &mut Context) -> Option<usize> {
+                node.as_object()
+                    .and_then(|o| o.get(js_string!("__nodeId"), ctx).ok())
+                    .and_then(|v| v.as_number().map(|n| n as usize))
+            }
+            let Some(child_id) = node_id_of_v(&child, ctx) else {
+                // Foreign node — mirrors appendChild's observable skip.
+                return Ok(child);
+            };
+            let reference = args.get(1).cloned().unwrap_or(JsValue::undefined());
+            let inserted = if let Some(doc) = rd_ib.borrow_mut().as_mut() {
+                let anchor = node_id_of_v(&reference, ctx)
+                    .or_else(|| doc.first_child(node_id));
+                match anchor {
+                    Some(anchor_id) => doc.insert_before(anchor_id, child_id),
+                    None => doc.append_child(node_id, child_id),
+                }
+                dirty_ib.store(true, Ordering::Relaxed);
+                true
+            } else {
+                false
+            };
+            if inserted {
+                call_global_helper(ctx, "__oxi_fire_connected", std::slice::from_ref(&child));
             }
             Ok(child)
         })
@@ -7265,6 +7358,30 @@ fn create_render_element_object(
         .name(js_string!("get assignedSlot"))
         .build();
 
+    // parentNode — live parent element (render-doc-backed), or null at the
+    // top of the tree. recaptcha's loader walks s.parentNode.insertBefore.
+    let rd_pn = render_doc.clone();
+    let dirty_pn = dom_dirty.clone();
+    let parent_node_getter_fn = FunctionObjectBuilder::new(ctx.realm(), unsafe {
+        NativeFunction::from_closure(move |_this: &JsValue, _args, ctx| {
+            let parent_id = rd_pn
+                .borrow()
+                .as_ref()
+                .and_then(|d| d.parent_id(node_id));
+            match parent_id {
+                Some(pid) => Ok(create_render_element_object(
+                    ctx,
+                    rd_pn.clone(),
+                    pid,
+                    dirty_pn.clone(),
+                )),
+                None => Ok(JsValue::null()),
+            }
+        })
+    })
+    .name(js_string!("get parentNode"))
+    .build();
+
     let obj = boa_engine::object::ObjectInitializer::new(ctx)
         .property(
             js_string!("tagName"),
@@ -7282,10 +7399,17 @@ fn create_render_element_object(
             JsValue::from(node_id),
             Attribute::all(),
         )
+        .accessor(
+            js_string!("parentNode"),
+            Some(parent_node_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
         .function(get_attr_fn, js_string!("getAttribute"), 1)
         .function(set_attr_fn, js_string!("setAttribute"), 2)
         .function(remove_attr_fn, js_string!("removeAttribute"), 1)
         .function(append_child_fn, js_string!("appendChild"), 1)
+        .function(insert_before_rd_fn, js_string!("insertBefore"), 2)
         .function(
             unsafe { NativeFunction::from_fn_ptr(prepend_obj_fn) },
             js_string!("prepend"),
@@ -14754,12 +14878,11 @@ mod tests {
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_default();
         assert!(msg.starts_with("OK"), "diagnostic: {msg}");
-        // Render-document elements lack insertBefore, so prepend degrades to
-        // append (documented in prepend_obj_fn): both scripts must be attached
-        // to <head>; strict ordering lands with render-crate insert-before.
-        assert!(msg.contains("n=2"), "diagnostic: {msg}");
-        assert!(msg.contains("appended"), "diagnostic: {msg}");
-        assert!(msg.contains("prepended"), "diagnostic: {msg}");
+        // insertBefore is native on render-doc elements: true prepend order.
+        assert!(
+            msg.contains("ids=prepended|appended"),
+            "diagnostic: {msg}"
+        );
     }
 
     #[tokio::test]
