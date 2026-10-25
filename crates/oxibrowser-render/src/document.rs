@@ -237,6 +237,38 @@ impl RenderDocument {
         &mut self.doc
     }
 
+    /// Injects a canvas element's RGBA8 drawing-buffer readback so blitz's
+    /// normal image compositing (`draw_image` → object-fit) paints it. Same
+    /// path as a decoded `<img>`: replace `SpecialElementData`, clear the
+    /// node's style cache, and flag full damage.
+    ///
+    /// `document_mut` semantics apply (revision bump + incarnation reset).
+    pub fn set_canvas_bitmap(
+        &mut self,
+        node: NodeId,
+        width: u32,
+        height: u32,
+        rgba: std::sync::Arc<Vec<u8>>,
+    ) -> bool {
+        use blitz_dom::node::{ImageData, RasterImageData, SpecialElementData};
+        use style::selector_parser::RestyleDamage;
+
+        let doc = self.document_mut();
+        let Some(node_ref) = doc.get_node_mut(node) else {
+            return false;
+        };
+        let Some(el) = node_ref.element_data_mut() else {
+            return false;
+        };
+        el.special_data = SpecialElementData::Image(Box::new(ImageData::Raster(
+            RasterImageData::new(width, height, rgba),
+        )));
+        node_ref.cache.clear();
+        // blitz-dom's private ALL_DAMAGE is the full damage bitset (0b1111111).
+        node_ref.insert_damage(RestyleDamage::from_bits_retain(0b0111_1111));
+        true
+    }
+
     /// Invalidates observed targets on every structural edit, even a detach/reinsert.
     pub fn tree_revision(&self) -> u64 {
         self.tree_revision

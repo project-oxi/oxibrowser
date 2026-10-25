@@ -60,7 +60,7 @@ pub(crate) fn capture_png(
     encode_png(&buffer, width, height)
 }
 
-fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, RenderError> {
+pub fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, RenderError> {
     let mut out = Vec::with_capacity(rgba.len() / 3);
     let mut encoder = png::Encoder::new(&mut out, width, height);
     encoder.set_color(png::ColorType::Rgba);

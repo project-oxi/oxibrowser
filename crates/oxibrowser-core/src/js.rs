@@ -15,6 +15,9 @@ pub mod runtime;
 pub mod stealth;
 pub mod wasm;
 
+#[cfg(feature = "webgl")]
+pub mod webgl;
+
 // ─── Re-exports ───────────────────────────────────────────────────────────────
 
 // DOM bridge

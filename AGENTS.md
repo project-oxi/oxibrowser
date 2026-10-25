@@ -53,7 +53,8 @@ cargo run -- session                 # Start interactive JSON REPL
 | Add a CLI subcommand | `crates/oxibrowser/src/main.rs` → add clap variant + handler |
 | Add a session command | `crates/oxibrowser/src/session/parser.rs` + `executor.rs` |
 | Add a CDP command | `crates/oxibrowser-cdp/src/domains/mod.rs` → add domain file |
-| Add a JS Web API | `crates/oxibrowser-core/src/js/runtime.rs` → `create_context()` |
+|Add a JS Web API|`crates/oxibrowser-core/src/js/runtime.rs` → `create_context()`|
+|Add a WebGL surface|`crates/oxibrowser-core/src/js/webgl/` (feature `webgl`; ANGLE via `oxibrowser-render/src/gl`, `scripts/setup-angle.sh`)|
 | Add DOM operation | `crates/oxibrowser-core/src/js/dom_snapshot.rs` → `DomSnapshot` + `DomMutation` |
 | Add a network feature | `crates/oxibrowser-core/src/network/` |
 | Add secret redaction / audit surface | `crates/oxibrowser-core/src/security/` (`redact.rs`, `audit.rs`) |

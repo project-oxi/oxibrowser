@@ -47,8 +47,14 @@ chacha20poly1305 = "0.11"
 zeroize = "1.9"
 
 oxibrowser-render = { version = "0.27.0", path = "../oxibrowser-render" }
+# Required by the js/webgl binding layer behind the `webgl` feature.
+glow = { workspace = true, optional = true }
 getrandom = { workspace = true }
 tokio-tungstenite = { workspace = true }
+
+[features]
+# ANGLE-backed WebGL. Requires scripts/setup-angle.sh (static libs at link time).
+webgl = ["oxibrowser-render/webgl", "dep:glow"]
 
 [dev-dependencies]
 wat = "1.256"

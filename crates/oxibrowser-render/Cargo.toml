@@ -24,8 +24,17 @@ anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
 peniko = { workspace = true }
 parley = "0.10"
 png = { workspace = true }
+# Direct stylo access for damage constants blitz-dom keeps crate-private.
+style = { version = "0.19.0", package = "stylo" }
 printpdf = { version = "0.12", features = ["png"] }
 tracing = { workspace = true }
+# ANGLE-backed WebGL backend. Off by default: linking requires the pinned
+# ANGLE static libraries from scripts/setup-angle.sh (third_party/angle).
+glow = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[features]
+webgl = ["dep:glow", "dep:thiserror"]
 
 [lib]
 path = "src/lib.rs"

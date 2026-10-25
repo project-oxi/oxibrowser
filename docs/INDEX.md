@@ -9,9 +9,8 @@
 |------|---------|------:|
 | `./` | **Top-level architecture, design rationale, quickstart, roadmap.** | 7 |
 | `design/` | Focused design notes for in-flight subsystems (observability, search-as-library). | 2 |
-| `designs/` | Dated design documents per planning cycle (v0.3 → v0.6, plus topic designs). | 14 |
+| `designs/` | Dated design documents per planning cycle (v0.3 → v0.6, plus topic designs). | 15 |
 | `research/` | Dated multi-agent research reports (sources cited, roadmap inputs). | 7 |
-
 Total active docs (root + `design/` + `designs/` + `research/`): **30** `.md` files.
 
 ## Top-level docs (root)
@@ -33,6 +32,7 @@ Total active docs (root + `design/` + `designs/` + `research/`): **30** `.md` fi
 
 | Date | Topic |
 |------|-------|
+| `2026-10-25-webgl-angle.md` | WebGL via ANGLE: backend, Boa bindings, compositing (feat `webgl`) |
 | `2026-05-16-cli-enhancement-design.md` | CLI ergonomics pass (v0.3 era) |
 | `2026-06-04-oxibrowser-observability.md` | Observability design v1 |
 | `2026-06-04-oxibrowser-observability-followup.md` | Observability follow-ups |
@@ -49,6 +49,12 @@ Total active docs (root + `design/` + `designs/` + `research/`): **30** `.md` fi
 | `2026-09-27-agent-auth-implementation.md` | Agent unattended auth — implementation design (from `research/` 2026-09-27) |
 | `2026-09-28-account-login-session-management.md` | Account layer: login session management, browser-context sandbox, login orchestration (amends 2026-09-27 M5/M6/M8, adds M-A~M-D) |
 
+
+## `research/` — headless-browser feasibility (2026-10-25)
+
+- [Headless-browser feasibility research](research/2026-10-25-headless-browser-feasibility.md) — Korean report: SPA handoff corrections, measured DOM/Window/event-loop/module/fetch gaps, upstream reuse, phased implementation, and acceptance criteria.
+- [Reproduction evidence](research/2026-10-25-headless-evidence.json) — Local fixtures and commands, exact responses, React 18.2 asset hashes, and three live-site samples.
+- [WebGL open-source research](research/2026-10-25-webgl-open-source.md) — Korean comparison of ANGLE, Servo, Ladybird, Rust graphics libraries and headless implementations; source-level limitations, license findings and OxiBrowser integration proposal. [Pinned evidence](research/2026-10-25-webgl-open-source-evidence.json).
 
 ## `research/` — dated research reports (2026-09-27: agent unattended authentication)
 

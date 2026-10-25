@@ -266,7 +266,7 @@ thread_local! {
 /// Read the currently-active execution context id (set by `js_thread_loop`
 /// before entering a frame's `Context`). Used to namespace thread-local
 /// registries so per-frame entries never collide.
-fn active_context_id() -> u32 {
+pub(crate) fn active_context_id() -> u32 {
     ACTIVE_CONTEXT_ID.with(|c| c.get())
 }
 
@@ -2425,6 +2425,7 @@ fn js_thread_loop(
     // the JS DOM bindings so JS mutates it directly; set via `SetDocument`,
     // captured/queried via `Capture`/`Query`.
     let render_doc_cell: Rc<RefCell<Option<RenderDocument>>> = Rc::new(RefCell::new(None));
+    set_active_ua(&effective_user_agent(&user_agent));
     let (mut ctx, mut job_queue) = create_context(
         &console_output,
         &dom_snapshot,
@@ -2778,6 +2779,7 @@ fn js_thread_loop(
                 // contexts rebuild with the new UA on their next navigation.
                 *USER_AGENT_OVERRIDE.write() = ua_override;
                 let ua = effective_user_agent(&user_agent);
+                set_active_ua(&ua);
                 let dom_snapshot_ref = dom_snapshot.clone();
                 register_window_globals(
                     &mut ctx,
@@ -2859,6 +2861,10 @@ fn js_thread_loop(
                             .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
                         NATIVE_LISTENERS
                             .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
+                        // WebGL contexts die with their document (EGL teardown
+                        // happens here on the JS thread via GlContext::Drop).
+                        #[cfg(feature = "webgl")]
+                        crate::js::webgl::reset_for_document();
                         *render_doc_cell.borrow_mut() = Some(doc);
                         // Shadow roots are per-document; drop stale entries.
                         crate::js::dom_snapshot::clear_shadow_roots();
@@ -2928,7 +2934,13 @@ fn js_thread_loop(
             JsCommand::Capture { opts, response_tx } => {
                 let mut guard = render_doc_cell.borrow_mut();
                 let result = match guard.as_mut() {
-                    Some(doc) => capture_png_composed(doc, &opts),
+                    Some(doc) => {
+                        // Present WebGL canvases into their nodes before
+                        // painting (clear-after-compositing semantics).
+                        #[cfg(feature = "webgl")]
+                        crate::js::webgl::flush_canvas(doc, true);
+                        capture_png_composed(doc, &opts)
+                    }
                     None => Err(RenderError::Render("no render document set".into())),
                 };
                 drop(guard);
@@ -8009,6 +8021,15 @@ fn create_render_element_object(
             Attribute::CONFIGURABLE,
         )
         .build();
+
+    // Canvas elements get the native WebGL surface (getContext / toDataURL /
+    // width / height) so parsed and created canvases behave identically. The
+    // JS bootstrap shim skips elements marked `__oxiWebglNative`.
+    #[cfg(feature = "webgl")]
+    if tag.eq_ignore_ascii_case("canvas") {
+        crate::js::webgl::canvas::attach(ctx, &obj, node_id, render_doc);
+    }
+
     JsValue::from(obj)
 }
 
@@ -11620,6 +11641,24 @@ fn effective_user_agent(configured: &str) -> String {
         .unwrap_or_else(|| configured.to_string())
 }
 
+thread_local! {
+    /// UA active on this JS thread — read by native bindings (WebGL
+    /// `getParameter(UNMASKED_*)`) that must agree with the stealth profile.
+    static ACTIVE_UA: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+pub(crate) fn set_active_ua(ua: &str) {
+    ACTIVE_UA.with(|c| *c.borrow_mut() = ua.to_string());
+}
+
+/// (vendor, renderer) reported through WebGL `getParameter(UNMASKED_*_WEBGL)`,
+/// consistent with the stealth profile for the active UA.
+pub(crate) fn current_webgl_identity() -> (String, String) {
+    let ua = ACTIVE_UA.with(|c| c.borrow().clone());
+    let (v, r) = crate::js::stealth::ChromeProfile::webgl_identity_for(&ua);
+    (v.to_string(), r.to_string())
+}
+
 // ---------------------------------------------------------------------------
 // `window` global object
 // ---------------------------------------------------------------------------
@@ -12839,35 +12878,28 @@ fn register_window_globals(
       drawFocusIfNeeded: function () {}
     };
   }
-  function makeWebGL(canvas) {
-    var no = function () {};
-    return {
-      canvas: canvas, drawingBufferWidth: canvas.width || 300, drawingBufferHeight: canvas.height || 150,
-      getParameter: function () { return null; }, getExtension: function () { return null; },
-      getSupportedExtensions: function () { return []; },
-      createShader: function () { return {}; }, shaderSource: no, compileShader: no, getShaderParameter: function () { return null; },
-      createProgram: function () { return {}; }, attachShader: no, linkProgram: no, useProgram: no,
-      getProgramParameter: function () { return null; }, getAttribLocation: function () { return -1; },
-      getUniformLocation: function () { return null; },
-      createBuffer: function () { return {}; }, bindBuffer: no, bufferData: no, deleteShader: no, deleteProgram: no, deleteBuffer: no,
-      enableVertexAttribArray: no, disableVertexAttribArray: no, vertexAttribPointer: no,
-      uniform1f: no, uniform2f: no, uniform3f: no, uniform4f: no, uniform1i: no, uniform2i: no, uniform3i: no, uniform4i: no,
-      uniformMatrix2fv: no, uniformMatrix3fv: no, uniformMatrix4fv: no,
-      viewport: no, drawArrays: no, drawElements: no, clearColor: no, clear: no, enable: no, disable: no,
-      blendFunc: no, depthFunc: no, cullFace: no, frontFace: no, pixelStorei: no, hint: no,
-      createContextAttributes: function () { return { alpha: true, antialias: true }; },
-      getContextAttributes: function () { return { alpha: true, antialias: true }; }
-    };
-  }
+  // Host fallback for native-canvas getContext('2d'): the JS 2d shim object.
+  globalThis.__oxi_canvas_context_2d = makeContext2d;
   function patchCanvas(el) {
     if (el.__oxiCanvas) return el;
     el.__oxiCanvas = true;
+    // Elements with the native WebGL surface handle getContext/toDataURL/
+    // width/height in Rust (incl. the 2d fallback above).
+    if (el.__oxiWebglNative) return el;
     if (typeof el.width !== 'number') el.width = 300;
     if (typeof el.height !== 'number') el.height = 150;
     el.getContext = function (type) {
       var t = String(type || '');
-      if (t === '2d') return makeContext2d(el);
-      if (t === 'webgl' || t === 'webgl2' || t === 'experimental-webgl') return makeWebGL(el);
+      if (t === '2d') {
+        if (!el.__oxiCtx2d) el.__oxiCtx2d = makeContext2d(el);
+        return el.__oxiCtx2d;
+      }
+      if (t === 'webgl' || t === 'webgl2' || t === 'experimental-webgl') {
+        // No native WebGL backend in this build: report honestly instead of
+        // returning a fake success object.
+        try { console.warn('WebGL is not available in this build; getContext("' + t + '") returned null'); } catch (e) {}
+        return null;
+      }
       return null;
     };
     el.toDataURL = function () { return 'data:,'; };
@@ -16724,7 +16756,8 @@ mod tests {
     }
 
     /// canvas 2D shim: getContext('2d') must exist and not throw, measureText
-    /// returns a TextMetrics, toDataURL returns a data: URL, webgl context truthy.
+    /// returns a TextMetrics, toDataURL returns a data: URL. `webgl` reports
+    /// reality: null without the `webgl` backend, a real context with it.
     #[tokio::test]
     async fn test_canvas_2d_shim() {
         let mut rt = JsRuntime::new();
@@ -16741,6 +16774,7 @@ mod tests {
                    mwPos: m.width > 0,\
                    dataUrl: c.toDataURL().slice(0, 5),\
                    gl: !!c.getContext('webgl'),\
+                   glSame: c.getContext('webgl') === c.getContext('webgl'),\
                    img: !!ctx.getImageData\
                  })",
             )
@@ -16755,8 +16789,20 @@ mod tests {
         assert_eq!(v["measure"], true);
         assert_eq!(v["mwPos"], true, "measureText width should be > 0");
         assert_eq!(v["dataUrl"], "data:", "toDataURL should return a data: URL");
-        assert_eq!(v["gl"], true, "getContext('webgl') should be truthy");
         assert_eq!(v["img"], true, "getImageData should exist");
+        // The fake-success WebGL shim is gone: without the ANGLE backend
+        // getContext('webgl') is honestly null; with it, real and identity-
+        // stable (two calls return the same object).
+        #[cfg(not(feature = "webgl"))]
+        assert_eq!(
+            v["gl"], false,
+            "getContext('webgl') must be null when no WebGL backend is compiled in"
+        );
+        #[cfg(feature = "webgl")]
+        assert_eq!(
+            v["glSame"], true,
+            "repeated getContext('webgl') calls must return the same context object"
+        );
     }
 
     /// window.alert/confirm/prompt must exist and not throw; defaults are

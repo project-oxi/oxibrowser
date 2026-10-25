@@ -40,3 +40,6 @@ perf.data.old
 
 # Servo build artifacts (when full-servo feature is enabled)
 /servo-build/
+
+# Vendored ANGLE static libraries (fetched by scripts/setup-angle.sh)
+/third_party/angle/

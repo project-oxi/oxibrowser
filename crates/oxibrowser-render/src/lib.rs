@@ -16,6 +16,9 @@
 mod document;
 mod paint;
 
+#[cfg(feature = "webgl")]
+pub mod gl;
+
 // Re-export Blitz DOM types so downstream crates (oxibrowser-core) can walk the
 // `BaseDocument` tree (returned by `RenderDocument::document()`) without adding
 // a direct blitz-dom dependency.
@@ -26,5 +29,6 @@ pub use document::{
     set_color_scheme_override,
 };
 pub use paint::blank_png;
+pub use paint::encode_png;
 pub use paint::png_to_pdf;
 pub use paint::{PdfOrientation, PdfPageOptions, PdfPageSize, png_to_pdf_paged};

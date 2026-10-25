@@ -120,6 +120,15 @@ impl ChromeProfile {
     pub(crate) fn platform_for(user_agent: &str) -> &'static str {
         Self::from_ua(user_agent).platform
     }
+
+    /// The (vendor, renderer) pair reported through WebGL
+    /// `getParameter(UNMASKED_*_WEBGL)` for a UA. Single source of truth with
+    /// `build_webgl_constructor` so live contexts and the stealth surface
+    /// never disagree.
+    pub fn webgl_identity_for(user_agent: &str) -> (&'static str, &'static str) {
+        let p = Self::from_ua(user_agent);
+        (p.webgl_vendor, p.webgl_renderer)
+    }
 }
 
 /// Extract the Chrome major version (`Chrome/<n>`) from a UA string.
