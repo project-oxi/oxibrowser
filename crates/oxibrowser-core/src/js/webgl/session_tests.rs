@@ -11,6 +11,7 @@
 //! lands on that line are fill-rule excluded. Sample strictly interior
 //! points: bitmap(x, y) = GL(x, 63-y).
 
+use base64::Engine as _;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -236,4 +237,230 @@ async fn webgl_canvas_resize_clears_buffer() {
     // mutator keeps the parsed attributes), so the DOM attribute stays "64";
     // the GL surface + IDL property follow the registry override.
     assert_eq!(v["direct"], 40, "IDL width reads back the override");
+}
+
+/// M5 — Three.js fixture: vendored r128 drives our WebGL1 surface through a
+/// deterministic scene — 2×2 DataTexture quad, an embedded glTF triangle
+/// (GLTFLoader.parse), fixed-step animation, and a real dispatched mousemove
+/// that steers the camera. Pixel assertions run on the session screenshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn webgl_threejs_fixture() {
+    let mut session = session_with(
+        "<!doctype html><html><head><style>body{margin:0}canvas{width:128px;height:128px;display:block}</style></head><body><canvas id=\"c\" width=\"128\" height=\"128\"></canvas></body></html>",
+    )
+    .await;
+
+    let three = std::fs::read_to_string("tests/fixtures/three.min.js").expect("vendored three.js");
+    let r = session.evaluate_js(&three).await.expect("evaluate three");
+    assert!(r.exception.is_none(), "three.js load: {:?}", r.exception);
+    let loader =
+        std::fs::read_to_string("tests/fixtures/GLTFLoader.js").expect("vendored GLTFLoader");
+    let r = session.evaluate_js(&loader).await.expect("evaluate loader");
+    assert!(r.exception.is_none(), "GLTFLoader load: {:?}", r.exception);
+
+    let glb = std::fs::read_to_string("tests/fixtures/minimal.glb.b64").expect("glTF fixture");
+    let glb_bytes = base64::engine::general_purpose::STANDARD
+        .decode(glb.trim())
+        .expect("decode glTF fixture");
+    let script = format!(
+        r#"
+  (async function () {{
+    const canvas = document.getElementById('c');
+    const ctx = canvas.getContext('webgl', {{ alpha: false, antialias: false }});
+    if (!ctx) throw new Error('no webgl');
+    const renderer = new THREE.WebGLRenderer({{ canvas, context: ctx, antialias: false }});
+    renderer.setSize(128, 128, false);
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x203040);
+    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+    camera.position.x = 0;
+    camera.position.y = 0;
+    camera.position.z = 3;
+
+    // 2×2 procedural DataTexture on a fullscreen quad (nearest filtering).
+    const px = new Uint8Array([
+      255, 0, 0, 255, 0, 255, 0, 255,
+      0, 0, 255, 255, 255, 255, 255, 255,
+    ]);
+    const tex = new THREE.DataTexture(px, 2, 2, THREE.RGBAFormat);
+    tex.needsUpdate = true;
+    const quad = new THREE.Mesh(
+      new THREE.PlaneGeometry(2, 2),
+      new THREE.MeshBasicMaterial({{ map: tex, side: THREE.DoubleSide }}),
+    );
+    scene.add(quad);
+
+    // Real dispatched mousemove steers the camera (user-input reproduction).
+    window.__inputDx = 0;
+    canvas.addEventListener('mousemove', (e) => {{
+      window.__inputDx = e.clientX;
+      camera.position.x = (e.clientX - 64) * 0.01;
+    }});
+
+    // Embedded glTF through GLTFLoader.parse — the binary GLB includes
+    // positions and indices; the PBR material is overridden for deterministic pixels.
+    const gltfBinary = new Uint8Array({glb_bytes:?}).buffer;
+    const gltfPromise = new Promise((res, rej) => {{
+      new THREE.GLTFLoader().parse(
+        gltfBinary,
+        '',
+        (g) => {{
+          const root = g.scene;
+          root.position.z = 0.1; // draw in front of the fullscreen texture quad
+          let mesh = null;
+          root.traverse((o) => {{
+            if (o.isMesh) {{
+              o.material = new THREE.MeshBasicMaterial({{ color: 0x00ff00, side: THREE.DoubleSide }});
+              mesh = o;
+            }}
+          }});
+          if (!mesh) return rej(new Error('glTF had no mesh'));
+          scene.add(root);
+          res(mesh);
+        }},
+        (e) => rej(new Error('gltf: ' + e)),
+      );
+    }});
+    const gltfMesh = await gltfPromise;
+
+    renderer.render(scene, camera);
+    // Expose handles for the later animation/input steps.
+    window.__stage = {{ renderer, scene, camera, gltfMesh }};
+    window.__stageError = null;
+  }})().catch((e) => {{
+    window.__stageError = String((e && e.message) || e);
+  }});
+  JSON.stringify({{ started: true }})
+"#,
+        glb_bytes = glb_bytes
+    );
+    let r = session.evaluate_js(&script).await.expect("evaluate scene");
+    assert!(r.exception.is_none(), "scene script: {:?}", r.exception);
+
+    // GLTFLoader's callback settles asynchronously; wait until the IIFE
+    // signals readiness (bounded).
+    let mut ready = false;
+    for _ in 0..50 {
+        let r = session
+            .evaluate_js(
+                "JSON.stringify({s: window.__stage ? 'ready' : (window.__stageError || 'pending')})",
+            )
+            .await
+            .expect("poll");
+        let s = r
+            .value
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if s.contains("\"ready\"") {
+            ready = true;
+            break;
+        }
+        assert!(s.contains("\"pending\""), "scene failed: {s}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(ready, "scene never became ready");
+
+    // Screenshot pixel assertions. Canvas 128×128 at page origin; the quad
+    // stretches the 2×2 texture into quadrants (nearest filtering).
+    let png = session.capture_screenshot_png(256).await.expect("capture");
+    let img = image::load_from_memory(&png).expect("decode");
+    let rgba = img.to_rgba8();
+    let at = |x: u32, y: u32| -> [u8; 3] {
+        let p = rgba.get_pixel(x, y);
+        [p[0], p[1], p[2]]
+    };
+    // Texture quadrants (GL (x,y) → bitmap (x, 127-y)):
+    assert_eq!(at(16, 111), [255, 0, 0], "tex red quadrant"); // GL (-0.75,-0.75)
+    assert_eq!(at(111, 111), [0, 255, 0], "tex green quadrant"); // GL (0.75,-0.75)
+    assert_eq!(at(16, 16), [0, 0, 255], "tex blue quadrant"); // GL (-0.75,0.75)
+    assert_eq!(at(111, 16), [255, 255, 255], "tex white quadrant");
+    // glTF triangle interior — green on top of the red quadrant.
+    let tri = at(48, 79); // GL (-0.25,-0.25)
+    assert_eq!(tri, [0, 255, 0], "glTF triangle (green)");
+    // Background outside the quad? The quad covers everything; check the
+    // page margin instead (outside canvas = white page background).
+    let margin = at(200, 4);
+    assert!(
+        margin[0] > 240 && margin[1] > 240,
+        "page margin should be white, got {margin:?}"
+    );
+
+    // Fixed-step animation: rotate the glTF mesh 180° in 4 fixed steps and
+    // re-render each step (deterministic animation reproduction).
+    let anim = r#"
+  const gltfMesh = window.__stage.gltfMesh;
+  const renderer = window.__stage.renderer;
+  const scene = window.__stage.scene;
+  const camera = window.__stage.camera;
+  for (let i = 0; i < 4; i++) {
+    gltfMesh.rotation.z += Math.PI / 4;
+    renderer.render(scene, camera);
+  }
+  gltfMesh.rotation.z = Math.PI;
+  renderer.render(scene, camera);
+  JSON.stringify({ rot: gltfMesh.rotation.z })
+"#;
+    let r = session.evaluate_js(anim).await.expect("evaluate anim");
+    let s = r.value.as_ref().and_then(|v| v.as_str()).expect("json");
+    let v: serde_json::Value = serde_json::from_str(s).expect("json");
+    let rot = v["rot"].as_f64().unwrap_or(0.0);
+    assert!(
+        (rot - std::f64::consts::PI).abs() < 1e-6,
+        "fixed-step animation state, got {rot}"
+    );
+    // After 180° the green triangle now covers GL (0.25,0.25) → bitmap (80,48);
+    // the old interior spot is quad-red again.
+    let png = session
+        .capture_screenshot_png(256)
+        .await
+        .expect("capture 2");
+    let img = image::load_from_memory(&png).expect("decode 2");
+    let rgba = img.to_rgba8();
+    let at = |x: u32, y: u32| -> [u8; 3] {
+        let p = rgba.get_pixel(x, y);
+        [p[0], p[1], p[2]]
+    };
+    let tri2 = at(80, 48); // GL (0.25,0.25)
+    assert_eq!(tri2, [0, 255, 0], "rotated glTF triangle (green)");
+    let old = at(48, 79);
+    assert_eq!(old, [255, 0, 0], "previous spot back to red texel");
+    assert_eq!(at(48, 16), [0, 0, 255], "blue texel before input");
+
+    // User input: real dispatched mousemove at canvas x=100 (dx=+36) shifts
+    // the camera +0.36 — the texture quadrant boundaries shift left.
+    let hover_js = crate::js::mouse::js_move_mouse(100.0, 64.0);
+    let r = session.evaluate_js(&hover_js).await.expect("hover eval");
+    assert!(r.exception.is_none(), "hover: {:?}", r.exception);
+    let check = r#"
+  window.__stage.renderer.render(window.__stage.scene, window.__stage.camera);
+  JSON.stringify({ inputDx: window.__inputDx, camX: window.__stage.camera.position.x })
+"#;
+    let r = session.evaluate_js(check).await.expect("eval check");
+    let s = r
+        .value
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("check value {:?}, exception {:?}", r.value, r.exception));
+    let v: serde_json::Value = serde_json::from_str(s).expect("json");
+    assert_eq!(v["inputDx"], 100, "mousemove clientX reached the page");
+    let camx = v["camX"].as_f64().unwrap_or(0.0);
+    assert!(
+        (camx - 0.36).abs() < 1e-9,
+        "camera moved by input, got {camx}"
+    );
+    let png = session
+        .capture_screenshot_png(256)
+        .await
+        .expect("capture after input");
+    let img = image::load_from_memory(&png)
+        .expect("decode after input")
+        .to_rgba8();
+    let pixel = img.get_pixel(48, 16);
+    assert_eq!(
+        [pixel[0], pixel[1], pixel[2]],
+        [255, 255, 255],
+        "mousemove shifts the textured scene"
+    );
 }

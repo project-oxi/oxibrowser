@@ -44,11 +44,18 @@ flowchart TD
 - cargo 피처: `oxibrowser --features webgl` (core/render로 전이).
 - ANGLE 정적 라이브러리는 커밋하지 않는다: `scripts/setup-angle.sh`가 고정 릴리스(godot-angle-static `chromium/8118`, macOS arm64/x86_64, sha256 고정)를 `third_party/angle/<triple>/`에 내려받고 `crates/oxibrowser-render/build.rs`가 링크. 기본 빌드는 피처 off로 영향 없음.
 
-## 백엔드 상태 (2026-10-25, 최종)
+## 백엔드 상태 (M1–M7)
 
-**Milestone 1·3·4 통과.** 소스 빌드 ANGLE(chromium/8118, Metal)에서 offscreen 생성·셰이더 컴파일/링크·삼각형 픽셀 readback·resize/해제 반복이 모두 검증됐고, 세션 레벨 통합 테스트(`src/js/webgl/session_tests.rs`) 4건이 통과한다 — 페이지 JS가 그린 WebGL 삼각형이 실제 PNG 스크린샷에 나온다.
+**M1·M3·M4 통과, M2 구현.** 소스 빌드 ANGLE(chromium/8118, Metal)에서 offscreen 생성·셰이더 컴파일/링크·삼각형 픽셀 readback·resize/해제 반복이 검증됐고, 세션 테스트는 페이지 JS가 그린 WebGL 픽셀을 실제 PNG에 합성한다.
 
 과정 기록 (디버깅 교훈): 중간에 "Metal에서 드로우가 래스터라이즈되지 않는다"는 결론을 내렸는데 — godot 사전빌드·소스 빌드·Vulkan/MoltenVK 모두에서 동일 증상이었기 때문. 원인은 **테스트 샘플링 버그**였다: 테스트 삼각형 `(-1,-1),(1,-1),(-1,1)`의 빗변이 `x+y=0`인데, 읽은 픽셀(GL (32,32) 등)이 정확히 그 에지 위라 fill-rule로 제외된 것이었다. 클리어만 보이고 드로우가 안 보이는 것으로 오독. 교훈: 래스터라이즈 검증은 엄밀히 내부적인 점으로.
+
+**M5 — Three.js fixture 통과.** Three.js r128, GLTFLoader, 작은 GLB를 로드하고 텍스처 사분면·glTF 삼각형·고정 스텝 회전·마우스 입력 후 픽셀을 확인한다. 실행: `cargo test -p oxibrowser-core --features webgl webgl_threejs_fixture -- --nocapture`.
+
+**M6 — SwiftShader Vulkan 통과.** `scripts/build-angle.sh`가 ANGLE Vulkan 백엔드를 포함하고, `scripts/setup-swiftshader.sh`가 고정 revision의 SwiftShader ICD를 준비한다. 이 macOS arm64 실행에서 `angle_smoke`가 resize·context 재생성까지 통과했다. `angle_bench`: 초기화 18,672 μs, 첫 context 967 μs, 256×256 readback 64회 평균/p95 53/88 μs, 64회 context cycle 평균/p95 131/228 μs. RSS는 시작 6.9 MB에서 첫 context 후 47.0 MB, readback 후 51.0 MB, cycle 16회부터 52.0 MB로 안정화됐다. 한 호스트의 측정값이며 성능 기준선은 아니다.
+
+**M7 — 고정 Khronos 부분집합 통과.** Revision `3a65272e40f97c82de335825ea77c4da8e77a637`의 6개 페이지에서 총 272 PASS, 0 FAIL: context(6), program-handling(13), index-validation(18), tex-input-validation(63), read-pixels-pack-alignment(165), gl-initial-state(7). 실행: `scripts/run-webgl-conformance.sh` (ANGLE/SwiftShader 환경변수 설정 필요). runner는 상대 script URL을 페이지 URL에 결합하고, 셰이더 파일은 동기 XHR로 읽는다. response body가 UTF-8 text로 제공되므로 `overrideMimeType`의 비-UTF-8 charset은 명시적으로 거부한다. `gl-geterror.html`은 같은 revision의 `desktop-gl-constants.js`에 없는 `ALPHA_TEST`를 참조해 테스트 전 TypeError가 발생하므로 제외하고, 유효한 state 초기값 테스트로 대체한다. 전체 Khronos suite 통과를 의미하지 않는다.
+
 
 빌드 경로 두 가지 (build.rs는 `libANGLE_all.a` 하나만 링크):
 
@@ -72,4 +79,6 @@ flowchart TD
 | 2 WebGL 호환·초기화 속성 | **구현** — 컨텍스트 생성 속성 적용(webgl+robust+bindgen=false), `getContextAttributes`로 노출 |
 | 3 Boa 연결(identity/pinning/소유/세대) | **PASS** — `webgl_context_identity_and_pinning`, `webgl_resource_ownership` |
 | 4 페이지 합성 | **PASS** — `webgl_triangle_reaches_screenshot` (rAF 이후 캡처 일치), `webgl_canvas_resize_clears_buffer` |
-| 5–7 (Three.js fixture, 소프트웨어 백엔드, Khronos) | 미착수 |
+| 5 Three.js fixture | **PASS** — `webgl_threejs_fixture` (Three.js r128 + GLTFLoader + GLB, 텍스처/회전/마우스 입력 픽셀 검증) |
+| 6 소프트웨어 백엔드 | **PASS** — ANGLE Vulkan + SwiftShader, `angle_smoke` 및 `angle_bench` (64회 readback/context cycle, RSS 안정화 확인) |
+| 7 Khronos WebGL | **PASS** — pinned revision의 6개 페이지, 272 PASS / 0 FAIL; 전체 suite가 아닌 선택 부분집합 |

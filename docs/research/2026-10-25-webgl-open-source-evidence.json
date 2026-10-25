@@ -1,0 +1,631 @@
+{
+  "schema_version": 1,
+  "research_date_kst": "2026-10-25",
+  "oxibrowser_head": "4fb4e79bfba136c9432a43658630eea6f40189f5",
+  "scope": "Static source and documentation investigation. No candidate native builds, GPU benchmarks, runtime conformance tests, or OxiBrowser engine edits.",
+  "method": [
+    "Agent Reach Exa searches discovered candidates; official repositories and specifications supplied final technical evidence.",
+    "GitHub connector read metadata, default-branch HEAD, directory listings, source, manifests, licenses and selected release metadata.",
+    "Early README discovery reads used default branches; source implementation and license analysis used the recorded commit pins. URLs below identify the matching revision for review.",
+    "Maintenance dates are HEAD commit committer dates, not pushed_at. License text/manifest takes precedence over README badges."
+  ],
+  "repositories": [
+    {
+      "repository": "servo/servo",
+      "default_branch": "main",
+      "head": "4b3bd9569875346c8c25c1a3ac5cb726e088ba04",
+      "head_committer_date": "2026-10-24T21:49:43Z",
+      "repository_pushed_at": "2026-10-24T23:42:50Z",
+      "archived": false,
+      "license_observed": "MPL-2.0",
+      "sources": [
+        {
+          "path": "Cargo.toml",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/Cargo.toml",
+          "retrieved": true,
+          "line_count": 497
+        },
+        {
+          "path": "components/webgl/Cargo.toml",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/components/webgl/Cargo.toml",
+          "retrieved": true,
+          "line_count": 43
+        },
+        {
+          "path": "components/webgl/webgl_thread.rs",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/components/webgl/webgl_thread.rs",
+          "retrieved": true,
+          "line_count": 3443
+        },
+        {
+          "path": "components/script/dom/webgl/webglrenderingcontext.rs",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/components/script/dom/webgl/webglrenderingcontext.rs",
+          "retrieved": true,
+          "line_count": 5434
+        },
+        {
+          "path": "components/script/dom/webgl/webgl2renderingcontext.rs",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/components/script/dom/webgl/webgl2renderingcontext.rs",
+          "retrieved": true,
+          "line_count": 5125
+        },
+        {
+          "path": "components/script/dom/webgl/webglshader.rs",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/components/script/dom/webgl/webglshader.rs",
+          "retrieved": true,
+          "line_count": 321
+        },
+        {
+          "path": "components/config/prefs.rs",
+          "url": "https://github.com/servo/servo/blob/4b3bd9569875346c8c25c1a3ac5cb726e088ba04/components/config/prefs.rs",
+          "retrieved": true,
+          "line_count": 713
+        }
+      ]
+    },
+    {
+      "repository": "servo/surfman",
+      "default_branch": "main",
+      "head": "e1af0230c9f30ec32c0855a8daa7272111ba5dcc",
+      "head_committer_date": "2026-10-18T07:44:18Z",
+      "repository_pushed_at": "2026-10-18T07:52:05Z",
+      "archived": false,
+      "license_observed": "MIT OR Apache-2.0 OR MPL-2.0 (Cargo)",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/servo/surfman/blob/e1af0230c9f30ec32c0855a8daa7272111ba5dcc/README.md",
+          "retrieved": true,
+          "line_count": 106
+        },
+        {
+          "path": "Cargo.toml",
+          "url": "https://github.com/servo/surfman/blob/e1af0230c9f30ec32c0855a8daa7272111ba5dcc/Cargo.toml",
+          "retrieved": true,
+          "line_count": 132
+        },
+        {
+          "path": "src/lib.rs",
+          "url": "https://github.com/servo/surfman/blob/e1af0230c9f30ec32c0855a8daa7272111ba5dcc/src/lib.rs",
+          "retrieved": true,
+          "line_count": 111
+        }
+      ]
+    },
+    {
+      "repository": "google/angle",
+      "default_branch": "main",
+      "head": "9addc2983b90152f628cfdaea194983b46b254bd",
+      "head_committer_date": "2026-10-24T17:22:55Z",
+      "repository_pushed_at": "2026-10-24T17:34:26Z",
+      "archived": false,
+      "license_observed": "BSD 3조항 계열 (LICENSE)",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/google/angle/blob/9addc2983b90152f628cfdaea194983b46b254bd/README.md",
+          "retrieved": true,
+          "line_count": 140
+        },
+        {
+          "path": "LICENSE",
+          "url": "https://github.com/google/angle/blob/9addc2983b90152f628cfdaea194983b46b254bd/LICENSE",
+          "retrieved": true,
+          "line_count": 33
+        },
+        {
+          "path": "extensions/EGL_ANGLE_create_context_webgl_compatibility.txt",
+          "url": "https://github.com/google/angle/blob/9addc2983b90152f628cfdaea194983b46b254bd/extensions/EGL_ANGLE_create_context_webgl_compatibility.txt",
+          "retrieved": true,
+          "line_count": 98
+        },
+        {
+          "path": "extensions/ANGLE_webgl_compatibility.txt",
+          "url": "https://github.com/google/angle/blob/9addc2983b90152f628cfdaea194983b46b254bd/extensions/ANGLE_webgl_compatibility.txt",
+          "retrieved": true,
+          "line_count": 101
+        },
+        {
+          "path": "extensions/EGL_ANGLE_robust_resource_initialization.txt",
+          "url": "https://github.com/google/angle/blob/9addc2983b90152f628cfdaea194983b46b254bd/extensions/EGL_ANGLE_robust_resource_initialization.txt",
+          "retrieved": true,
+          "line_count": 129
+        },
+        {
+          "path": "extensions/EGL_ANGLE_create_context_extensions_enabled.txt",
+          "url": "https://github.com/google/angle/blob/9addc2983b90152f628cfdaea194983b46b254bd/extensions/EGL_ANGLE_create_context_extensions_enabled.txt",
+          "retrieved": true,
+          "line_count": 89
+        }
+      ]
+    },
+    {
+      "repository": "stackgl/headless-gl",
+      "default_branch": "master",
+      "head": "7f7338de35889e7c51c3f495a956bf5a110d4b51",
+      "head_committer_date": "2026-05-25T05:34:41Z",
+      "repository_pushed_at": "2026-05-25T05:34:41Z",
+      "archived": false,
+      "license_observed": "본체 BSD 2조항, ANGLE 별도",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/stackgl/headless-gl/blob/7f7338de35889e7c51c3f495a956bf5a110d4b51/README.md",
+          "retrieved": true,
+          "line_count": 269
+        },
+        {
+          "path": "LICENSES",
+          "url": "https://github.com/stackgl/headless-gl/blob/7f7338de35889e7c51c3f495a956bf5a110d4b51/LICENSES",
+          "retrieved": true,
+          "line_count": 67
+        }
+      ]
+    },
+    {
+      "repository": "monteslu/webgl-node",
+      "default_branch": "main",
+      "head": "f9b4fcef069bda6163ea317e18e5d226c237d99c",
+      "head_committer_date": "2026-10-18T20:45:39Z",
+      "repository_pushed_at": "2026-10-18T20:45:41Z",
+      "archived": false,
+      "license_observed": "MIT",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/monteslu/webgl-node/blob/f9b4fcef069bda6163ea317e18e5d226c237d99c/README.md",
+          "retrieved": true,
+          "line_count": 231
+        },
+        {
+          "path": "package.json",
+          "url": "https://github.com/monteslu/webgl-node/blob/f9b4fcef069bda6163ea317e18e5d226c237d99c/package.json",
+          "retrieved": true
+        },
+        {
+          "path": "lib/webgl2-context.mjs",
+          "url": "https://github.com/monteslu/webgl-node/blob/f9b4fcef069bda6163ea317e18e5d226c237d99c/lib/webgl2-context.mjs",
+          "retrieved": true,
+          "line_count": 1358
+        },
+        {
+          "path": "lib/webgl-objects.mjs",
+          "url": "https://github.com/monteslu/webgl-node/blob/f9b4fcef069bda6163ea317e18e5d226c237d99c/lib/webgl-objects.mjs",
+          "retrieved": true,
+          "line_count": 41
+        }
+      ]
+    },
+    {
+      "repository": "monteslu/native-gles",
+      "default_branch": "main",
+      "head": "1d5277ad3757162e22404e764bb0580746ee0227",
+      "head_committer_date": "2026-10-15T16:17:14Z",
+      "repository_pushed_at": "2026-10-15T16:17:22Z",
+      "archived": false,
+      "license_observed": "MIT (package.json)",
+      "sources": [
+        {
+          "path": "package.json",
+          "url": "https://github.com/monteslu/native-gles/blob/1d5277ad3757162e22404e764bb0580746ee0227/package.json",
+          "retrieved": true
+        },
+        {
+          "path": "src/egl_context.cpp",
+          "url": "https://github.com/monteslu/native-gles/blob/1d5277ad3757162e22404e764bb0580746ee0227/src/egl_context.cpp",
+          "retrieved": true,
+          "line_count": 480
+        }
+      ]
+    },
+    {
+      "repository": "google/node-gles",
+      "default_branch": "master",
+      "head": "b4cb488f580888d13c603cba38f692441ec4fc69",
+      "head_committer_date": "2020-04-16T17:46:54Z",
+      "repository_pushed_at": "2025-08-20T14:53:44Z",
+      "archived": false,
+      "license_observed": "Apache-2.0 (저장소 metadata)",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/google/node-gles/blob/b4cb488f580888d13c603cba38f692441ec4fc69/README.md",
+          "retrieved": true,
+          "line_count": 65
+        }
+      ]
+    },
+    {
+      "repository": "gfx-rs/wgpu",
+      "default_branch": "trunk",
+      "head": "63e505290e82708a53b53eb8a16aec731683be63",
+      "head_committer_date": "2026-10-22T17:16:48Z",
+      "repository_pushed_at": "2026-10-24T16:35:51Z",
+      "archived": false,
+      "license_observed": "MIT OR Apache-2.0 (workspace)",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/gfx-rs/wgpu/blob/63e505290e82708a53b53eb8a16aec731683be63/README.md",
+          "retrieved": true,
+          "line_count": 170
+        },
+        {
+          "path": "Cargo.toml",
+          "url": "https://github.com/gfx-rs/wgpu/blob/63e505290e82708a53b53eb8a16aec731683be63/Cargo.toml",
+          "retrieved": true,
+          "line_count": 354
+        },
+        {
+          "path": "naga/src/front/glsl/mod.rs",
+          "url": "https://github.com/gfx-rs/wgpu/blob/63e505290e82708a53b53eb8a16aec731683be63/naga/src/front/glsl/mod.rs",
+          "retrieved": true,
+          "line_count": 235
+        }
+      ]
+    },
+    {
+      "repository": "grovesNL/glow",
+      "default_branch": "main",
+      "head": "0e9ad3313364754c45fab073c98b0a5e162315be",
+      "head_committer_date": "2026-10-22T16:05:22Z",
+      "repository_pushed_at": "2026-10-22T16:05:23Z",
+      "archived": false,
+      "license_observed": "Apache-2.0 OR Zlib OR MIT",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/grovesNL/glow/blob/0e9ad3313364754c45fab073c98b0a5e162315be/README.md",
+          "retrieved": true,
+          "line_count": 36
+        }
+      ]
+    },
+    {
+      "repository": "google/swiftshader",
+      "default_branch": "master",
+      "head": "cddb5c91b23ff70a1f607ea31610aa0d7f4b5ad5",
+      "head_committer_date": "2026-10-14T16:03:47Z",
+      "repository_pushed_at": "2026-10-14T16:09:48Z",
+      "archived": false,
+      "license_observed": "Apache-2.0",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/google/swiftshader/blob/cddb5c91b23ff70a1f607ea31610aa0d7f4b5ad5/README.md",
+          "retrieved": true,
+          "line_count": 127
+        }
+      ]
+    },
+    {
+      "repository": "BabylonJS/BabylonNative",
+      "default_branch": "master",
+      "head": "5e8cefa7add1881893c74827eb7ad940f0131b09",
+      "head_committer_date": "2026-10-23T23:30:45Z",
+      "repository_pushed_at": "2026-10-23T23:30:46Z",
+      "archived": false,
+      "license_observed": "MIT (저장소 metadata)",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/BabylonJS/BabylonNative/blob/5e8cefa7add1881893c74827eb7ad940f0131b09/README.md",
+          "retrieved": true,
+          "line_count": 131
+        }
+      ]
+    },
+    {
+      "repository": "godotengine/godot-angle-static",
+      "default_branch": "godot-static",
+      "head": "03294a3685546770cb4363829944709eabf0d094",
+      "head_committer_date": "2026-10-23T11:22:36Z",
+      "repository_pushed_at": "2026-10-23T11:25:01Z",
+      "archived": false,
+      "license_observed": "빌드 코드 MIT, ANGLE 별도",
+      "sources": [
+        {
+          "path": "SConstruct",
+          "url": "https://github.com/godotengine/godot-angle-static/blob/03294a3685546770cb4363829944709eabf0d094/SConstruct",
+          "retrieved": true,
+          "line_count": 829
+        },
+        {
+          "path": ".github/workflows/ci.yaml",
+          "url": "https://github.com/godotengine/godot-angle-static/blob/03294a3685546770cb4363829944709eabf0d094/.github/workflows/ci.yaml",
+          "retrieved": true,
+          "line_count": 312
+        },
+        {
+          "path": "LICENSE.md",
+          "url": "https://github.com/godotengine/godot-angle-static/blob/03294a3685546770cb4363829944709eabf0d094/LICENSE.md",
+          "retrieved": true,
+          "line_count": 22
+        }
+      ]
+    },
+    {
+      "repository": "RenaudRohlinger/node-webgl",
+      "default_branch": "main",
+      "head": "9a462f5d915b078c9499c2b1c341d352c572ffbf",
+      "head_committer_date": "2026-09-17T11:45:09Z",
+      "repository_pushed_at": "2026-09-17T11:57:51Z",
+      "archived": false,
+      "license_observed": "MIT 수정본, AI 사용 제한",
+      "sources": [
+        {
+          "path": "LICENSE",
+          "url": "https://github.com/RenaudRohlinger/node-webgl/blob/9a462f5d915b078c9499c2b1c341d352c572ffbf/LICENSE",
+          "retrieved": true,
+          "line_count": 70
+        }
+      ]
+    },
+    {
+      "repository": "servo/mozangle",
+      "default_branch": "main",
+      "head": "db4633ea0ce432fcb76d1ff3d38b513463b350df",
+      "head_committer_date": "2026-09-18T09:57:01Z",
+      "repository_pushed_at": "2026-09-19T03:43:00Z",
+      "archived": false,
+      "license_observed": "BSD-3-Clause (Cargo)",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/servo/mozangle/blob/db4633ea0ce432fcb76d1ff3d38b513463b350df/README.md",
+          "retrieved": true,
+          "line_count": 51
+        },
+        {
+          "path": "Cargo.toml",
+          "url": "https://github.com/servo/mozangle/blob/db4633ea0ce432fcb76d1ff3d38b513463b350df/Cargo.toml",
+          "retrieved": true,
+          "line_count": 28
+        }
+      ]
+    },
+    {
+      "repository": "LadybirdBrowser/ladybird",
+      "default_branch": "master",
+      "head": "96dcb7e92576853e99ffa10b4e47fd2e3d6adf17",
+      "head_committer_date": "2026-10-24T23:22:58Z",
+      "repository_pushed_at": "2026-10-24T23:26:42Z",
+      "archived": false,
+      "license_observed": "검토한 WebGL Rust 파일 BSD-2-Clause",
+      "sources": [
+        {
+          "path": "Libraries/LibWeb/Bindings/Rust/Cargo.toml",
+          "url": "https://github.com/LadybirdBrowser/ladybird/blob/96dcb7e92576853e99ffa10b4e47fd2e3d6adf17/Libraries/LibWeb/Bindings/Rust/Cargo.toml",
+          "retrieved": true,
+          "line_count": 42
+        },
+        {
+          "path": "Libraries/LibWeb/Bindings/Rust/src/web_gl/mod.rs",
+          "url": "https://github.com/LadybirdBrowser/ladybird/blob/96dcb7e92576853e99ffa10b4e47fd2e3d6adf17/Libraries/LibWeb/Bindings/Rust/src/web_gl/mod.rs",
+          "retrieved": true,
+          "line_count": 149
+        },
+        {
+          "path": "Libraries/LibWeb/Bindings/Rust/src/web_gl/host.rs",
+          "url": "https://github.com/LadybirdBrowser/ladybird/blob/96dcb7e92576853e99ffa10b4e47fd2e3d6adf17/Libraries/LibWeb/Bindings/Rust/src/web_gl/host.rs",
+          "retrieved": true,
+          "line_count": 300
+        },
+        {
+          "path": "Libraries/LibWeb/Bindings/Rust/src/web_gl/web_gl_object.rs",
+          "url": "https://github.com/LadybirdBrowser/ladybird/blob/96dcb7e92576853e99ffa10b4e47fd2e3d6adf17/Libraries/LibWeb/Bindings/Rust/src/web_gl/web_gl_object.rs",
+          "retrieved": true,
+          "line_count": 141
+        },
+        {
+          "path": "Services/Compositor/OpenGLContext.cpp",
+          "url": "https://github.com/LadybirdBrowser/ladybird/blob/96dcb7e92576853e99ffa10b4e47fd2e3d6adf17/Services/Compositor/OpenGLContext.cpp",
+          "retrieved": true,
+          "line_count": 915
+        }
+      ]
+    },
+    {
+      "repository": "mavity/webgl2",
+      "default_branch": "main",
+      "head": "da1bec86365f0eb465f2f9fad31a42787b7445c4",
+      "head_committer_date": "2026-02-08T17:04:21Z",
+      "repository_pushed_at": "2026-02-08T17:04:47Z",
+      "archived": false,
+      "license_observed": "권한을 부여하지 않는 placeholder",
+      "sources": [
+        {
+          "path": "README.md",
+          "url": "https://github.com/mavity/webgl2/blob/da1bec86365f0eb465f2f9fad31a42787b7445c4/README.md",
+          "retrieved": true,
+          "line_count": 119
+        },
+        {
+          "path": "Cargo.toml",
+          "url": "https://github.com/mavity/webgl2/blob/da1bec86365f0eb465f2f9fad31a42787b7445c4/Cargo.toml",
+          "retrieved": true,
+          "line_count": 101
+        },
+        {
+          "path": "LICENSE",
+          "url": "https://github.com/mavity/webgl2/blob/da1bec86365f0eb465f2f9fad31a42787b7445c4/LICENSE",
+          "retrieved": true,
+          "line_count": 15
+        }
+      ]
+    }
+  ],
+  "findings": [
+    {
+      "id": "angle-webgl-mode",
+      "kind": "source",
+      "repo": "google/angle",
+      "path": "extensions/EGL_ANGLE_create_context_webgl_compatibility.txt",
+      "finding": "WebGL compatibility mode is explicitly enabled at EGL context creation and defaults false. GL extension applies WebGL differences and GLSL ES 100/300 WebGL shader semantics."
+    },
+    {
+      "id": "angle-resource-init",
+      "kind": "source",
+      "repo": "google/angle",
+      "path": "extensions/EGL_ANGLE_robust_resource_initialization.txt",
+      "finding": "Robust initialization is a separate context/surface option defaulting false; do not assume setting one WebGL mode flag completes every browser responsibility."
+    },
+    {
+      "id": "servo-coupling",
+      "kind": "source",
+      "repo": "servo/servo",
+      "paths": [
+        "components/webgl/Cargo.toml",
+        "components/script/dom/webgl/webglrenderingcontext.rs",
+        "Cargo.toml"
+      ],
+      "finding": "servo-webgl crate execution layer depends on Servo paint/canvas traits/WebRender; DOM frontend imports js (mozjs), typed arrays, GC/rooting and generated WebIDL. Not a drop-in Boa SDK."
+    },
+    {
+      "id": "servo-shader-and-pref",
+      "kind": "source",
+      "repo": "servo/servo",
+      "paths": [
+        "components/script/dom/webgl/webglshader.rs",
+        "components/config/prefs.rs"
+      ],
+      "finding": "ShaderValidator::for_webgl and for_webgl2 come from mozangle; dom_webgl2_enabled defaults false at prefs.rs line 503."
+    },
+    {
+      "id": "ladybird-rust-frontend",
+      "kind": "source",
+      "repo": "LadybirdBrowser/ladybird",
+      "paths": [
+        "Libraries/LibWeb/Bindings/Rust/src/web_gl/mod.rs",
+        "Libraries/LibWeb/Bindings/Rust/src/web_gl/web_gl_object.rs",
+        "Services/Compositor/OpenGLContext.cpp"
+      ],
+      "finding": "Rust WebGL frontend tracks context identity/generation/invalidated handles; C++ compositor creates ANGLE context with WebGL compatibility and robust initialization true. Target source BSD-2-Clause, coupled to libjs_rust/LibWeb/transport."
+    },
+    {
+      "id": "surfman-macos",
+      "kind": "source",
+      "repo": "servo/surfman",
+      "path": "src/lib.rs",
+      "finding": "macOS default is CGL; angle module is cfg Windows + sm-angle. Metal surfaces in README do not establish macOS ANGLE GLES backend support."
+    },
+    {
+      "id": "mozangle-scope",
+      "kind": "source",
+      "repo": "servo/mozangle",
+      "path": "README.md",
+      "finding": "Default compiles shader translator; egl only Windows D3D11. Not turnkey macOS Metal runtime packaging."
+    },
+    {
+      "id": "godot-static",
+      "kind": "source",
+      "repo": "godotengine/godot-angle-static",
+      "paths": [
+        "SConstruct",
+        ".github/workflows/ci.yaml"
+      ],
+      "finding": "Static ANGLE/EGL/GLES libraries built for macOS/iOS/Windows; SConstruct platform tuple excludes Linux. Packaging model candidate, not OxiBrowser size/build verification."
+    },
+    {
+      "id": "node-webgl-identity",
+      "kind": "static-observation",
+      "repo": "monteslu/webgl-node",
+      "paths": [
+        "lib/webgl-objects.mjs",
+        "lib/webgl2-context.mjs"
+      ],
+      "finding": "Wrapper handles store numeric ID only; bindBuffer forwards unwrap(buf) without context identity validation; isContextLost returns false. No runtime exploit or driver failure tested."
+    },
+    {
+      "id": "native-gles-context",
+      "kind": "source",
+      "repo": "monteslu/native-gles",
+      "path": "src/egl_context.cpp",
+      "lines": [
+        289,
+        294
+      ],
+      "finding": "eglCreateContext attributes request GLES3 only, no WebGL-compatibility or robust-initialization flags in that creation list."
+    },
+    {
+      "id": "headless-gl-status",
+      "kind": "source",
+      "repo": "stackgl/headless-gl",
+      "path": "README.md",
+      "finding": "README targets WebGL1.0.3 and labels WebGL2 experimental. GitHub latest release observed v9.0.0-rc.10 published 2026-04-10."
+    },
+    {
+      "id": "node-gles-age",
+      "kind": "source",
+      "repo": "google/node-gles",
+      "finding": "HEAD committer date 2020-04-16 despite repository pushed_at 2025-08-20."
+    },
+    {
+      "id": "wgpu-direction",
+      "kind": "source",
+      "repo": "gfx-rs/wgpu",
+      "paths": [
+        "README.md",
+        "naga/src/front/glsl/mod.rs"
+      ],
+      "finding": "WebGPU-based API; wasm WebGL backend consumes host WebGL. GLSL input frontend lists Vulkan 440 partial/450/460; ES frontend compatibility is not established."
+    },
+    {
+      "id": "license-mavity",
+      "kind": "license-metadata",
+      "repo": "mavity/webgl2",
+      "paths": [
+        "README.md",
+        "LICENSE",
+        "Cargo.toml"
+      ],
+      "finding": "README MIT statement conflicts with actual restrictive proprietary placeholder LICENSE and Cargo license-file. Excluded as a reuse candidate; no implementation source adopted or executed."
+    },
+    {
+      "id": "license-renaud",
+      "kind": "license-metadata",
+      "repo": "RenaudRohlinger/node-webgl",
+      "path": "LICENSE",
+      "finding": "Modified MIT includes AI-use restrictions, unsuitable for recommended OxiBrowser agent-oriented reuse. No implementation code adopted, installed or executed."
+    },
+    {
+      "id": "oxi-shim",
+      "kind": "local-source",
+      "path": "crates/oxibrowser-core/src/js/runtime.rs",
+      "lines": [
+        12795,
+        12892
+      ],
+      "finding": "Canvas bootstrap WebGL methods are no-ops; getContext returns fresh mock object, no readPixels implemented. Existing test checks truthy WebGL context. Actual renderer uses VelloCpuImageRenderer."
+    }
+  ],
+  "standards": [
+    {
+      "repository": "KhronosGroup/WebGL",
+      "repo": "KhronosGroup/WebGL",
+      "sha": "3a65272e40f97c82de335825ea77c4da8e77a637",
+      "date": "2026-10-21T19:14:58Z",
+      "url": "https://github.com/KhronosGroup/WebGL/blob/3a65272e40f97c82de335825ea77c4da8e77a637/sdk/tests/CONFORMANCE_RULES.txt"
+    },
+    {
+      "url": "https://registry.khronos.org/webgl/specs/latest/1.0/",
+      "status": "Editor draft as served; used for browser semantics context"
+    },
+    {
+      "url": "https://docs.mesa3d.org/drivers/llvmpipe.html",
+      "finding": "LLVM-based CPU rasterizer"
+    }
+  ],
+  "retrieval_failures": [
+    "godotengine/godot-angle-static README.md 404; recovered by directory listing and inspecting SConstruct, LICENSE.md and CI.",
+    "Mesa drivers/lavapipe.html 404; no Lavapipe-specific claims included.",
+    "Guessed ANGLE EGL_ANGLE_create_context_bind_generates_resource.txt 404; no claims based on that path.",
+    "Ladybird Libraries/LibWebGL 404; actual frontend found under LibWeb/Bindings/Rust/src/web_gl."
+  ],
+  "remaining": [
+    "Select target workloads and platforms; choose whether optional C++ graphics dependencies are acceptable.",
+    "Run isolated ANGLE Metal/GLES3 offscreen prototype, actual conformance subsets and performance measurements.",
+    "Validate Rust EGL/glow binding availability against chosen ANGLE build and all required extensions.",
+    "Verify canvas composition integration and foundational DOM/event-loop/module/binary-fetch behavior."
+  ]
+}

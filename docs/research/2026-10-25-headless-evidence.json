@@ -1,0 +1,452 @@
+{
+  "research_date": "2026-10-25",
+  "timezone": "Asia/Seoul",
+  "scope": "Research evidence, not a compatibility certification. No browser engine source changes. Local fixtures ran in the CLI session path. No Chrome differential run.",
+  "build": "cargo build -p oxibrowser --locked",
+  "unit_checks": {
+    "command": "cargo test -p oxibrowser-core --lib test_get_computed_style --locked",
+    "passed": 6,
+    "failed": 0,
+    "filtered": 706
+  },
+  "local_probes": {
+    "source_revision": "4fb4e79bfba136c9432a43658630eea6f40189f5",
+    "binary_sha256": "1529dc5406dd9428a526eff875fabd8575f6b910cc651584a82796736b810966",
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "fixtures": {
+      "/": "<!doctype html><html><head><style>#box{color:rgb(12,34,56);width:123px;height:45px;background-color:rgb(1,2,3)}#off{position:absolute;top:5000px;width:100px;height:100px}</style></head><body><div id=\"box\">box</div><div id=\"parent\"><i id=\"first\">first</i></div><div id=\"off\">off</div></body></html>",
+      "/module": "<body>module<script type=\"module\">export const value=42;globalThis.moduleOK=value;</script></body>",
+      "/chunk.js": "globalThis.chunkRan=(globalThis.chunkRan||0)+1;",
+      "/binary": {
+        "bytes": [
+          0,
+          128,
+          255,
+          65
+        ]
+      }
+    },
+    "probe_names": [
+      "presence",
+      "window_identity",
+      "event_target",
+      "node_identity",
+      "expando",
+      "computed_css",
+      "inline_css",
+      "inline_css_next_eval",
+      "insert_before_null",
+      "dom_helpers",
+      "observer",
+      "timer_promise",
+      "observer_result",
+      "append_script",
+      "append_result",
+      "insert_script",
+      "insert_result",
+      "binary_fetch",
+      "dynamic_final"
+    ],
+    "commands": [
+      "new",
+      "goto t1 http://127.0.0.1:56588/",
+      "eval t1 JSON.stringify(Object.fromEntries(['EventTarget','DOMException','MessageChannel','ReadableStream','WritableStream','TransformStream','Worker','FileReader','CSSStyleSheet','CanvasRenderingContext2D','getComputedStyle'].map(k=>[k,typeof globalThis[k]])))",
+      "eval t1 JSON.stringify({same:window===globalThis,self:typeof self==='undefined'?'undefined':self===window,eventTargetOnWindow:typeof window.EventTarget,gcsOnWindow:typeof window.getComputedStyle,scrollX:typeof window.scrollX})",
+      "eval t1 JSON.stringify({ctor:typeof EventTarget,add:typeof (new EventTarget()).addEventListener,dispatch:typeof (new EventTarget()).dispatchEvent})",
+      "eval t1 JSON.stringify({same:document.getElementById('box')===document.getElementById('box'),node:document.getElementById('box') instanceof Node,element:document.getElementById('box') instanceof Element,html:document.getElementById('box') instanceof HTMLElement})",
+      "eval t1 (()=>{var e=document.getElementById('box');e.__probe=42;return JSON.stringify({again:document.getElementById('box').__probe||null})})()",
+      "eval t1 (()=>{var e=document.getElementById('box'),s=getComputedStyle(e);return JSON.stringify({null:s===null,color:s&&s.color,width:s&&s.width,bg:s&&s.getPropertyValue('background-color'),font:s&&s.getPropertyValue('font-size'),opacity:s&&s.getPropertyValue('opacity')})})()",
+      "eval t1 (()=>{var e=document.getElementById('box');e.setAttribute('style','font-size:23px;background-color:red;opacity:0.5');var s=getComputedStyle(e);return JSON.stringify({font:s&&s.fontSize,kebab:s&&s.getPropertyValue('font-size'),opacity:s&&s.getPropertyValue('opacity')})})()",
+      "eval t1 getComputedStyle(document.getElementById('box')).fontSize",
+      "eval t1 (()=>{var p=document.getElementById('parent'),e=document.createElement('b');e.id='last';p.insertBefore(e,null);return JSON.stringify(Array.from(p.childNodes).map(n=>n.tagName))})()",
+      "eval t1 JSON.stringify({range:typeof document.createRange,walker:typeof document.createTreeWalker,iterator:typeof document.createNodeIterator,selection:typeof getSelection,sheets:typeof document.styleSheets,subtle:typeof crypto.subtle})",
+      "eval t1 (()=>{globalThis.obs={};new ResizeObserver(es=>obs.ro=es[0].contentRect.width).observe(document.getElementById('box'));new IntersectionObserver(es=>obs.io=es[0].isIntersecting).observe(document.getElementById('off'));return 'scheduled'})()",
+      "eval t1 new Promise(r=>setTimeout(()=>r('done'),50)) --await",
+      "eval t1 JSON.stringify(obs)",
+      "eval t1 (()=>{globalThis.chunkRan=0;globalThis.chunkLoaded=false;var s=document.createElement('script');s.src='http://127.0.0.1:56588/chunk.js';s.onload=()=>globalThis.chunkLoaded=true;document.head.appendChild(s);return 'scheduled'})()",
+      "eval t1 new Promise(r=>setTimeout(r,50)).then(()=>JSON.stringify({ran:chunkRan,loaded:chunkLoaded})) --await",
+      "eval t1 (()=>{globalThis.chunkRan=0;globalThis.chunkLoaded=false;var s=document.createElement('script');s.src='http://127.0.0.1:56588/chunk.js';s.onload=()=>globalThis.chunkLoaded=true;document.head.insertBefore(s,document.head.firstChild);return 'scheduled'})()",
+      "eval t1 new Promise(r=>setTimeout(r,50)).then(()=>JSON.stringify({ran:chunkRan,loaded:chunkLoaded,helper:typeof __oxi_load_script,windowHelper:typeof window.__oxi_load_script})) --await",
+      "eval t1 fetch('http://127.0.0.1:56588/binary').then(r=>r.arrayBuffer()).then(b=>JSON.stringify({tag:Object.prototype.toString.call(b),bytes:Array.from(new Uint8Array(b))})) --await",
+      "eval t1 JSON.stringify({ran:chunkRan,loaded:chunkLoaded,helper:typeof __oxi_load_script,windowHelper:typeof window.__oxi_load_script})",
+      "goto t1 http://127.0.0.1:56588/module",
+      "eval t1 typeof globalThis.moduleOK",
+      "exit"
+    ],
+    "responses": [
+      {
+        "data": {
+          "tab_id": "t1"
+        },
+        "meta": {
+          "elapsed_ms": 54,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "status": 200,
+          "title": "",
+          "url": "http://127.0.0.1:56588/"
+        },
+        "meta": {
+          "elapsed_ms": 172,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"EventTarget\":\"function\",\"DOMException\":\"undefined\",\"MessageChannel\":\"undefined\",\"ReadableStream\":\"undefined\",\"WritableStream\":\"undefined\",\"TransformStream\":\"undefined\",\"Worker\":\"undefined\",\"FileReader\":\"undefined\",\"CSSStyleSheet\":\"undefined\",\"CanvasRenderingContext2D\":\"undefined\",\"getComputedStyle\":\"function\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"same\":false,\"self\":false,\"eventTargetOnWindow\":\"function\",\"gcsOnWindow\":\"undefined\",\"scrollX\":\"undefined\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"ctor\":\"function\",\"add\":\"undefined\",\"dispatch\":\"undefined\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"same\":false,\"node\":false,\"element\":false,\"html\":false}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"again\":null}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"null\":false,\"color\":\"#000000\",\"width\":\"auto\",\"bg\":\"\",\"font\":\"\",\"opacity\":\"\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"font\":\"16px\",\"kebab\":\"\",\"opacity\":\"\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "16px"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "[\"B\",\"I\"]"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"range\":\"undefined\",\"walker\":\"undefined\",\"iterator\":\"undefined\",\"selection\":\"undefined\",\"sheets\":\"undefined\",\"subtle\":\"undefined\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "scheduled"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": null
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"ro\":1,\"io\":true}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "scheduled"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": null
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "scheduled"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": null
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"tag\":\"[object Uint8Array]\",\"bytes\":[0,239,191,189,239,191,189,65]}"
+        },
+        "meta": {
+          "elapsed_ms": 51,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "{\"ran\":0,\"loaded\":false,\"helper\":\"undefined\",\"windowHelper\":\"undefined\"}"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "status": 200,
+          "title": "",
+          "url": "http://127.0.0.1:56588/module"
+        },
+        "meta": {
+          "elapsed_ms": 149,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "value": "undefined"
+        },
+        "meta": {
+          "elapsed_ms": 0,
+          "tab_id": "t1"
+        },
+        "ok": true
+      },
+      {
+        "data": {
+          "exit": true
+        },
+        "meta": {
+          "elapsed_ms": 0
+        },
+        "ok": true
+      }
+    ],
+    "stderr": "⚠ SSRF filter disabled: private/internal IP ranges accessible.\n2026-10-25T00:16:36.362227Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=syntax: unexpected token 'export', primary expression at line 1, col 1 src=None\n",
+    "exit_code": 0
+  },
+  "react_18_2": {
+    "fixture_html": "<!doctype html><html><head><script src=\"/react.js\"></script><script src=\"/react-dom.js\"></script></head><body><div id=\"root\"></div><script>globalThis.bootError=null;try{function Counter(){var a=React.useState(0);return React.createElement('button',{id:'counter',onClick:function(){a[1](a[0]+1);}},'count:'+a[0]);}(globalThis.reactRoot=ReactDOM.createRoot(document.getElementById('root'))).render(React.createElement(Counter));}catch(e){globalThis.bootError=String(e);}</script></body></html>",
+    "assets": {
+      "react": {
+        "url": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+        "member": "package/umd/react.development.js",
+        "sha256": "857364e2b982318417025fb9b4b8355c09f75fa46ba0be93f520f769f6757a78",
+        "bytes": 109910
+      },
+      "react-dom": {
+        "url": "https://registry.npmjs.org/react-dom/-/react-dom-18.2.0.tgz",
+        "member": "package/umd/react-dom.development.js",
+        "sha256": "6d11da926dde155c0d8773ae0e05bb64683f1f40d4e1eb628717dd8499172282",
+        "bytes": 1077022
+      }
+    },
+    "commands": [
+      "new",
+      "goto t1 http://127.0.0.1:56662/",
+      "eval t1 JSON.stringify({react:typeof React,reactDOM:typeof ReactDOM,bootError:globalThis.bootError,rootText:document.getElementById('root').textContent,buttonExists:!!document.getElementById('counter')})",
+      "wait t1 #counter --timeout 500",
+      "click t1 #counter",
+      "eval t1 JSON.stringify({rootText:document.getElementById('root').textContent,buttonExists:!!document.getElementById('counter')})",
+      "exit"
+    ],
+    "stdout": "{\"data\":{\"tab_id\":\"t1\"},\"meta\":{\"elapsed_ms\":53,\"tab_id\":\"t1\"},\"ok\":true}\n{\"data\":{\"status\":200,\"title\":\"\",\"url\":\"http://127.0.0.1:56662/\"},\"meta\":{\"elapsed_ms\":1625,\"tab_id\":\"t1\"},\"ok\":true}\n{\"data\":{\"value\":\"{\\\"react\\\":\\\"object\\\",\\\"reactDOM\\\":\\\"object\\\",\\\"bootError\\\":null,\\\"rootText\\\":\\\"\\\",\\\"buttonExists\\\":false}\"},\"meta\":{\"elapsed_ms\":0,\"tab_id\":\"t1\"},\"ok\":true}\n{\"error\":\"timeout: wait_for('#counter') timed out after 500ms\",\"error_code\":\"TIMEOUT\",\"meta\":{\"elapsed_ms\":0},\"ok\":false}\n{\"error\":\"DOM error: click: no element matching '#counter'\",\"error_code\":\"DOM_NOT_FOUND\",\"meta\":{\"elapsed_ms\":0},\"ok\":false}\n{\"data\":{\"value\":\"{\\\"rootText\\\":\\\"\\\",\\\"buttonExists\\\":false}\"},\"meta\":{\"elapsed_ms\":0,\"tab_id\":\"t1\"},\"ok\":true}\n{\"data\":{\"exit\":true},\"meta\":{\"elapsed_ms\":0},\"ok\":true}\n",
+    "stderr": "⚠ SSRF filter disabled: private/internal IP ranges accessible.\n",
+    "returncode": 0
+  },
+  "live_samples": [
+    {
+      "url": "https://www.daum.net",
+      "elapsed_s": 28.43,
+      "exit_code": 0,
+      "stdout": {
+        "data": {
+          "content_type": "text/html",
+          "status": 200,
+          "text": "",
+          "title": "Daum",
+          "url": "https://www.daum.net/"
+        },
+        "meta": {
+          "elapsed_ms": 28414
+        },
+        "ok": true
+      },
+      "js_error_count": 10,
+      "stderr_summary": [
+        "2026-10-25T00:16:03.150956Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=RuntimeLimitError: reached the maximum number of recursive calls on this execution stack=    at <main> (unknown at :113:68)",
+        "2026-10-25T00:16:03.268581Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=type: cannot convert 'null' or 'undefined' to object stack=    at <main> (https://ssl.pstatic.net/tveta/libs/glad/prod/gfp-core.js:1:37483)",
+        "2026-10-25T00:16:05.608328Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=type: not a callable function stack=    at <main> (https://t1.kakaocdn.net/play/kamp/sdk/2.0.27/external.min.js:2:931723)",
+        "2026-10-25T00:16:06.159000Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=RuntimeLimitError: reached the maximum number of recursive calls on this execution stack=    at <main> (unknown at :113:68)",
+        "2026-10-25T00:16:06.441182Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=type: cannot convert 'null' or 'undefined' to object stack=    at <main> (https://t1.kakaocdn.net/tiara/js/v1/tiara-1.2.0.min.js:7:1376)",
+        "2026-10-25T00:16:07.008556Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=reference: Document is not defined stack=    at <main> (https://t1.daumcdn.net/daumtop_deco/scripts/lib/lottie-player-2.0.2.js:20:124)",
+        "2026-10-25T00:16:07.033001Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=type: cannot convert 'null' or 'undefined' to object stack=    at <main> (https://t1.daumcdn.net/top/tiller-pc/lib/1667278587486/polyfill.min.js:1:1154)",
+        "2026-10-25T00:16:12.626698Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=RuntimeLimitError: reached the maximum number of recursive calls on this execution stack=    at <main> (unknown at :113:68)",
+        "2026-10-25T00:16:13.798572Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=reference: access of uninitialized binding stack=    at <main> (https://t1.daumcdn.net/harmony_static/axzad/build/adwidget-2.3.1/axz-ad-widget.js:1:75598)",
+        "2026-10-25T00:16:14.156959Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=RuntimeLimitError: reached the maximum number of recursive calls on this execution stack=    at tt (https://search1.daumcdn.net/search/statics/common/js/fe/amado-workspace/pc/4.0.0/main.js:1:56734)"
+      ]
+    },
+    {
+      "url": "https://www.spotify.com",
+      "elapsed_s": 16.81,
+      "exit_code": 0,
+      "stdout": {
+        "data": {
+          "content_type": "text/html; charset=utf-8",
+          "status": 200,
+          "text": "",
+          "title": "Spotify – Web Player",
+          "url": "https://open.spotify.com/"
+        },
+        "meta": {
+          "elapsed_ms": 16784
+        },
+        "ok": true
+      },
+      "js_error_count": 1,
+      "stderr_summary": [
+        "2026-10-25T00:16:02.527019Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=type: not a constructor stack=    at u (https://open.spotifycdn.com/cdn/build/web-player/web-player.f954508a.js:74:45106)"
+      ]
+    },
+    {
+      "url": "https://developer.mozilla.org/en-US/docs/Web/API",
+      "elapsed_s": 1.6,
+      "exit_code": 0,
+      "stdout": {
+        "data": {
+          "content_type": "text/html",
+          "returned_bytes": 300,
+          "status": 200,
+          "text": "- Skip to main content \n- Skip to search \nMDN \nHTML HTML: Markup language \nHTML reference - Elements \n- Global attributes \n- Attributes \n- See all… \nHTML guides - Responsive images \n- HTML cheatsheet \n- Date & time formats \n- See all… \nMarkup languages - SVG \n- MathML \n- XML \nCSS CSS",
+          "title": "",
+          "total_bytes": 28384,
+          "truncated": true,
+          "url": ""
+        },
+        "meta": {
+          "elapsed_ms": 1589
+        },
+        "ok": true
+      },
+      "js_error_count": 5,
+      "stderr_summary": [
+        "2026-10-25T00:16:04.115348Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=syntax: unexpected token 'export', primary expression at line 1, col 19579 src=Some(\"/static/client/runtime.231db49498ee594b.js\")",
+        "2026-10-25T00:16:04.115526Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=syntax: unexpected token 'export', primary expression at line 1, col 1 src=Some(\"/static/client/5909.489e266d049aa182.js\")",
+        "2026-10-25T00:16:04.115898Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=syntax: unexpected token 'export', primary expression at line 2, col 1 src=Some(\"/static/client/4585.e30f706b333273cd.js\")",
+        "2026-10-25T00:16:04.115923Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=syntax: unexpected token 'export', primary expression at line 1, col 1 src=Some(\"/static/client/1216.2fdb44f0bb574bc2.js\")",
+        "2026-10-25T00:16:04.116179Z  WARN oxibrowser_core::js::runtime: page script threw; continuing error=syntax: unexpected token 'export', primary expression at line 2, col 1 src=Some(\"/static/client/index.0059999758bb8565.js\")"
+      ]
+    }
+  ],
+  "live_command": [
+    "target/debug/oxibrowser",
+    "fetch",
+    "<url>",
+    "--json",
+    "--format",
+    "text",
+    "--max-bytes",
+    "300",
+    "--timeout",
+    "15",
+    "--no-audit"
+  ],
+  "live_process_deadline_seconds": 45,
+  "live_concurrency": 2
+}

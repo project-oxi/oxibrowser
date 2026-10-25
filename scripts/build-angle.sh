@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build ANGLE (Metal backend) from the pinned chromium/8118 checkout and
-# install the static libs into third_party/angle/<triple>, replacing the
-# godot-angle-static prebuilts (whose macOS Metal backend initializes but does
-# not rasterize draws — see docs/designs/2026-10-25-webgl-angle.md).
+# Build ANGLE (Metal + Vulkan backends) from the pinned chromium/8118 checkout
+# and install the static libs into third_party/angle/<triple>.
+# Source build enables the Vulkan backend for SwiftShader ICD verification;
+# godot-angle-static prebuilts remain a Metal-only fallback.
 #
 # Prereq: ANGLE checkout at $ANGLE_SRC (default ~/angle-build/angle) produced by
 #   git clone depot_tools; fetch --nohooks angle; gclient sync --force
@@ -11,6 +11,7 @@
 set -euo pipefail
 
 ANGLE_SRC="${ANGLE_SRC:-$HOME/angle-build/angle}"
+ANGLE_SRC="$(cd "$ANGLE_SRC" && pwd)"
 REV="chromium/8118"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/third_party/angle/$(uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')-apple-darwin"
@@ -38,9 +39,8 @@ treat_warnings_as_errors = false
 angle_enable_perfetto = false
 angle_build_all = false
 angle_build_tests = false
-angle_enable_vulkan = false
+angle_enable_vulkan = true
 angle_enable_gl = false
-angle_enable_d3d9 = false
 angle_enable_d3d11 = false
 angle_enable_null = false
 angle_enable_egl = true
@@ -50,19 +50,23 @@ angle_enable_wgpu = false
 EOF
 
 gn gen out/Release
-# Switching build tools (siso → ninja) requires a clean out dir.
-gn clean out/Release 2>/dev/null || true
+# A Siso-generated output must be cleaned once before Ninja uses it. Preserve
+# Ninja objects on repeat builds; GN/Ninja rebuilds targets when args change.
+if [ ! -f out/Release/.ninja_log ]; then
+  gn clean out/Release 2>/dev/null || true
+fi
 gn gen out/Release
 ninja -C out/Release libEGL.dylib libGLESv2.dylib obj/libEGL_static.a obj/libGLESv2_static.a
 
 mkdir -p "$OUT"
 # Build ONE fat archive with unique member names. Composition (verified by
-# crates/oxibrowser-core/src/js/webgl/session_tests.rs):
-#   * all non-third_party ANGLE objects, EXCLUDING the dylib-flavor
+# the WebGL smoke + conformance runners):
+#   * ANGLE EGL/GLES/Metal/Vulkan objects, excluding the dylib-flavor
 #     `obj/libEGL/*` + `obj/libEGL_egl_loader/*` (those carry
-#     ANGLE_USE_EGL_LOADER and dlopen libGLESv2 at runtime — the static
-#     `libEGL_static`/`libGLESv2_static` entry points are used instead),
-#   * excluding the wgpu backend (drags in dawn/tint),
+#     ANGLE_USE_EGL_LOADER and dlopen libGLESv2 at runtime — static entry points
+#     are used instead), plus the Vulkan Memory Allocator object and Vulkan
+#     loader archive members required by the Vulkan backend;
+#   * excluding the wgpu backend (drags in dawn/tint);
 #   * including abseil-cpp, zlib and astc-encoder (ANGLE links against them).
 # Member names are flattened to path-derived unique names: rustc repackages
 # native archives into rlibs by basename and same-named objects would collide.
@@ -71,12 +75,24 @@ mkdir -p "$STAGE"
 cd out/Release
 find obj -name "*.o" \
   \( -not -path "*third_party*" -o -path "*third_party/abseil-cpp*" \
-     -o -path "*third_party/zlib*" -o -path "*astc*" \) \
+     -o -path "*third_party/zlib*" -o -path "*astc*" \
+     -o -path "*third_party/vulkan_memory_allocator*" \) \
   -not -path "*wgpu*" -not -path "obj/libEGL/*" -not -path "obj/libEGL_egl_loader/*" |
 while read -r rel; do
   flat="obj_$(printf '%s' "$rel" | sed 's|^obj/||; s|/|__|g')"
   cp "$rel" "$STAGE/$flat"
 done
+
+# ANGLE's Vulkan loader is a thin static archive; copy its referenced objects
+# into the staging area before flattening the final archive.
+VULKAN_LOADER="obj/third_party/vulkan-loader/src/libvulkan.a"
+if [ -f "$VULKAN_LOADER" ]; then
+  LLVM_AR="$ANGLE_SRC/third_party/llvm-build/Release+Asserts/bin/llvm-ar"
+  "$LLVM_AR" t "$ANGLE_SRC/out/Release/$VULKAN_LOADER" |
+    while read -r member; do
+      cp "$member" "$STAGE/obj_vulkan_loader__$(basename "$member")"
+    done
+fi
 COUNT=$(ls "$STAGE" | wc -l | tr -d ' ')
 [ "$COUNT" -gt 300 ] || { echo "suspiciously few objects ($COUNT); ninja layout changed?" >&2; exit 1; }
 # shellcheck disable=SC2046

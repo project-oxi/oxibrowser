@@ -6,6 +6,8 @@
 > **Status**: Corpus 17/21 (80%), 0 crashes, 0 timeouts. Core 710/710.
 > **Branch**: `main` at `d8c9dbd` (all pushed)
 
+> **2026-10-25 revalidation**: See the [headless-browser feasibility research](research/2026-10-25-headless-browser-feasibility.md) before implementing this plan. Code inspection and local probes found additional DOM identity, Window, event-loop, module-loading, and binary-fetch failures. Several API/root-cause claims below need correction; 17/21 measures non-empty text output, not SPA interaction success.
+
 ---
 
 ## 1. What works today

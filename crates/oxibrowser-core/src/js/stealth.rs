@@ -819,12 +819,8 @@ fn build_connection(ctx: &mut Context) -> JsValue {
 
 // ── WebGLRenderingContext / WebGL2RenderingContext ───────────────────────
 
-/// A WebGL context constructor carrying the standard parameter constants on
-/// itself and `getParameter`/`getExtension`/`getSupportedExtensions` on its
-/// prototype. `typeof WebGLRenderingContext` is then `"function"` (a presence
-/// check naive detection performs); a real context object (from
-/// `canvas.getContext("webgl")`) is a separate integration point — the
-/// prototype methods here are coherent if canvas ever routes to this stub.
+/// A WebGL interface object carrying the standard constants on itself and its
+/// prototype. With the `webgl` feature, canvas contexts use this prototype too.
 fn build_webgl_constructor(ctx: &mut Context, p: &ChromeProfile, is_webgl2: bool) -> JsValue {
     let vendor = p.webgl_vendor.to_string();
     let renderer = p.webgl_renderer.to_string();
@@ -884,6 +880,25 @@ fn build_webgl_constructor(ctx: &mut Context, p: &ChromeProfile, is_webgl2: bool
     // Functions built via FunctionObjectBuilder always carry a prototype;
     // the fallback is defensive only.
     .unwrap_or_else(|| ObjectInitializer::new(ctx).build());
+    #[cfg(feature = "webgl")]
+    {
+        let kind = if is_webgl2 {
+            crate::js::webgl::CtxKind::WebGl2
+        } else {
+            crate::js::webgl::CtxKind::WebGl1
+        };
+        crate::js::webgl::api::add_context_constants(&ctor, kind, ctx);
+        crate::js::webgl::api::add_context_constants(&proto, kind, ctx);
+    }
+    // FunctionObjectBuilder creates a callable native function without an
+    // ordinary constructor prototype. Keep the browser-facing constructor
+    // usable in `instanceof` checks made by libraries such as Three.js.
+    let _ = ctor.set(
+        js_string!("prototype"),
+        JsValue::from(proto.clone()),
+        true,
+        ctx,
+    );
 
     let vendor_for_get = vendor.clone();
     let renderer_for_get = renderer.clone();

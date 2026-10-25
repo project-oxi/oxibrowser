@@ -302,6 +302,74 @@ fn write_bytes_into_view(v: &JsValue, bytes: &[u8], cx: &mut Context) -> Result<
     Ok(true)
 }
 
+fn is_texture_image_target(target: u32) -> bool {
+    target == glow::TEXTURE_2D || (0x8515..=0x851A).contains(&target)
+}
+
+fn color_format_has_alpha(format: u32) -> Option<bool> {
+    match format {
+        glow::RGB | glow::RGB8 | glow::RGB565 => Some(false),
+        glow::RGBA | glow::RGBA4 | glow::RGB5_A1 | glow::RGBA8 => Some(true),
+        _ => None,
+    }
+}
+
+fn bound_color_attachment_format(gl: &glow::Context, entry: &RegistryEntry) -> Option<u32> {
+    if entry.ctx.bound_framebuffer.is_none() {
+        return Some(if entry.ctx.attrs.alpha {
+            glow::RGBA
+        } else {
+            glow::RGB
+        });
+    }
+
+    let object_type = unsafe {
+        gl.get_framebuffer_attachment_parameter_i32(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE,
+        )
+    } as u32;
+    let object_name = unsafe {
+        gl.get_framebuffer_attachment_parameter_i32(
+            glow::FRAMEBUFFER,
+            glow::COLOR_ATTACHMENT0,
+            glow::FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+        )
+    } as u32;
+    let kind = match object_type {
+        glow::RENDERBUFFER => ResourceKind::Renderbuffer,
+        glow::TEXTURE => ResourceKind::Texture,
+        _ => return None,
+    };
+
+    entry
+        .ctx
+        .resources
+        .values()
+        .find(|resource| {
+            resource.kind == kind && resource.handle == object_name && !resource.deleted
+        })
+        .and_then(|resource| resource.internal_format)
+}
+
+fn copy_color_formats_match(
+    gl: &glow::Context,
+    entry: &RegistryEntry,
+    destination_format: u32,
+) -> bool {
+    let Some(source_format) = bound_color_attachment_format(gl, entry) else {
+        return true;
+    };
+    match (
+        color_format_has_alpha(source_format),
+        color_format_has_alpha(destination_format),
+    ) {
+        (Some(source_alpha), Some(destination_alpha)) => source_alpha == destination_alpha,
+        _ => true,
+    }
+}
+
 // ─── Unpack transforms (WebGL-only pixelStorei state) ───────────────────────
 
 /// Applies `UNPACK_FLIP_Y_WEBGL` / `UNPACK_PREMULTIPLY_ALPHA_WEBGL` on the
@@ -786,6 +854,27 @@ const CONSTANTS_WEBGL2: &[(&str, f64)] = &[
     ("WAIT_FAILED", 0x911C as f64),
     ("FRAGMENT_SHADER_DERIVATIVE_HINT", 0x8B8B as f64),
 ];
+/// Install the interface constants on a context object, constructor, or
+/// prototype. WebGL exposes these values on both instances and interface
+/// objects; keep every surface backed by the same spec tables.
+pub(crate) fn add_context_constants(target: &JsObject, kind: CtxKind, cx: &mut Context) {
+    for (name, value) in CONSTANTS {
+        let _ = target.set(JsString::from(*name), JsValue::from(*value), false, cx);
+    }
+    for unit in 0..32u32 {
+        let _ = target.set(
+            JsString::from(format!("TEXTURE{unit}")),
+            JsValue::from((0x84C0 + unit) as f64),
+            false,
+            cx,
+        );
+    }
+    if kind == CtxKind::WebGl2 {
+        for (name, value) in CONSTANTS_WEBGL2 {
+            let _ = target.set(JsString::from(*name), JsValue::from(*value), false, cx);
+        }
+    }
+}
 
 // ─── Registration macro ─────────────────────────────────────────────────────
 
@@ -1273,7 +1362,17 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
     });
     gl_method!(cx, obj, "pixelStorei", move |_h, e, gl, args, _c| {
         let pname = u32_at(args, 0)?;
-        let param = i32_at(args, 1)?;
+        // WebGL specifies boolean values for the two WebGL-only UNPACK flags;
+        // Three.js passes those booleans directly. Other pixelStorei states
+        // remain integer-valued.
+        let param = if matches!(pname, 0x9240 | 0x9241) {
+            match args.get_or_undefined(1).as_boolean() {
+                Some(value) => i32::from(value),
+                None => i32_at(args, 1)?,
+            }
+        } else {
+            i32_at(args, 1)?
+        };
         match pname {
             // WebGL-only knobs with no GLES enum: mirror on the frontend and
             // apply as a CPU transform in the texImage2D path.
@@ -1282,6 +1381,14 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             // Colorspace conversion is not applied on the CPU path; accept and
             // ignore (uploads behave as BROWSER_DEFAULT_WEBGL).
             0x9243 => {}
+            0x0D05 => {
+                if !matches!(param, 1 | 2 | 4 | 8) {
+                    e.ctx.push_error(types::INVALID_VALUE);
+                    return Ok(JsValue::undefined());
+                }
+                e.ctx.pack_alignment = param;
+                unsafe { gl.pixel_store_i32(pname, param) };
+            }
             _ => unsafe { gl.pixel_store_i32(pname, param) },
         }
         Ok(JsValue::undefined())
@@ -1349,6 +1456,16 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 upload,
             )
         };
+        let texture_id = if target == glow::TEXTURE_2D {
+            e.ctx.bound_texture_2d
+        } else {
+            e.ctx.bound_texture_cube_map
+        };
+        if let Some(texture_id) = texture_id
+            && let Some(resource) = e.ctx.resources.get_mut(&texture_id)
+        {
+            resource.internal_format = Some(internal_format as u32);
+        }
         Ok(JsValue::undefined())
     });
     gl_method!(cx, obj, "texSubImage2D", move |_h, e, gl, args, c| {
@@ -1410,7 +1527,7 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         };
         Ok(JsValue::undefined())
     });
-    gl_method!(cx, obj, "copyTexImage2D", move |_h, _e, gl, args, _c| {
+    gl_method!(cx, obj, "copyTexImage2D", move |_h, e, gl, args, _c| {
         let (target, level, internal_format) =
             (u32_at(args, 0)?, i32_at(args, 1)?, u32_at(args, 2)?);
         let (x, y, w, h2, border) = (
@@ -1420,10 +1537,20 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             i32_at(args, 6)?,
             i32_at(args, 7)?,
         );
+        let valid_parameters = is_texture_image_target(target)
+            && level >= 0
+            && w >= 0
+            && h2 >= 0
+            && border == 0
+            && matches!(internal_format, glow::RGB | glow::RGBA);
+        if valid_parameters && !copy_color_formats_match(gl, e, internal_format) {
+            e.ctx.push_error(types::INVALID_OPERATION);
+            return Ok(JsValue::undefined());
+        }
         unsafe { gl.copy_tex_image_2d(target, level, internal_format, x, y, w, h2, border) };
         Ok(JsValue::undefined())
     });
-    gl_method!(cx, obj, "copyTexSubImage2D", move |_h, _e, gl, args, _c| {
+    gl_method!(cx, obj, "copyTexSubImage2D", move |_h, e, gl, args, _c| {
         let (target, level) = (u32_at(args, 0)?, i32_at(args, 1)?);
         let (xoff, yoff, x, y, w, h2) = (
             i32_at(args, 2)?,
@@ -1433,6 +1560,29 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             i32_at(args, 6)?,
             i32_at(args, 7)?,
         );
+        let texture_id = if target == glow::TEXTURE_2D {
+            e.ctx.bound_texture_2d
+        } else {
+            e.ctx.bound_texture_cube_map
+        };
+        let destination_format = texture_id
+            .and_then(|id| e.ctx.resources.get(&id))
+            .and_then(|resource| resource.internal_format);
+        let valid_parameters = is_texture_image_target(target)
+            && level >= 0
+            && xoff >= 0
+            && yoff >= 0
+            && x >= 0
+            && y >= 0
+            && w >= 0
+            && h2 >= 0;
+        if valid_parameters
+            && let Some(format) = destination_format
+            && !copy_color_formats_match(gl, e, format)
+        {
+            e.ctx.push_error(types::INVALID_OPERATION);
+            return Ok(JsValue::undefined());
+        }
         unsafe { gl.copy_tex_sub_image_2d(target, level, xoff, yoff, x, y, w, h2) };
         Ok(JsValue::undefined())
     });
@@ -1538,7 +1688,7 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         cx,
         obj,
         "renderbufferStorage",
-        move |_h, _e, gl, args, _c| {
+        move |_h, e, gl, args, _c| {
             let (target, internal_format, w, h2) = (
                 u32_at(args, 0)?,
                 u32_at(args, 1)?,
@@ -1546,6 +1696,11 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 i32_at(args, 3)?,
             );
             unsafe { gl.renderbuffer_storage(target, internal_format, w, h2) };
+            if let Some(renderbuffer_id) = e.ctx.bound_renderbuffer
+                && let Some(resource) = e.ctx.resources.get_mut(&renderbuffer_id)
+            {
+                resource.internal_format = Some(internal_format);
+            }
             Ok(JsValue::undefined())
         }
     );
@@ -1798,6 +1953,17 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 i32_at(args, 4)?,
                 i32_at(args, 5)?,
             );
+            let supported_type = matches!(ty, 0x1400 | 0x1401 | 0x1402 | 0x1403 | 0x1406)
+                || (kind == CtxKind::WebGl2
+                    && matches!(ty, 0x1404 | 0x1405 | 0x140B | 0x8368 | 0x8C3B));
+            if !supported_type {
+                e.ctx.push_error(types::INVALID_ENUM);
+                return Ok(JsValue::undefined());
+            }
+            if !(1..=4).contains(&size) || !(0..=255).contains(&stride) || offset < 0 {
+                e.ctx.push_error(types::INVALID_VALUE);
+                return Ok(JsValue::undefined());
+            }
             match ty {
                 // BYTE, UNSIGNED_BYTE, SHORT, UNSIGNED_SHORT, FLOAT
                 0x1400 | 0x1401 | 0x1402 | 0x1403 | 0x1406 => unsafe {
@@ -1811,7 +1977,7 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 0x140B | 0x8368 | 0x8C3B if kind == CtxKind::WebGl2 => unsafe {
                     gl.vertex_attrib_pointer_f32(index, size, ty, normalized, stride, offset)
                 },
-                _ => e.ctx.push_error(types::INVALID_ENUM),
+                _ => unreachable!("unsupported vertex attribute type was rejected above"),
             }
             Ok(JsValue::undefined())
         }
@@ -2089,18 +2255,34 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             e.ctx.push_error(types::INVALID_VALUE);
             return Ok(JsValue::undefined());
         }
-        let required = (w as usize) * (h2 as usize) * 4;
-        // Size-check the destination BEFORE touching GL: an undersized
-        // destination is INVALID_OPERATION and must not allocate.
+        let row_bytes = (w as usize) * 4;
+        let alignment = e.ctx.pack_alignment as usize;
+        let Some(row_stride) = row_bytes
+            .checked_add(alignment - 1)
+            .map(|aligned| aligned / alignment * alignment)
+        else {
+            e.ctx.push_error(types::INVALID_OPERATION);
+            return Ok(JsValue::undefined());
+        };
+        let Some(required) = (if h2 == 0 {
+            Some(0)
+        } else {
+            row_stride
+                .checked_mul((h2 as usize) - 1)
+                .and_then(|preceding_rows| preceding_rows.checked_add(row_bytes))
+        }) else {
+            e.ctx.push_error(types::INVALID_OPERATION);
+            return Ok(JsValue::undefined());
+        };
+        // Check the typed-array view before allocation. `write_bytes_into_view`
+        // applies its byte offset to the backing buffer after GL readback.
         let Some(obj) = args.get_or_undefined(6).as_object() else {
             return Err(type_err(
                 "readPixels requires a destination ArrayBufferView",
             ));
         };
         let ta = JsTypedArray::from_object(obj)?;
-        let offset = ta.byte_offset(c)?;
-        let len = ta.byte_length(c)?;
-        if offset + required > len {
+        if required > ta.byte_length(c)? {
             e.ctx.push_error(types::INVALID_OPERATION);
             return Ok(JsValue::undefined());
         }
@@ -2656,7 +2838,21 @@ pub fn build_context_object(
     canvas: JsValue,
     _webgl_identity: (String, String),
 ) -> JsObject {
+    let constructor_name = match kind {
+        CtxKind::WebGl1 => "WebGLRenderingContext",
+        CtxKind::WebGl2 => "WebGL2RenderingContext",
+    };
+    let prototype = cx
+        .global_object()
+        .get(JsString::from(constructor_name), cx)
+        .ok()
+        .and_then(|value| value.as_object())
+        .and_then(|constructor| constructor.get(js_string!("prototype"), cx).ok())
+        .and_then(|value| value.as_object());
     let obj = JsObject::with_object_proto(cx.intrinsics());
+    if let Some(prototype) = prototype {
+        let _ = obj.set_prototype(Some(prototype));
+    }
     let _ = obj.set(js_string!("canvas"), canvas, false, cx);
     // Hidden dispatch key (read by every method closure).
     let _ = obj.set(
@@ -2700,22 +2896,6 @@ pub fn build_context_object(
 
     register_methods(cx, &obj, kind);
 
-    for (name, value) in CONSTANTS {
-        let _ = obj.set(JsString::from(*name), JsValue::from(*value), false, cx);
-    }
-    // TEXTURE0..TEXTURE31.
-    for unit in 0..32u32 {
-        let _ = obj.set(
-            JsString::from(format!("TEXTURE{unit}")),
-            JsValue::from((0x84C0 + unit) as f64),
-            false,
-            cx,
-        );
-    }
-    if kind == CtxKind::WebGl2 {
-        for (name, value) in CONSTANTS_WEBGL2 {
-            let _ = obj.set(JsString::from(*name), JsValue::from(*value), false, cx);
-        }
-    }
+    add_context_constants(&obj, kind, cx);
     obj
 }

@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **WebGL verification** — Three.js/GLTFLoader fixture, ANGLE + SwiftShader Vulkan smoke/benchmark, and an opt-in runner for a pinned Khronos WebGL conformance subset.
+
+### Changed
+- ANGLE source build includes the Vulkan backend; SwiftShader setup pins its revision.
+
+### Fixed
+- WebGL validates `PACK_ALIGNMENT`, framebuffer/texture copy compatibility and negative `vertexAttribPointer` offsets.
+- WebGL script loading resolves relative `src` URLs; Boa Annex B provides `String.prototype.substr`, and the render DOM supports live `classList`, `innerHTML`, `textContent` and script `.text`.
+- Synchronous XHR settles before `send()` returns. `overrideMimeType` rejects non-UTF-8 charsets because the fetch bridge supplies decoded UTF-8 text.
+
+
 ## [0.26.0] - 2026-10-18
 
 The agent plane — the browser becomes the agent's workstation

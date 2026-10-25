@@ -21,11 +21,11 @@ async fn navigate_executes_external_script() {
     let html = concat!(
         "<!DOCTYPE html><html><head></head><body>",
         r#"<div id="app">placeholder</div>"#,
-        r#"<script src="/app.js"></script>"#,
+        r#"<script src="app.js"></script>"#,
         "</body></html>"
     );
     Mock::given(method("GET"))
-        .and(path("/"))
+        .and(path("/pages/index.html"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(html)
@@ -36,7 +36,7 @@ async fn navigate_executes_external_script() {
 
     let js = "document.getElementById('app').textContent = 'from-external';";
     Mock::given(method("GET"))
-        .and(path("/app.js"))
+        .and(path("/pages/app.js"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(js)
@@ -46,7 +46,7 @@ async fn navigate_executes_external_script() {
         .await;
 
     let tab = make_tab().await;
-    let url = format!("{}/", server.uri());
+    let url = format!("{}/pages/index.html", server.uri());
     tab.goto(&url).await.expect("navigate");
 
     let val = tab
@@ -58,6 +58,20 @@ async fn navigate_executes_external_script() {
         serde_json::json!("from-external"),
         "external <script src> fetched and executed during navigation"
     );
+    let script_src = tab
+        .evaluate("document.querySelector('script').src")
+        .await
+        .expect("evaluate script URL");
+    assert_eq!(
+        script_src,
+        serde_json::json!(format!("{}/pages/app.js", server.uri())),
+        "script.src resolves relative to the document URL"
+    );
+    let raw_src = tab
+        .evaluate("document.querySelector('script').getAttribute('src')")
+        .await
+        .expect("evaluate raw script URL");
+    assert_eq!(raw_src, serde_json::json!("app.js"));
 }
 
 #[tokio::test]

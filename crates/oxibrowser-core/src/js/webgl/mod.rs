@@ -70,6 +70,8 @@ pub struct FrontContext {
     /// in the texImage2D path.
     pub unpack_flip_y: bool,
     pub unpack_premultiply: bool,
+    /// `PACK_ALIGNMENT` used to size readPixels client buffers and preserve row padding.
+    pub pack_alignment: i32,
     /// Minimal binding mirror so `getParameter` can answer *_BINDING /
     /// CURRENT_PROGRAM queries without GL round trips. Values are frontend
     /// resource ids (`FrontContext.resources` keys), not GL names.
@@ -93,6 +95,7 @@ impl FrontContext {
             next_res: 1,
             errors: std::collections::VecDeque::new(),
             unpack_flip_y: false,
+            pack_alignment: 4,
             unpack_premultiply: false,
             bound_array_buffer: None,
             bound_element_array_buffer: None,
@@ -113,6 +116,7 @@ impl FrontContext {
             Resource {
                 kind,
                 handle,
+                internal_format: None,
                 deleted: false,
             },
         );

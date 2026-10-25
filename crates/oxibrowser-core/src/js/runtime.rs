@@ -3769,6 +3769,30 @@ fn drain_pending_fetch_responses(ctx: &mut Context) {
     // rejection reaction un-drained until the next evaluate.
     let _ = ctx.run_jobs();
 }
+
+/// Block an explicitly synchronous XHR until its response arrives, then settle
+/// it through the normal response pump so response fields and callbacks agree
+/// with asynchronous requests.
+fn wait_for_sync_xhr(id: u64, ctx: &mut Context) -> bool {
+    if DEFERRED_RESPONSES.with(|responses| responses.borrow().iter().any(|resp| resp.id == id)) {
+        drain_pending_fetch_responses(ctx);
+        return true;
+    }
+
+    loop {
+        let received =
+            RESPONSE_RX.with(|cell| cell.borrow_mut().as_mut().map(|receiver| receiver.recv()));
+        let Some(Ok(response)) = received else {
+            return false;
+        };
+        let matched = response.id == id;
+        DEFERRED_RESPONSES.with(|responses| responses.borrow_mut().push(response));
+        if matched {
+            drain_pending_fetch_responses(ctx);
+            return true;
+        }
+    }
+}
 /// Drain all available WebSocket events and fire the matching JS callbacks.
 /// Collects into a Vec first to release the `WS_EVENT_RX` borrow before
 /// re-entering boa (settling may issue more JS / WS / fetch).
@@ -4281,6 +4305,33 @@ fn create_context(
     let out_warn = output.clone();
     let out_error = output.clone();
     let out_info = output.clone();
+    let out_assert = output.clone();
+    let assert_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            if args.first().is_some_and(|condition| condition.to_boolean()) {
+                return Ok(JsValue::undefined());
+            }
+
+            let prefix = "Assertion failed:";
+            let mut strings = vec![prefix.to_string()];
+            let mut typed = vec![ConsoleArg::String(prefix.to_string())];
+            for arg in args.iter().skip(1) {
+                let value = arg
+                    .to_string(ctx)
+                    .map(|value| value.to_std_string_escaped())
+                    .unwrap_or_else(|_| "undefined".to_string());
+                typed.push(classify_console_arg(arg, &value, ctx));
+                strings.push(value);
+            }
+            out_assert.write().push(strings.join(" "));
+            push_event(CoreEvent::Console {
+                level: ConsoleLevel::Error,
+                args: typed,
+                timestamp: now_ms(),
+            });
+            Ok(JsValue::undefined())
+        })
+    };
 
     let log_fn = console_fn!(out_log, ConsoleLevel::Log);
 
@@ -4300,6 +4351,7 @@ fn create_context(
             js_string!("error"),
             1,
         )
+        .function(assert_fn, js_string!("assert"), 2)
         .function(
             console_fn!(out_info, ConsoleLevel::Info),
             js_string!("info"),
@@ -4670,7 +4722,7 @@ fn create_context(
                     }
                     let method = send_method.read().clone();
                     let url = send_url.read().clone();
-                    let _is_async = *send_async.read();
+                    let is_async = *send_async.read();
 
                     *send_rs.write() = 2.0; // HEADERS_RECEIVED
 
@@ -4719,12 +4771,63 @@ fn create_context(
                                     },
                                 );
                             });
+                            if !is_async && !wait_for_sync_xhr(id, ctx) {
+                                PENDING_FETCH.with(|pending| {
+                                    pending.borrow_mut().remove(&id);
+                                });
+                                *send_rs.write() = 4.0;
+                                *send_status.write() = 0.0;
+                                fire_callback(&send_onerror, ctx);
+                                fire_callback(&send_onrsc, ctx);
+                            }
                         } else {
                             *send_rs.write() = 4.0;
                             *send_status.write() = 0.0;
                         }
                     }
 
+                    Ok(JsValue::undefined())
+                })
+            };
+
+            // FetchResponse carries decoded UTF-8 text. MIME overrides that
+            // request another charset cannot be honored without raw bytes.
+            // Accept valid UTF-8-compatible overrides and reject unsupported
+            // decodings instead of silently returning mislabeled text.
+            let override_mime_fn = {
+                NativeFunction::from_closure(move |_this, args, ctx| {
+                    let value = args
+                        .first()
+                        .ok_or_else(|| {
+                            JsNativeError::typ()
+                                .with_message("overrideMimeType requires a MIME type")
+                        })?
+                        .to_string(ctx)?
+                        .to_std_string_escaped();
+                    let mut parts = value.split(';');
+                    let media_type = parts.next().unwrap_or_default().trim();
+                    if !media_type.contains('/') {
+                        return Err(JsNativeError::typ()
+                            .with_message("overrideMimeType expects a MIME type")
+                            .into());
+                    }
+                    for parameter in parts {
+                        if let Some((name, value)) = parameter.trim().split_once('=')
+                            && name.trim().eq_ignore_ascii_case("charset")
+                            && !matches!(
+                                value
+                                    .trim()
+                                    .trim_matches(['"', '\''])
+                                    .to_ascii_lowercase()
+                                    .as_str(),
+                                "utf-8" | "utf8"
+                            )
+                        {
+                            return Err(JsNativeError::typ()
+                                .with_message("only UTF-8 XHR response decoding is supported")
+                                .into());
+                        }
+                    }
                     Ok(JsValue::undefined())
                 })
             };
@@ -4866,6 +4969,7 @@ fn create_context(
                 )
                 .function(open_fn, js_string!("open"), 3)
                 .function(send_fn, js_string!("send"), 1)
+                .function(override_mime_fn, js_string!("overrideMimeType"), 1)
                 .function(set_req_header_fn, js_string!("setRequestHeader"), 2)
                 .function(get_header_fn, js_string!("getResponseHeader"), 1)
                 .function(abort_fn, js_string!("abort"), 0)
@@ -5896,24 +6000,12 @@ fn create_context(
         NativeFunction::from_closure(move |_this, args, ctx| {
             let decode_fn = {
                 NativeFunction::from_closure(move |_this2, args2, ctx2| {
-                    // Decode buffer/array back to string
                     let input = args2.first().cloned().unwrap_or(JsValue::undefined());
-                    if let Some(arr_obj) = input.as_object()
-                        && let Ok(arr) = JsArray::from_object(arr_obj.clone())
-                        && let Ok(len) = arr.length(ctx2)
-                    {
-                        let mut bytes = Vec::with_capacity(len as usize);
-                        for i in 0..len {
-                            if let Ok(v) = arr.at(i as i64, ctx2)
-                                && let Some(n) = v.as_number()
-                            {
-                                bytes.push(n as u8);
-                            }
-                        }
-                        let s = String::from_utf8_lossy(&bytes).to_string();
-                        return Ok(JsValue::from(JsString::from(s.as_str())));
-                    }
-                    Ok(JsValue::from(JsString::from("")))
+                    // Typed-array views expose indexed byte values, so this
+                    // preserves both their byteOffset and byteLength.
+                    let bytes = extract_binary_bytes(&input, ctx2).unwrap_or_default();
+                    let s = String::from_utf8_lossy(&bytes).to_string();
+                    Ok(JsValue::from(JsString::from(s.as_str())))
                 })
             };
             let encoding = args
@@ -7319,6 +7411,37 @@ fn create_render_element_object(
     let text_setter_fn = FunctionObjectBuilder::new(ctx.realm(), text_set_fn)
         .name(js_string!("set textContent"))
         .build();
+    let rd_ih_set = render_doc.clone();
+    let dirty_ih = dom_dirty.clone();
+    let inner_html_set_fn = unsafe {
+        NativeFunction::from_closure(move |_this, args, ctx| {
+            let html = args
+                .first()
+                .and_then(|value| value.to_string(ctx).ok())
+                .map(|value| value.to_std_string_escaped())
+                .unwrap_or_default();
+            let snapshot = crate::js::dom_snapshot::parse_html_fragment_to_snapshot(&html);
+            let body_id = snapshot.body_id.unwrap_or(snapshot.root_id);
+            let top = snapshot
+                .nodes
+                .get(&body_id)
+                .map(|node| node.children.clone())
+                .unwrap_or_default();
+            if let Some(doc) = rd_ih_set.borrow_mut().as_mut() {
+                for child in doc.children_ids(node_id) {
+                    doc.remove_node(child);
+                }
+                for child in top {
+                    recreate_subtree_from_snapshot(doc, &snapshot, child, Some(node_id));
+                }
+                dirty_ih.store(true, Ordering::Relaxed);
+            }
+            Ok(JsValue::undefined())
+        })
+    };
+    let inner_html_setter_fn = FunctionObjectBuilder::new(ctx.realm(), inner_html_set_fn)
+        .name(js_string!("set innerHTML"))
+        .build();
 
     // ── id / className (backed by attributes) ──
     let rd_id_get = render_doc.clone();
@@ -7387,6 +7510,150 @@ fn create_render_element_object(
     };
     let cls_setter_fn = FunctionObjectBuilder::new(ctx.realm(), cls_set_fn)
         .name(js_string!("set className"))
+        .build();
+    let rd_class_list = render_doc.clone();
+    let dirty_class_list = dom_dirty.clone();
+    let class_list_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            let current = rd_class_list
+                .borrow()
+                .as_ref()
+                .and_then(|doc| doc.node_attr(node_id, "class"))
+                .unwrap_or_default();
+            let count = current.split_whitespace().count() as i32;
+
+            let rd_add = rd_class_list.clone();
+            let dirty_add = dirty_class_list.clone();
+            let add_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let tokens: Vec<String> = args
+                    .iter()
+                    .filter_map(|arg| arg.to_string(ctx).ok())
+                    .map(|token| token.to_std_string_escaped())
+                    .filter(|token| !token.is_empty())
+                    .collect();
+                if let Some(doc) = rd_add.borrow_mut().as_mut() {
+                    let mut classes: Vec<String> = doc
+                        .node_attr(node_id, "class")
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect();
+                    let old_len = classes.len();
+                    for token in tokens {
+                        if !classes.iter().any(|class| class == &token) {
+                            classes.push(token);
+                        }
+                    }
+                    if classes.len() != old_len {
+                        doc.set_attribute(node_id, "class", &classes.join(" "));
+                        dirty_add.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(JsValue::undefined())
+            });
+
+            let rd_remove = rd_class_list.clone();
+            let dirty_remove = dirty_class_list.clone();
+            let remove_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let tokens: Vec<String> = args
+                    .iter()
+                    .filter_map(|arg| arg.to_string(ctx).ok())
+                    .map(|token| token.to_std_string_escaped())
+                    .collect();
+                if let Some(doc) = rd_remove.borrow_mut().as_mut() {
+                    let current = doc.node_attr(node_id, "class").unwrap_or_default();
+                    let classes: Vec<&str> = current
+                        .split_whitespace()
+                        .filter(|class| !tokens.iter().any(|token| token == class))
+                        .collect();
+                    let updated = classes.join(" ");
+                    if updated != current {
+                        doc.set_attribute(node_id, "class", &updated);
+                        dirty_remove.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(JsValue::undefined())
+            });
+
+            let rd_contains = rd_class_list.clone();
+            let contains_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let token = args
+                    .first()
+                    .and_then(|arg| arg.to_string(ctx).ok())
+                    .map(|token| token.to_std_string_escaped())
+                    .unwrap_or_default();
+                let found = rd_contains
+                    .borrow()
+                    .as_ref()
+                    .and_then(|doc| doc.node_attr(node_id, "class"))
+                    .is_some_and(|current| current.split_whitespace().any(|class| class == token));
+                Ok(JsValue::from(found))
+            });
+
+            let rd_toggle = rd_class_list.clone();
+            let dirty_toggle = dirty_class_list.clone();
+            let toggle_fn = NativeFunction::from_closure(move |_this, args, ctx| {
+                let token = args
+                    .first()
+                    .and_then(|arg| arg.to_string(ctx).ok())
+                    .map(|token| token.to_std_string_escaped())
+                    .unwrap_or_default();
+                let mut doc = rd_toggle.borrow_mut();
+                let Some(doc) = doc.as_mut() else {
+                    return Ok(JsValue::from(false));
+                };
+                let current = doc.node_attr(node_id, "class").unwrap_or_default();
+                let found = current.split_whitespace().any(|class| class == token);
+                let add = args
+                    .get(1)
+                    .map(|force| force.to_boolean())
+                    .unwrap_or(!found);
+                if add != found && !token.is_empty() {
+                    let updated = if add {
+                        if current.is_empty() {
+                            token
+                        } else {
+                            format!("{current} {token}")
+                        }
+                    } else {
+                        current
+                            .split_whitespace()
+                            .filter(|class| *class != token)
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    doc.set_attribute(node_id, "class", &updated);
+                    dirty_toggle.store(true, Ordering::Relaxed);
+                }
+                Ok(JsValue::from(add))
+            });
+
+            let class_list = boa_engine::object::ObjectInitializer::new(ctx)
+                .property(js_string!("length"), JsValue::from(count), Attribute::all())
+                .function(add_fn, js_string!("add"), 1)
+                .function(remove_fn, js_string!("remove"), 1)
+                .function(contains_fn, js_string!("contains"), 1)
+                .function(toggle_fn, js_string!("toggle"), 2)
+                .build();
+            Ok(JsValue::from(class_list))
+        })
+    };
+    let class_list_getter_fn = FunctionObjectBuilder::new(ctx.realm(), class_list_fn)
+        .name(js_string!("get classList"))
+        .build();
+    let rd_type = render_doc.clone();
+    let type_get_fn = unsafe {
+        NativeFunction::from_closure(move |_this, _args, _ctx| {
+            let value = rd_type
+                .borrow()
+                .as_ref()
+                .and_then(|doc| doc.node_attr(node_id, "type"))
+                .unwrap_or_default();
+            Ok(JsValue::from(JsString::from(value.as_str())))
+        })
+    };
+    let type_getter_fn = FunctionObjectBuilder::new(ctx.realm(), type_get_fn)
+        .name(js_string!("get type"))
         .build();
 
     let dirty_click = dom_dirty.clone();
@@ -7536,15 +7803,30 @@ fn create_render_element_object(
     let make_noop = || unsafe {
         NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::undefined()))
     };
-    // value / checked / href / src (attribute-backed)
+    // Attribute-backed DOM properties. Script URLs resolve against the page
+    // URL; the raw attribute remains available through getAttribute("src").
     let attr_getter = |rd: Rc<RefCell<Option<RenderDocument>>>, name: &'static str| unsafe {
-        NativeFunction::from_closure(move |_this, _args, _ctx| {
-            let v = rd
+        NativeFunction::from_closure(move |_this, _args, ctx| {
+            let mut value = rd
                 .borrow()
                 .as_ref()
                 .and_then(|d| d.node_attr(node_id, name))
                 .unwrap_or_default();
-            Ok(JsValue::from(JsString::from(v.as_str())))
+            if name == "src" && !value.is_empty() {
+                let base = ctx
+                    .global_object()
+                    .get(js_string!("__oxiPageUrl"), ctx)
+                    .ok()
+                    .and_then(|value| value.as_string().map(|s| s.to_std_string_escaped()));
+                if let Some(resolved) = base
+                    .as_deref()
+                    .and_then(|base| url::Url::parse(base).ok())
+                    .and_then(|base| base.join(&value).ok())
+                {
+                    value = resolved.to_string();
+                }
+            }
+            Ok(JsValue::from(JsString::from(value.as_str())))
         })
     };
     let val_get_fn = attr_getter(render_doc.clone(), "value");
@@ -7978,8 +8260,20 @@ fn create_render_element_object(
         )
         .accessor(
             js_string!("textContent"),
+            Some(text_getter_fn.clone()),
+            Some(text_setter_fn.clone()),
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("text"),
             Some(text_getter_fn),
             Some(text_setter_fn),
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("innerHTML"),
+            None,
+            Some(inner_html_setter_fn),
             Attribute::CONFIGURABLE,
         )
         .accessor(
@@ -7992,6 +8286,18 @@ fn create_render_element_object(
             js_string!("className"),
             Some(cls_getter_fn),
             Some(cls_setter_fn),
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("classList"),
+            Some(class_list_getter_fn),
+            None,
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("type"),
+            Some(type_getter_fn),
+            None,
             Attribute::CONFIGURABLE,
         )
         .accessor(
@@ -9352,34 +9658,51 @@ fn create_element_object(
             let _ = evt_obj.set(js_string!("currentTarget"), _this.clone(), true, ctx);
 
             let this_obj = _this.as_object().unwrap();
-            let listeners = this_obj.get(js_string!("__listeners"), ctx);
-            if let Ok(l_val) = listeners
-                && let Some(l_obj) = l_val.as_object()
-            {
-                let arr_val = l_obj
-                    .get(JsString::from(event_type.as_str()), ctx)
-                    .unwrap_or(JsValue::null());
-                if let Some(arr_obj) = arr_val.as_object()
-                    && let Ok(arr) = JsArray::from_object(arr_obj.clone())
-                    && let Ok(len) = arr.length(ctx)
+            let target_node_id = this_obj
+                .get(js_string!("__nodeId"), ctx)
+                .ok()
+                .and_then(|v| v.as_number().map(|n| n as u32));
+            let target_callbacks = target_node_id
+                .map(|id| registry_get(id, &event_type))
+                .unwrap_or_default();
+            if !target_callbacks.is_empty() {
+                // DOM queries such as elementFromPoint create a fresh JS
+                // wrapper for an existing node. Dispatch through the
+                // node-id registry so listeners attached to the original
+                // wrapper still receive events.
+                for cb in target_callbacks {
+                    let _ = cb.call(_this, std::slice::from_ref(&event), ctx);
+                }
+            } else {
+                let listeners = this_obj.get(js_string!("__listeners"), ctx);
+                if let Ok(l_val) = listeners
+                    && let Some(l_obj) = l_val.as_object()
                 {
-                    for i in 0..len {
-                        // Check stopImmediatePropagation before each callback
-                        if evt_obj
-                            .get(js_string!("__stopImmediatePropagation"), ctx)
-                            .ok()
-                            .and_then(|v| v.as_boolean())
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
+                    let arr_val = l_obj
+                        .get(JsString::from(event_type.as_str()), ctx)
+                        .unwrap_or(JsValue::null());
+                    if let Some(arr_obj) = arr_val.as_object()
+                        && let Ok(arr) = JsArray::from_object(arr_obj.clone())
+                        && let Ok(len) = arr.length(ctx)
+                    {
+                        for i in 0..len {
+                            // Check stopImmediatePropagation before each callback
+                            if evt_obj
+                                .get(js_string!("__stopImmediatePropagation"), ctx)
+                                .ok()
+                                .and_then(|v| v.as_boolean())
+                                .unwrap_or(false)
+                            {
+                                break;
+                            }
 
-                        if let Ok(cb) = arr.at(i as i64, ctx)
-                            && let Some(cb_obj) = cb.as_object()
-                            && cb_obj.is_callable()
-                        {
-                            let evt_arg = event.clone();
-                            let _ = cb_obj.call(_this, &[evt_arg], ctx);
+                            if let Ok(cb) = arr.at(i as i64, ctx)
+                                && let Some(cb_obj) = cb.as_object()
+                                && cb_obj.is_callable()
+                            {
+                                let evt_arg = event.clone();
+                                let _ = cb_obj.call(_this, &[evt_arg], ctx);
+                            }
                         }
                     }
                 }
@@ -12138,11 +12461,48 @@ fn register_window_globals(
         .function(document_element_getter, js_string!("getDocumentElement"), 0)
         .function(get_computed_style_fn, js_string!("getComputedStyle"), 1)
         .property(
+            js_string!("WebGLRenderingContext"),
+            stealth.webgl1.clone(),
+            Attribute::all(),
+        )
+        .property(
+            js_string!("WebGL2RenderingContext"),
+            stealth.webgl2.clone(),
+            Attribute::all(),
+        )
+        .property(
             js_string!("chrome"),
             stealth.chrome.clone(),
             Attribute::all(),
         )
         .build();
+    // A top-level browsing context's parent and top are itself. Keep these
+    // aliases non-enumerable so serializing window does not recurse into it.
+    let window_ref = JsValue::from(window_final.clone());
+    let _ = window_final.define_property_or_throw(
+        js_string!("self"),
+        boa_engine::property::PropertyDescriptor::builder()
+            .value(window_ref.clone())
+            .writable(false)
+            .enumerable(false)
+            .configurable(true)
+            .build(),
+        ctx,
+    );
+    if active_context_id() == 1 {
+        for name in ["parent", "top"] {
+            let _ = window_final.define_property_or_throw(
+                JsString::from(name),
+                boa_engine::property::PropertyDescriptor::builder()
+                    .value(window_ref.clone())
+                    .writable(false)
+                    .enumerable(false)
+                    .configurable(true)
+                    .build(),
+                ctx,
+            );
+        }
+    }
 
     let _ = ctx.register_global_property(
         js_string!("window"),
@@ -13578,6 +13938,15 @@ fn register_window_globals(
   try {
     var wloc = globalThis.window && globalThis.window.location;
     if (wloc) globalThis.window = Object.assign({}, globalThis.window, { location: makeLocationProxy(wloc) });
+  } catch (e) {}
+  try {
+    if (globalThis.window) {
+      Object.defineProperties(globalThis.window, {
+        self: { value: globalThis.window, configurable: true },
+        parent: { value: globalThis.window, configurable: true },
+        top: { value: globalThis.window, configurable: true }
+      });
+    }
   } catch (e) {}
   if (globalThis.window && globalThis.window.location) augment(globalThis.window.location);
   // Register a dedicated hashchange listener slot (regular
@@ -17004,6 +17373,37 @@ mod tests {
         assert_eq!(sent.value, Some(Value::from(1)));
         let xhr = rt.evaluate("window.__xhr").await.unwrap();
         assert_eq!(xhr.value, Some(Value::from(1)));
+    }
+
+    #[tokio::test]
+    async fn test_sync_xhr_settles_response_before_send_returns() {
+        let mut rt = JsRuntime::new();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<FetchRequestMsg>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<FetchResponseMsg>();
+        rt.set_fetch_channel(req_tx, resp_rx);
+        let _handler = spawn_test_fetch_handler(req_rx, resp_tx, 20, "sync body".to_string());
+
+        let result = rt
+            .evaluate(
+                "var x = new XMLHttpRequest();\
+                 x.open('GET', 'http://x/', false);\
+                 x.overrideMimeType('text/plain');\
+                 x.onload = function () { window.__xhr = 'load'; };\
+                 x.onerror = function () { window.__xhr = 'error'; };\
+                 x.send();\
+                 JSON.stringify({state: x.readyState, status: x.status, body: x.responseText, event: window.__xhr})",
+            )
+            .await
+            .unwrap();
+        let json = result
+            .value
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap();
+        let actual: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(actual["state"], 4);
+        assert_eq!(actual["status"], 200);
+        assert_eq!(actual["body"], "sync body");
+        assert_eq!(actual["event"], "load");
     }
 
     #[tokio::test]

@@ -81,6 +81,8 @@ impl ResourceKind {
 pub struct Resource {
     pub kind: ResourceKind,
     pub handle: u32,
+    /// Storage format for textures/renderbuffers used as framebuffer attachments.
+    pub internal_format: Option<u32>,
     pub deleted: bool,
 }
 
@@ -269,6 +271,7 @@ mod tests {
         let res = Resource {
             kind: ResourceKind::Buffer,
             handle: 7,
+            internal_format: None,
             deleted: false,
         };
         assert_eq!(

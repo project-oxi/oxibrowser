@@ -1,0 +1,7 @@
+revision=3a65272e40f97c82de335825ea77c4da8e77a637
+conformance/context/context-type-test.html
+conformance/programs/program-handling.html
+conformance/buffers/index-validation.html
+conformance/textures/misc/tex-input-validation.html
+conformance/reading/read-pixels-pack-alignment.html
+conformance/state/gl-initial-state.html
