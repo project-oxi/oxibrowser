@@ -32,6 +32,9 @@ browser = [
     "dep:uuid",
     "dep:libc",
 ]
+# WebGL via ANGLE (canvas.getContext('webgl')). Requires the ANGLE static
+# libraries: scripts/setup-angle.sh (prebuilt) or scripts/build-angle.sh.
+webgl = ["browser", "oxibrowser-core/webgl"]
 
 [[bin]]
 name = "oxibrowser"
