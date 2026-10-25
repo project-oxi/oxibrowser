@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-10-25
+
+WebGL via ANGLE behind the opt-in `webgl` feature — the canvas gets a real GPU
+path ([design](docs/designs/2026-10-25-webgl-angle.md)). Verified end to end:
+a Three.js/GLTFLoader fixture renders to screenshots, ANGLE+SwiftShader runs
+the software backend with stable RSS over 64 context cycles, and a pinned
+6-page Khronos conformance subset passes 272/272. Engine fixes the suite
+exposed ship for everyone: synchronous XHR, relative script URLs, and WebGL
+parameter validation.
+
 ### Added
 - **WebGL verification** — Three.js/GLTFLoader fixture, ANGLE + SwiftShader Vulkan smoke/benchmark, and an opt-in runner for a pinned Khronos WebGL conformance subset.
 
