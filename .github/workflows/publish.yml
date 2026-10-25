@@ -33,11 +33,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
 
-      # Publish core-first (dependency order):
-      # core → credentials → render → cdp → oxibrowser.
-      # Each crate depends on earlier ones via crates.io (path deps are
-      # resolved to registry versions at publish time), so we wait for index
-      # propagation between steps.
+      # Publish in dependency order (leaf → root):
+      # render → core → credentials → cdp → oxibrowser.
+      # core depends on render; credentials/cdp depend on core; the CLI
+      # depends on all. Path deps are resolved to registry versions at
+      # publish time, so we wait for index propagation between steps.
+      - name: Publish oxibrowser-render
+        run: cargo publish -p oxibrowser-render
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index propagation
+        run: sleep 30
+
       - name: Publish oxibrowser-core
         run: cargo publish -p oxibrowser-core
         env:
@@ -48,14 +56,6 @@ jobs:
 
       - name: Publish oxibrowser-credentials
         run: cargo publish -p oxibrowser-credentials
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      - name: Wait for index propagation
-        run: sleep 30
-
-      - name: Publish oxibrowser-render
-        run: cargo publish -p oxibrowser-render
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -97,4 +97,7 @@ jobs:
             awk "/^## \\[$VER\\]/{f=1; next} /^## \\[/{f=0} f" CHANGELOG.md
             printf '\n**Full changelog**: https://github.com/project-oxi/oxibrowser/blob/main/CHANGELOG.md\n'
           } > release-notes.md
-          gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag
+          # The macOS release workflow usually created the release first;
+          # only create it when missing so re-runs stay idempotent.
+          gh release view "$TAG" --json name --jq .name >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag
