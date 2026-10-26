@@ -256,17 +256,19 @@ async fn synthesize_scroll_gesture(params: Option<Value>, ctx: &DispatchContext)
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Calculate modifier flags from CDP key event params.
-/// CDP modifiers: 0=none, 1=click, 2=alt, 4=ctrl, 8=shift, 16=meta
+/// Translate CDP modifiers into the shared input generator's flags.
 fn calculate_modifiers(params: &serde_json::Value) -> u32 {
     let mut m = 0u32;
-    if params
+    let cdp = params
         .get("modifiers")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        > 0
-    {
-        m |= 1;
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    // CDP uses Alt=1, Control=2, Meta=4, Shift=8. The shared input
+    // generator uses Alt=2, Control=4, Meta=16, Shift=8 instead.
+    for (wire, internal) in [(1, 2), (2, 4), (4, 16), (8, 8)] {
+        if cdp & wire != 0 {
+            m |= internal;
+        }
     }
     if params
         .get("shiftKey")
@@ -306,4 +308,26 @@ fn current_timestamp_ms() -> f64 {
         .unwrap_or_default()
         .as_secs_f64()
         * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_modifiers;
+    use serde_json::json;
+
+    #[test]
+    fn cdp_keyboard_modifier_bits_keep_their_meaning() {
+        for (wire, internal) in [(0, 0), (1, 2), (2, 4), (4, 16), (8, 8), (15, 30)] {
+            assert_eq!(calculate_modifiers(&json!({"modifiers": wire})), internal);
+        }
+        assert_eq!(calculate_modifiers(&json!({"modifiers": -1})), 0);
+        assert_eq!(
+            calculate_modifiers(&json!({"modifiers": 1, "ctrlKey": true, "shiftKey": true})),
+            14,
+        );
+        assert_eq!(
+            calculate_modifiers(&json!({"altKey": true, "metaKey": true})),
+            18,
+        );
+    }
 }

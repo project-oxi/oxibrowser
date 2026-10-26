@@ -457,6 +457,9 @@ KHR_parallel_shader_compile uses actual ANGLE worker compilation and completion
 status in WebGL1 and WebGL2. Query availability uses native timing; browser task
 snapshots and the remaining unimplemented WebGL2 groups are not provided.
 
+See [Cheonggye runtime compatibility](docs/quality/cheonggye-runtime.md) for the
+retained game's integration results, limits and manual scene/input inspector.
+
 Image loading decodes real raster bytes from data/Blob URLs and same-origin
 HTTP, with a 128 MiB decoded limit and 16k dimension limit. Blob URLs retain
 actual branded Blob bytes until revoked or the document is replaced.

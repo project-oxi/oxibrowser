@@ -63,14 +63,21 @@ pub fn js_dispatch_key_event(
     let alt = (modifiers & 2) != 0;
     let meta = (modifiers & 16) != 0;
 
+    let dom_event_type = match event_type {
+        "keyDown" | "rawKeyDown" => "keydown",
+        "keyUp" => "keyup",
+        "char" => "keypress",
+        other => other,
+    };
+    let insert_character = event_type == "char";
     // Safely escape key/code/event_type using serde_json
     let key_json = serde_json::to_string(key).unwrap_or_default();
     let code_json = serde_json::to_string(code).unwrap_or_default();
-    let event_type_json = serde_json::to_string(event_type).unwrap_or_default();
+    let event_type_json = serde_json::to_string(dom_event_type).unwrap_or_default();
 
     format!(
         r#"(function() {{
-            var el = document.activeElement;
+            var el = document.activeElement || document.body || document.documentElement || document;
             var dispatched = false;
             if (el) {{
                 dispatched = el.dispatchEvent(new KeyboardEvent({event_type_json}, {{
@@ -86,12 +93,12 @@ pub fn js_dispatch_key_event(
                 }}));
 
                 // For printable char events, also update input values
-                if ({event_type_json} === 'char' && dispatched) {{
+                if ({insert_character} && dispatched) {{
                     if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {{
-                        var start = el.selectionStart || el.value.length;
-                        var end = el.selectionEnd || el.value.length;
+                        var start = typeof el.selectionStart === 'number' ? el.selectionStart : el.value.length;
+                        var end = typeof el.selectionEnd === 'number' ? el.selectionEnd : el.value.length;
                         el.value = el.value.substring(0, start) + {key_json} + el.value.substring(end);
-                        el.selectionStart = el.selectionEnd = start + 1;
+                        el.selectionStart = el.selectionEnd = start + {key_json}.length;
                         el.dispatchEvent(new Event('input', {{ bubbles: true }}));
                         el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     }}
@@ -174,7 +181,7 @@ mod tests {
     fn test_keydown_generates_valid_js() {
         let js = js_dispatch_key_event("Enter", "Enter", "keyDown", 0, 0.0);
         assert!(js.contains("KeyboardEvent"));
-        assert!(js.contains("keyDown"));
+        assert!(js.contains("keydown"));
         assert!(js.contains("key: \"Enter\""));
         assert!(js.contains("code: \"Enter\""));
     }

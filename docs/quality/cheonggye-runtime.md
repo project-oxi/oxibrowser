@@ -1,6 +1,6 @@
 # Cheonggye runtime compatibility
 
-Development candidate, 2026-10-26. This is browser-engine work; the game and
+Development candidate, 2026-10-26–27. This is browser-engine work; the game and
 its retained release assets are unchanged.
 
 ## Acceptance
@@ -53,6 +53,9 @@ Candidate assets used for integration:
   byte offsets for all index widths, including instanced draws.
 - KHR_parallel_shader_compile activates real ANGLE compiler workers and exposes
   native shader/program completion. Babylon selects its asynchronous pipeline.
+- CDP keyboard types map to DOM `keydown`/`keyup`/`keypress`; events preserve
+  their bubbling/cancellation flags and reach connected element ancestors,
+  document and window once. Modifier bits translate at the CDP boundary.
 
 Modules still use synchronous network waits on the JS thread. Import maps,
 import attributes, non-HTTP module URLs, anonymous wildcard CDN imports and
@@ -66,6 +69,8 @@ Image decoding is limited to 16k dimensions and 128 MiB. Image loading supports
 data/Blob URLs and same-origin HTTP; cross-origin images and cross-origin
 redirects are rejected. WebGL image uploads currently support RGB/RGBA UNSIGNED_BYTE;
 ImageBitmap and canvas TexImageSources remain unsupported.
+Event capture/options and focus tracking are unchanged; the active element still
+defaults to body. Listener exceptions retain the existing swallowed-error policy.
 
 ## Actual-game observations
 
@@ -121,13 +126,29 @@ is `Windows::nth` plus its regression cases. Other Boa crates remain registry
 dependencies. On the same retained 66,430-byte fragment, 100 actual JavaScript
 splits decreased from 1,298 to 22 ms for Latin1 and from 1,299 to 8 ms for a
 UTF-16 variant, with identical part counts. This is a string microbenchmark,
-not a startup or frame-rate measurement. The next unmodified-game run completed
-readiness and rendered the actual 1,946-mesh scene with one active render loop.
-The loading veil became hidden after roughly four minutes overall. A five-second
-CDP W hold did not move the player: keyboard dispatch still uses CDP's camel-case
-event names rather than DOM `keydown`/`keyup`. Movement acceptance is pending
-that input repair. Audio and frame-rate performance remain **unverified**;
-game assets are unchanged.
+not a startup or frame-rate measurement. The first optimized unmodified-game
+run completed readiness and rendered the 1,946-mesh scene. Its W hold did not
+move the player. Three browser defects explained the missing input: CDP event
+names were not normalized, KeyboardEvent discarded inherited bubbling flags,
+and element dispatch stopped before document/window. Those paths are now fixed.
+
+The final exclusive local run on 2026-10-27 passed actual-game acceptance:
+
+- The original loading veil was observed hidden at 160.4 seconds (10-second
+  polling), with genuine WebGL2, 1,946 meshes and one active render loop.
+- The idle baseline had zero horizontal drift. A five-second CDP W hold moved
+  the player from X/Z `(18.5, -4.9)` to `(19.03259, -6.04191)`: 1.26 world units.
+  The game window observed both `keydown` and `keyup` with `KeyW`.
+- Fourteen actual rendered-frame observations fell strictly inside the
+  command-free hold, spanning 4,489 ms, approximately 2.9 fps in this short
+  sample. Frame ID advanced from 20 to 37 across the complete input check.
+- Before/after PNGs show the scene and player movement. No exception or shader
+  error was reported; the console recorded the actual Babylon WebGL2 engine.
+
+This establishes the basic loading/rendering/movement path, not smooth real-time
+play. Startup and frame rate need further optimization. Sustained performance,
+audio, other interactions and broader visual correctness remain **unverified**;
+game sources, asset hashes, shaders and readiness deadlines are unchanged.
 Timer exceptions reach the CDP event sink; shader/draw calls and original shader
 sources have separate opt-in trace targets.
 
@@ -141,15 +162,16 @@ independent across contexts.
 
 ## Verification and remaining work
 
-- After the native WebGL2 and string changes, the full workspace with WebGL
-  passed serially with `oxibrowser-core/webgl`: 1,080 passed, 0 failed, 28 ignored.
-  This run excludes the CLI's opt-in `browser` tests. The vendored string crate
-  separately passed 28 unit tests and two doctests, with strict Clippy; an
+- Full workspace with `oxibrowser/webgl`, serial: 1,229 passed, 0 failed,
+  35 ignored, including the CLI browser/MCP tests and final input repair.
+  Strict all-target core/render/CDP Clippy, formatting and diff checks passed.
+  The vendored string crate separately passed 28 unit tests and two doctests;
   independent archive/provenance/patch review found no actionable issue.
-- Full workspace with WebGL, serial: 1,213 passed, 0 failed, 34 ignored after
-  the Image and GL capability/lifecycle additions. After the final subtree
-  retention sweep, the core library passed 715 tests with two ignored, and
-  all three forced-GC cases and ten image tests passed.
+- Five keyboard tests, 13 native-input cases and ten image tests passed after
+  four initial keyboard regressions failed before the repair. Independent
+  input review found no concrete blocker. The manual game inspector compares
+  horizontal displacement with idle drift and counts actual rendered frames
+  strictly inside the host's command-free hold, avoiding command-driven frames.
 - Ten image lifecycle/network tests, a forced-GC connected-image regression,
   real PNG-to-GPU uploads, cold parallel native context initialization and
   cross-canvas creation/resize tests passed. Eight GL session tests passed
@@ -205,12 +227,26 @@ cargo clippy -p oxibrowser-core -p oxibrowser-render --features oxibrowser-core/
 For the local retained game, serve its `public` directory over HTTP and start:
 
 ```sh
-oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864
+cargo build -p oxibrowser --release --features webgl
+target/release/oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864
 ```
 
-At this checkpoint the default WebGL2 recipe reaches the real scene; CDP movement
-acceptance is still pending. Adding `--disable-webgl2` is a diagnostic fallback
-that stops at the custom PBR shader.
+With that server running, Node 22+ can check the exact retained release:
+
+```sh
+node scripts/check-cheonggye.mjs http://127.0.0.1:8000/
+```
+
+The manual inspector waits for the loading veil to hide, selects the largest
+actual Babylon scene, captures PNGs, measures five seconds of idle drift and
+holds W for five seconds. It checks horizontal displacement above that baseline
+and actual frames inside the command-free hold. It records JSON and console
+events in a fresh temporary directory and returns nonzero on failure. The module
+path is pinned to the retained release above; it is not a generic game driver.
+
+The default WebGL2 recipe passes the retained scene and basic movement check,
+with the loading/frame-rate limits above. Adding `--disable-webgl2` is a
+diagnostic fallback that stops at the custom PBR shader.
 
 `--background-event-loop` is opt-in; MCP/Ghost sessions retain command-driven
 execution. Synchronous native calls and module I/O cannot be preempted at a

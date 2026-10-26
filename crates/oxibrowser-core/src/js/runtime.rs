@@ -434,6 +434,142 @@ fn registry_remove(node_id: u32, event_type: &str) {
     })
 }
 
+enum EventListenerStore {
+    Element(u32),
+    Document,
+    Window,
+}
+
+/// Dispatch over one fixed target-to-root path. Existing listener stores are
+/// retained; callbacks are cloned out before calls so listeners may edit DOM.
+/// Capture/options support is intentionally unchanged by this bubbling repair.
+fn dispatch_bubbling_event(
+    ctx: &mut Context,
+    event: &JsValue,
+    path: &[(JsValue, EventListenerStore)],
+) -> JsResult<bool> {
+    let object = event.as_object();
+    let event_type = if let Some(object) = &object {
+        object
+            .get(js_string!("type"), ctx)?
+            .to_string(ctx)?
+            .to_std_string_escaped()
+    } else if let Some(name) = event.as_string() {
+        name.to_std_string_escaped()
+    } else {
+        return Ok(true);
+    };
+    if let Some(object) = &object {
+        let _ = object.set(js_string!("target"), path[0].0.clone(), true, ctx);
+    }
+    let flag = |ctx: &mut Context, name: &str| {
+        object
+            .as_ref()
+            .and_then(|object| object.get(JsString::from(name), ctx).ok())
+            .is_some_and(|value| value.to_boolean())
+    };
+    let bubbles = flag(ctx, "bubbles");
+    for (index, (target, store)) in path.iter().enumerate() {
+        if index > 0 && (!bubbles || flag(ctx, "__stopPropagation")) {
+            break;
+        }
+        if let Some(object) = &object {
+            let _ = object.set(js_string!("currentTarget"), target.clone(), true, ctx);
+            let _ = object.set(
+                js_string!("eventPhase"),
+                if index == 0 { 2 } else { 3 },
+                true,
+                ctx,
+            );
+        }
+        let callbacks = match store {
+            EventListenerStore::Element(node) => registry_get(*node, &event_type),
+            EventListenerStore::Document | EventListenerStore::Window => {
+                let owner = if matches!(store, EventListenerStore::Window) {
+                    ctx.global_object()
+                } else {
+                    target.as_object().expect("document target is an object")
+                };
+                let key = if matches!(store, EventListenerStore::Window) {
+                    "__oxiWinListeners"
+                } else {
+                    "__listeners"
+                };
+                let array = owner
+                    .get(JsString::from(key), ctx)
+                    .ok()
+                    .and_then(|value| value.as_object())
+                    .and_then(|listeners| {
+                        listeners.get(JsString::from(event_type.as_str()), ctx).ok()
+                    })
+                    .and_then(|value| value.as_object())
+                    .and_then(|array| JsArray::from_object(array).ok());
+                let mut callbacks = Vec::new();
+                if let Some(array) = array {
+                    for index in 0..array.length(ctx)? {
+                        if let Some(callback) = array.at(index as i64, ctx)?.as_object() {
+                            callbacks.push(callback);
+                        }
+                    }
+                }
+                callbacks
+            }
+        };
+        for callback in callbacks {
+            if flag(ctx, "__stopImmediatePropagation") {
+                break;
+            }
+            if callback.is_callable() {
+                // Event listeners historically report errors through neither
+                // dispatchEvent nor this input bridge; preserve that policy.
+                let _ = callback.call(target, std::slice::from_ref(event), ctx);
+            }
+        }
+        if !flag(ctx, "__stopImmediatePropagation") {
+            let key = JsString::from(format!("on{event_type}"));
+            let mut handler = target
+                .as_object()
+                .and_then(|target| target.get(key.clone(), ctx).ok());
+            if matches!(store, EventListenerStore::Window)
+                && !handler.as_ref().is_some_and(JsValue::is_callable)
+            {
+                handler = ctx.global_object().get(key, ctx).ok();
+            }
+            if let Some(handler) = handler.and_then(|handler| handler.as_object())
+                && handler.is_callable()
+            {
+                let _ = handler.call(target, std::slice::from_ref(event), ctx);
+            }
+        }
+    }
+    let prevented = flag(ctx, "defaultPrevented");
+    if let Some(object) = &object {
+        let _ = object.set(js_string!("currentTarget"), JsValue::null(), true, ctx);
+        let _ = object.set(js_string!("eventPhase"), 0, true, ctx);
+        let _ = object.set(js_string!("__stopPropagation"), false, true, ctx);
+        let _ = object.set(js_string!("__stopImmediatePropagation"), false, true, ctx);
+    }
+    Ok(!prevented)
+}
+
+fn append_document_event_targets(
+    ctx: &mut Context,
+    path: &mut Vec<(JsValue, EventListenerStore)>,
+) -> JsResult<()> {
+    let document = ctx.global_object().get(js_string!("document"), ctx)?;
+    path.push((document, EventListenerStore::Document));
+    append_window_event_target(ctx, path)
+}
+
+fn append_window_event_target(
+    ctx: &mut Context,
+    path: &mut Vec<(JsValue, EventListenerStore)>,
+) -> JsResult<()> {
+    let window = ctx.global_object().get(js_string!("window"), ctx)?;
+    path.push((window, EventListenerStore::Window));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -5504,6 +5640,8 @@ fn create_context(
         "detail",
     ];
     const KEYBOARD_INIT_KEYS: &[&str] = &[
+        "bubbles",
+        "cancelable",
         "key",
         "code",
         "keyCode",
@@ -6921,9 +7059,40 @@ fn create_render_element_object(
                 .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
                 .unwrap_or_default();
             if !event_type.is_empty() {
-                for cb in registry_get(node_id as u32, &event_type) {
-                    let _ = cb.call(&JsValue::undefined(), std::slice::from_ref(&event), ctx);
+                let (ancestors, connected) = {
+                    let document = rd_disp.borrow();
+                    let mut ancestors = Vec::new();
+                    let mut connected = false;
+                    if let Some(document) = document.as_ref() {
+                        let mut parent = document.parent_id(node_id);
+                        while let Some(id) = parent {
+                            let Some(node) = document.document().get_node(id) else {
+                                break;
+                            };
+                            if matches!(node.data, oxibrowser_render::NodeData::Document) {
+                                connected = true;
+                                break;
+                            }
+                            if !node.is_element() {
+                                break;
+                            }
+                            ancestors.push(id);
+                            parent = document.parent_id(id);
+                        }
+                    }
+                    (ancestors, connected)
+                };
+                let mut path = vec![(_this.clone(), EventListenerStore::Element(node_id as u32))];
+                for id in ancestors {
+                    path.push((
+                        create_render_element_object(ctx, rd_disp.clone(), id, dirty_disp.clone()),
+                        EventListenerStore::Element(id as u32),
+                    ));
                 }
+                if connected {
+                    append_document_event_targets(ctx, &mut path)?;
+                }
+                let _ = dispatch_bubbling_event(ctx, &event, &path)?;
             }
             // Click default action: a submit control activates its owner form
             // unless a listener called preventDefault (on click or on the
@@ -6972,7 +7141,7 @@ fn create_render_element_object(
                     }
                 }
             }
-            Ok(JsValue::from(true))
+            Ok(JsValue::from(!prevented))
         })
     };
 
@@ -7977,42 +8146,9 @@ fn register_document_object(
     let doc_dispatch_event_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let event = args.first().cloned().unwrap_or(JsValue::undefined());
-
-            let event_type = if let Some(evt_obj) = event.as_object() {
-                evt_obj
-                    .get(js_string!("type"), ctx)
-                    .ok()
-                    .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
-                    .unwrap_or_default()
-            } else if let Some(s) = event.as_string() {
-                s.to_std_string_escaped()
-            } else {
-                return Ok(JsValue::from(true));
-            };
-
-            if let Some(this_obj) = _this.as_object()
-                && let Ok(l_val) = this_obj.get(js_string!("__listeners"), ctx)
-                && let Some(l_obj) = l_val.as_object()
-            {
-                let arr_val = l_obj
-                    .get(JsString::from(event_type.as_str()), ctx)
-                    .unwrap_or(JsValue::null());
-                if let Some(arr_obj) = arr_val.as_object()
-                    && let Ok(arr) = JsArray::from_object(arr_obj.clone())
-                    && let Ok(len) = arr.length(ctx)
-                {
-                    for i in 0..len {
-                        if let Ok(cb) = arr.at(i as i64, ctx)
-                            && let Some(cb_obj) = cb.as_object()
-                            && cb_obj.is_callable()
-                        {
-                            let _ = cb_obj.call(_this, std::slice::from_ref(&event), ctx);
-                        }
-                    }
-                }
-            }
-
-            Ok(JsValue::from(true))
+            let mut path = vec![(_this.clone(), EventListenerStore::Document)];
+            append_window_event_target(ctx, &mut path)?;
+            Ok(JsValue::from(dispatch_bubbling_event(ctx, &event, &path)?))
         })
     };
 
@@ -8877,133 +9013,50 @@ fn create_element_object(
                 .and_then(|v| v.as_string().map(|s| s.to_std_string_escaped()))
                 .unwrap_or_default();
 
-            // Set target/currentTarget before any listener runs
-            let _ = evt_obj.set(js_string!("target"), _this.clone(), true, ctx);
-            let _ = evt_obj.set(js_string!("currentTarget"), _this.clone(), true, ctx);
-
-            let this_obj = _this.as_object().unwrap();
-            let target_node_id = this_obj
-                .get(js_string!("__nodeId"), ctx)
-                .ok()
-                .and_then(|v| v.as_number().map(|n| n as u32));
-            let target_callbacks = target_node_id
-                .map(|id| registry_get(id, &event_type))
-                .unwrap_or_default();
-            if !target_callbacks.is_empty() {
-                // DOM queries such as elementFromPoint create a fresh JS
-                // wrapper for an existing node. Dispatch through the
-                // node-id registry so listeners attached to the original
-                // wrapper still receive events.
-                for cb in target_callbacks {
-                    let _ = cb.call(_this, std::slice::from_ref(&event), ctx);
-                }
-            } else {
-                let listeners = this_obj.get(js_string!("__listeners"), ctx);
-                if let Ok(l_val) = listeners
-                    && let Some(l_obj) = l_val.as_object()
-                {
-                    let arr_val = l_obj
-                        .get(JsString::from(event_type.as_str()), ctx)
-                        .unwrap_or(JsValue::null());
-                    if let Some(arr_obj) = arr_val.as_object()
-                        && let Ok(arr) = JsArray::from_object(arr_obj.clone())
-                        && let Ok(len) = arr.length(ctx)
-                    {
-                        for i in 0..len {
-                            // Check stopImmediatePropagation before each callback
-                            if evt_obj
-                                .get(js_string!("__stopImmediatePropagation"), ctx)
-                                .ok()
-                                .and_then(|v| v.as_boolean())
-                                .unwrap_or(false)
-                            {
-                                break;
-                            }
-
-                            if let Ok(cb) = arr.at(i as i64, ctx)
-                                && let Some(cb_obj) = cb.as_object()
-                                && cb_obj.is_callable()
-                            {
-                                let evt_arg = event.clone();
-                                let _ = cb_obj.call(_this, &[evt_arg], ctx);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // === Bubbling phase ===
-            // Walk the DomSnapshot parent chain (not JS parentNode stubs,
-            // which lack __listeners). For each ancestor nodeId, look up
-            // listeners in the thread-local registry.
-            let bubbles = evt_obj
-                .get(js_string!("bubbles"), ctx)
-                .ok()
-                .and_then(|v| v.as_boolean())
-                .unwrap_or(true);
-            if bubbles {
-                // Build the ancestor nodeId chain from the snapshot.
-                let mut ancestor_ids: Vec<u32> = Vec::new();
-                let snap = snap_disp.read();
-                if let Some(ref s) = *snap {
-                    let mut current = s.nodes.get(&node_id_disp).and_then(|n| n.parent);
-                    while let Some(pid) = current {
-                        // Stop at document nodes (type 9) — they use a
-                        // separate listener system on the document object.
-                        match s.nodes.get(&pid) {
-                            Some(pn) if pn.node_type == 1 => {
-                                ancestor_ids.push(pid);
-                                current = pn.parent;
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-                drop(snap);
-
-                for aid in ancestor_ids {
-                    // Check stopPropagation
-                    if evt_obj
-                        .get(js_string!("__stopPropagation"), ctx)
-                        .ok()
-                        .and_then(|v| v.as_boolean())
-                        .unwrap_or(false)
-                    {
-                        break;
-                    }
-
-                    // Look up listeners from the registry (NOT from JS
-                    // __listeners, which lives on a different object instance).
-                    let callbacks = registry_get(aid, &event_type);
-                    if callbacks.is_empty() {
-                        continue;
-                    }
-
-                    // Build a minimal ancestor JS object for currentTarget.
-                    let ancestor_obj = boa_engine::object::ObjectInitializer::new(ctx)
-                        .property(js_string!("__nodeId"), JsValue::from(aid), Attribute::all())
-                        .build();
-                    let _ = evt_obj.set(
-                        js_string!("currentTarget"),
-                        JsValue::from(ancestor_obj.clone()),
-                        true,
-                        ctx,
-                    );
-
-                    let ancestor_val = JsValue::from(ancestor_obj);
-                    for cb in &callbacks {
-                        if evt_obj
-                            .get(js_string!("__stopImmediatePropagation"), ctx)
-                            .ok()
-                            .and_then(|v| v.as_boolean())
-                            .unwrap_or(false)
-                        {
+            let (ancestor_ids, connected) = {
+                let snapshot = snap_disp.read();
+                let mut ids = Vec::new();
+                let mut connected = false;
+                if let Some(snapshot) = snapshot.as_ref() {
+                    let mut parent = snapshot
+                        .nodes
+                        .get(&node_id_disp)
+                        .and_then(|node| node.parent);
+                    while let Some(id) = parent {
+                        let Some(node) = snapshot.nodes.get(&id) else {
+                            break;
+                        };
+                        if node.node_type == 9 {
+                            connected = true;
                             break;
                         }
-                        let _ = cb.call(&ancestor_val, std::slice::from_ref(&event), ctx);
+                        if node.node_type != 1 {
+                            break;
+                        }
+                        ids.push(id);
+                        parent = node.parent;
+                    }
+                }
+                (ids, connected)
+            };
+            let mut path = vec![(_this.clone(), EventListenerStore::Element(node_id_disp))];
+            {
+                let snapshot = snap_disp.read();
+                if let Some(snapshot) = snapshot.as_ref() {
+                    for id in ancestor_ids {
+                        if let Some(node) = snapshot.nodes.get(&id) {
+                            path.push((
+                                create_element_object(snapshot, node, ctx, &disp_mut, &snap_disp),
+                                EventListenerStore::Element(id),
+                            ));
+                        }
                     }
                 }
             }
+            if connected {
+                append_document_event_targets(ctx, &mut path)?;
+            }
+            let _ = dispatch_bubbling_event(ctx, &event, &path)?;
 
             let prevented = evt_obj
                 .get(js_string!("defaultPrevented"), ctx)
@@ -11258,6 +11311,18 @@ fn register_window_globals(
     render_doc_cell: &Rc<RefCell<Option<RenderDocument>>>,
     telemetry: bool,
 ) {
+    // Window listeners share the bootstrap store; native dispatch preserves
+    // event target/phase/cancellation and does not redispatch through document.
+    let _ = ctx.register_global_callable(
+        js_string!("dispatchEvent"),
+        1,
+        NativeFunction::from_fn_ptr(|_this, args, ctx| {
+            let mut path = Vec::new();
+            append_window_event_target(ctx, &mut path)?;
+            let event = args.first().cloned().unwrap_or(JsValue::undefined());
+            Ok(JsValue::from(dispatch_bubbling_event(ctx, &event, &path)?))
+        }),
+    );
     let _ = fetch_tx_arc; // suppress unused warning
     let url_owned = page_url.to_string();
     let ua_owned = user_agent.to_string();
