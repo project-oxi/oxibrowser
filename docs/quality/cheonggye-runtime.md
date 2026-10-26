@@ -113,9 +113,21 @@ but the first readiness sweep had not reached a render (render ID 0). A controll
 recreation of an actual PBR effect took 1,891 ms to dispatch and 1,912 ms to
 complete. Native samples put 338 of 408 JS-thread samples in Boa String.split /
 StringIndexOf: its Windows iterator repeatedly skips the whole prefix rather
-than jumping to the requested offset. A bounded string-library optimization is
-the next step before scene and movement acceptance. Audio and frame-rate
-performance remain **unverified**; game sources and assets are unchanged.
+than jumping to the requested offset. The iterator now uses constant-time
+skipping through a bounded `boa_string` 0.22.0 vendor
+patch. Its archive checksum, exact upstream revision and dual licenses are
+retained in `vendor/boa_string/PROVENANCE.md`; the only upstream source change
+is `Windows::nth` plus its regression cases. Other Boa crates remain registry
+dependencies. On the same retained 66,430-byte fragment, 100 actual JavaScript
+splits decreased from 1,298 to 22 ms for Latin1 and from 1,299 to 8 ms for a
+UTF-16 variant, with identical part counts. This is a string microbenchmark,
+not a startup or frame-rate measurement. The next unmodified-game run completed
+readiness and rendered the actual 1,946-mesh scene with one active render loop.
+The loading veil became hidden after roughly four minutes overall. A five-second
+CDP W hold did not move the player: keyboard dispatch still uses CDP's camel-case
+event names rather than DOM `keydown`/`keyup`. Movement acceptance is pending
+that input repair. Audio and frame-rate performance remain **unverified**;
+game assets are unchanged.
 Timer exceptions reach the CDP event sink; shader/draw calls and original shader
 sources have separate opt-in trace targets.
 
@@ -129,6 +141,11 @@ independent across contexts.
 
 ## Verification and remaining work
 
+- After the native WebGL2 and string changes, the full workspace with WebGL
+  passed serially with `oxibrowser-core/webgl`: 1,080 passed, 0 failed, 28 ignored.
+  This run excludes the CLI's opt-in `browser` tests. The vendored string crate
+  separately passed 28 unit tests and two doctests, with strict Clippy; an
+  independent archive/provenance/patch review found no actionable issue.
 - Full workspace with WebGL, serial: 1,213 passed, 0 failed, 34 ignored after
   the Image and GL capability/lifecycle additions. After the final subtree
   retention sweep, the core library passed 715 tests with two ignored, and
@@ -191,9 +208,9 @@ For the local retained game, serve its `public` directory over HTTP and start:
 oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864
 ```
 
-At this checkpoint readiness still fails. Adding `--disable-webgl2` is a
-diagnostic fallback that stops at the custom PBR shader; neither recipe yet
-establishes playable game support.
+At this checkpoint the default WebGL2 recipe reaches the real scene; CDP movement
+acceptance is still pending. Adding `--disable-webgl2` is a diagnostic fallback
+that stops at the custom PBR shader.
 
 `--background-event-loop` is opt-in; MCP/Ghost sessions retain command-driven
 execution. Synchronous native calls and module I/O cannot be preempted at a
