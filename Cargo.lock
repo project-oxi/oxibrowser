@@ -3636,6 +3636,8 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "glow",
+ "html5ever",
+ "parking_lot",
  "parley",
  "peniko",
  "png 0.18.1",
@@ -3644,6 +3646,7 @@ dependencies = [
  "stylo_traits",
  "thiserror 2.0.21",
  "tracing",
+ "xml5ever",
 ]
 
 [[package]]

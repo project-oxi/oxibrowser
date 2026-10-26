@@ -19,6 +19,9 @@ blitz-dom = { workspace = true }
 blitz-html = { workspace = true }
 blitz-paint = { workspace = true }
 blitz-traits = { workspace = true }
+# Match blitz-html's parser so the resource policy can delegate its TreeSink.
+html5ever = "0.39"
+xml5ever = "0.39"
 anyrender = { workspace = true }
 anyrender_vello_cpu = { workspace = true, features = ["multithreading"] }
 peniko = { workspace = true }
@@ -29,6 +32,7 @@ style = { version = "0.19.0", package = "stylo" }
 style_traits = { version = "0.19.0", package = "stylo_traits" }
 printpdf = { version = "0.12", features = ["png"] }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 # ANGLE-backed WebGL backend. Off by default: linking requires the pinned
 # ANGLE static libraries from scripts/setup-angle.sh (third_party/angle).
 glow = { workspace = true, optional = true }

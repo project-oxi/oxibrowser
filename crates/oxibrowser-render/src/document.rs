@@ -6,7 +6,6 @@ use blitz_dom::LocalName;
 use blitz_dom::NodeData;
 use blitz_dom::QualName;
 use blitz_dom::ns;
-use blitz_html::HtmlDocument;
 use blitz_traits::shell::ColorScheme;
 use blitz_traits::shell::Viewport as BlitzViewport;
 
@@ -121,6 +120,7 @@ fn html_name(local: &str) -> QualName {
 pub struct RenderDocument {
     doc: BaseDocument,
     base_url: String,
+    stylesheets: crate::PreloadedStylesheets,
     viewport: Viewport,
     tree_revision: u64,
     next_incarnation: u64,
@@ -140,41 +140,7 @@ impl RenderDocument {
         base_url: Option<&str>,
         viewport: Viewport,
     ) -> Result<Self, RenderError> {
-        // base_url MUST be in DocumentConfig: blitz-html resolves eager
-        // sub-resource ops (<img src>) DURING parsing, before the post-parse
-        // `set_base_url` runs — without this, a relative img URL panics
-        // (resolved against blitz's data: default).
-        let config = DocumentConfig {
-            base_url: base_url.map(str::to_string),
-            ..DocumentConfig::default()
-        };
-        let mut doc = HtmlDocument::from_html(html, config).into_inner();
-
-        if let Some(url) = base_url {
-            doc.set_base_url(url);
-        }
-
-        // Critical: set the viewport BEFORE resolve, otherwise Taffy lays out
-        // against a (0,0) window and flexbox children collapse to zero size.
-        doc.set_viewport(BlitzViewport::new(
-            viewport.width,
-            viewport.height,
-            viewport.scale as f32,
-            effective_color_scheme(),
-        ));
-
-        // Drive Stylo restyle + Taffy relayout once so the tree is paint-ready.
-        doc.resolve(0.0);
-
-        Ok(Self {
-            doc,
-            base_url: base_url.unwrap_or("about:blank").to_owned(),
-            viewport,
-            tree_revision: 0,
-            next_incarnation: 1,
-            incarnations: Default::default(),
-            attachments: Default::default(),
-        })
+        Self::from_html_with_resources(html, base_url, viewport, &[], &Default::default())
     }
 
     /// Like [`from_html`](Self::from_html), but registers the supplied webfont
@@ -190,6 +156,19 @@ impl RenderDocument {
         viewport: Viewport,
         fonts: &[Vec<u8>],
     ) -> Result<Self, RenderError> {
+        Self::from_html_with_resources(html, base_url, viewport, fonts, &Default::default())
+    }
+
+    /// Parse with document-scoped stylesheet bytes fetched through core's
+    /// network policy. Link elements retain their original attributes; the
+    /// renderer performs no networking and invents no resource/load events.
+    pub fn from_html_with_resources(
+        html: &str,
+        base_url: Option<&str>,
+        viewport: Viewport,
+        fonts: &[Vec<u8>],
+        stylesheets: &crate::PreloadedStylesheets,
+    ) -> Result<Self, RenderError> {
         let mut config = DocumentConfig {
             // See from_html: eager <img> ops resolve during parsing, so the
             // base URL has to be present in the config, not just post-parse.
@@ -199,10 +178,7 @@ impl RenderDocument {
         if !fonts.is_empty() {
             config.font_ctx = Some(build_font_ctx(fonts));
         }
-        let mut doc = HtmlDocument::from_html(html, config).into_inner();
-        if let Some(url) = base_url {
-            doc.set_base_url(url);
-        }
+        let mut doc = crate::resources::parse(html, config, stylesheets);
         doc.set_viewport(BlitzViewport::new(
             viewport.width,
             viewport.height,
@@ -213,6 +189,7 @@ impl RenderDocument {
         Ok(Self {
             doc,
             base_url: base_url.unwrap_or("about:blank").to_owned(),
+            stylesheets: stylesheets.clone(),
             viewport,
             tree_revision: 0,
             next_incarnation: 1,
@@ -228,6 +205,15 @@ impl RenderDocument {
     /// The viewport this document was constructed (and laid out) against.
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// Reuse only for a composed view of this same document, never navigation.
+    pub fn preloaded_stylesheets(&self) -> &crate::PreloadedStylesheets {
+        &self.stylesheets
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Flush pending style/layout changes before synchronous DOM geometry reads.

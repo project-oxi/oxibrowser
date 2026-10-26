@@ -37,7 +37,7 @@ use super::{RegistryEntry, props};
 /// Hidden prop on the context object carrying the frontend context handle.
 const CTX_HANDLE_PROP: &str = "__webglCtxHandle";
 
-/// Extensions exposed by `getExtension` when ANGLE advertises them. In WebGL2
+/// Extensions exposed by `getExtension` when ANGLE can enable them. In WebGL2
 /// every one of these is core, so `getExtension` reports `null` there.
 const EXTENSION_ALLOWLIST: &[&str] = &[
     "OES_element_index_uint",
@@ -49,7 +49,6 @@ const EXTENSION_ALLOWLIST: &[&str] = &[
     "OES_texture_half_float",
     "OES_texture_float_linear",
     "OES_texture_half_float_linear",
-    "OES_vertex_array_object",
 ];
 
 // ─── JS helpers ─────────────────────────────────────────────────────────────
@@ -415,6 +414,46 @@ fn apply_unpack_transform(
             }
         }
     }
+}
+
+type ImagePixels = (i32, i32, Vec<u8>);
+
+/// Decoded image sources keep their real, potentially rectangular dimensions.
+/// Transform straight RGBA before dropping alpha for an RGB upload.
+fn image_source_pixels(
+    source: &JsValue,
+    format: u32,
+    ty: u32,
+    entry: &RegistryEntry,
+    cx: &mut Context,
+) -> JsResult<Option<ImagePixels>> {
+    let Some((width, height, mut pixels)) = crate::js::runtime::image::source_pixels(source, cx)?
+    else {
+        return Ok(None);
+    };
+    if ty != glow::UNSIGNED_BYTE || !matches!(format, glow::RGBA | glow::RGB) {
+        return Err(type_err(
+            "decoded image uploads support RGB/RGBA UNSIGNED_BYTE",
+        ));
+    }
+    let (width, height) = (width as i32, height as i32);
+    apply_unpack_transform(
+        &mut pixels,
+        width,
+        height,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        entry.ctx.unpack_flip_y,
+        entry.ctx.unpack_premultiply,
+    );
+    if format == glow::RGB {
+        let mut rgb = Vec::with_capacity(pixels.len() / 4 * 3);
+        for pixel in pixels.as_chunks::<4>().0 {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+        pixels = rgb;
+    }
+    Ok(Some((width, height, pixels)))
 }
 
 /// Bytes-per-pixel for the legacy 6/7-arg tex*Image2D overloads, where the
@@ -1001,6 +1040,7 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         let src = str_at(args, 1)?;
         if let Some(sh) = resolve_resource(e, h, args.get_or_undefined(0), c, ResourceKind::Shader)?
         {
+            tracing::trace!(target: "oxibrowser::shader_sources", context = h, shader = sh, source = ?src, "WebGL shader source");
             unsafe { gl.shader_source(glow::NativeShader(nz(sh)), &src) };
         }
         Ok(JsValue::undefined())
@@ -1419,31 +1459,34 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         let internal_format = i32_at(args, 2)?;
         // Dimensions per overload; pixels extracted exactly once. `owned` must
         // outlive the upload borrow handed to glow.
-        let (width, height, border, format, ty, mut owned) = if args.len() >= 9 {
+        let (width, height, border, format, ty, mut owned, image_source) = if args.len() >= 9 {
             let w = i32_at(args, 3)?;
             let h2 = i32_at(args, 4)?;
             let border = i32_at(args, 5)?;
             let f = u32_at(args, 6)?;
             let t = u32_at(args, 7)?;
             let px = buffer_source_bytes(args.get_or_undefined(8), c)?;
-            (w, h2, border, f, t, px)
+            (w, h2, border, f, t, px, false)
         } else if args.len() >= 6 {
-            // Legacy 6-arg overload. ArrayBufferView is not a TexImageSource
-            // in the spec; we accept it with a square-dimension convention
-            // ([`square_dims`]) and let ANGLE validate the resulting upload.
             let f = u32_at(args, 3)?;
             let t = u32_at(args, 4)?;
-            let Some(bytes) = buffer_source_bytes(args.get_or_undefined(5), c)? else {
-                return Err(type_err("texImage2D requires pixel data"));
-            };
-            let Some(side) = square_dims(&bytes, e, f, t) else {
-                return Ok(JsValue::undefined());
-            };
-            (side, side, 0, f, t, Some(bytes))
+            let source = args.get_or_undefined(5);
+            if let Some((w, h, pixels)) = image_source_pixels(source, f, t, e, c)? {
+                (w, h, 0, f, t, Some(pixels), true)
+            } else {
+                // Retain the legacy ArrayBufferView square convention.
+                let Some(bytes) = buffer_source_bytes(source, c)? else {
+                    return Err(type_err("texImage2D requires pixel data"));
+                };
+                let Some(side) = square_dims(&bytes, e, f, t) else {
+                    return Ok(JsValue::undefined());
+                };
+                (side, side, 0, f, t, Some(bytes), false)
+            }
         } else {
             return Err(type_err("texImage2D expects 6 or 9 arguments"));
         };
-        if let Some(b) = owned.as_mut() {
+        if let Some(b) = owned.as_mut().filter(|_| !image_source) {
             apply_unpack_transform(
                 b,
                 width,
@@ -1458,7 +1501,14 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             None => glow::PixelUnpackData::Slice(None),
             Some(slice) => glow::PixelUnpackData::Slice(Some(slice)),
         };
+        // Image pixels are tightly packed; DOM image rows do not inherit the
+        // app's client-memory alignment. Preserve that state after upload.
+        let unpack_alignment =
+            image_source.then(|| unsafe { gl.get_parameter_i32(glow::UNPACK_ALIGNMENT) });
         unsafe {
+            if image_source {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            }
             gl.tex_image_2d(
                 target,
                 level,
@@ -1469,7 +1519,10 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 format,
                 ty,
                 upload,
-            )
+            );
+            if let Some(alignment) = unpack_alignment {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, alignment);
+            }
         };
         let texture_id = if target == glow::TEXTURE_2D {
             e.ctx.bound_texture_2d
@@ -1486,7 +1539,7 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
     gl_method!(cx, obj, "texSubImage2D", move |_h, e, gl, args, c| {
         let target = u32_at(args, 0)?;
         let level = i32_at(args, 1)?;
-        let (xoff, yoff, width, height, format, ty, bytes) = if args.len() >= 9 {
+        let (xoff, yoff, width, height, format, ty, bytes, image_source) = if args.len() >= 9 {
             let x = i32_at(args, 2)?;
             let y = i32_at(args, 3)?;
             let w = i32_at(args, 4)?;
@@ -1494,23 +1547,25 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             let f = u32_at(args, 6)?;
             let t = u32_at(args, 7)?;
             let px = buffer_source_bytes(args.get_or_undefined(8), c)?;
-            (x, y, w, h2, f, t, px)
+            (x, y, w, h2, f, t, px, false)
         } else if args.len() >= 7 {
-            // 7-arg legacy form: dimensions derived from the data length
-            // (square convention, mirrors the 6-arg texImage2D handling).
             let x = i32_at(args, 2)?;
             let y = i32_at(args, 3)?;
             let f = u32_at(args, 4)?;
             let t = u32_at(args, 5)?;
-            let Some(bytes) = buffer_source_bytes(args.get_or_undefined(6), c)? else {
-                // glTexSubImage2D needs real client data; null → INVALID_VALUE.
-                e.ctx.push_error(types::INVALID_VALUE);
-                return Ok(JsValue::undefined());
-            };
-            let Some(side) = square_dims(&bytes, e, f, t) else {
-                return Ok(JsValue::undefined());
-            };
-            (x, y, side, side, f, t, Some(bytes))
+            let source = args.get_or_undefined(6);
+            if let Some((w, h, pixels)) = image_source_pixels(source, f, t, e, c)? {
+                (x, y, w, h, f, t, Some(pixels), true)
+            } else {
+                let Some(bytes) = buffer_source_bytes(source, c)? else {
+                    e.ctx.push_error(types::INVALID_VALUE);
+                    return Ok(JsValue::undefined());
+                };
+                let Some(side) = square_dims(&bytes, e, f, t) else {
+                    return Ok(JsValue::undefined());
+                };
+                (x, y, side, side, f, t, Some(bytes), false)
+            }
         } else {
             return Err(type_err("texSubImage2D expects 7 or 9 arguments"));
         };
@@ -1518,16 +1573,23 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
             e.ctx.push_error(types::INVALID_VALUE);
             return Ok(JsValue::undefined());
         };
-        apply_unpack_transform(
-            &mut bytes,
-            width,
-            height,
-            format,
-            ty,
-            e.ctx.unpack_flip_y,
-            e.ctx.unpack_premultiply,
-        );
+        if !image_source {
+            apply_unpack_transform(
+                &mut bytes,
+                width,
+                height,
+                format,
+                ty,
+                e.ctx.unpack_flip_y,
+                e.ctx.unpack_premultiply,
+            );
+        }
+        let unpack_alignment =
+            image_source.then(|| unsafe { gl.get_parameter_i32(glow::UNPACK_ALIGNMENT) });
         unsafe {
+            if image_source {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            }
             gl.tex_sub_image_2d(
                 target,
                 level,
@@ -1538,7 +1600,10 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 format,
                 ty,
                 glow::PixelUnpackData::Slice(Some(&bytes)),
-            )
+            );
+            if let Some(alignment) = unpack_alignment {
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, alignment);
+            }
         };
         Ok(JsValue::undefined())
     });
@@ -2368,24 +2433,21 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         cx,
         obj,
         "getSupportedExtensions",
-        move |_h, _e, gl, _args, c| {
-            let raw = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
-            let names: Vec<JsValue> = raw
-                .split_whitespace()
+        move |_h, e, gl, _args, c| {
+            let available = e.ctx.backend.available_extensions(gl);
+            let mut names: Vec<JsValue> = available
+                .iter()
+                .map(String::as_str)
                 .filter_map(|token| token.strip_prefix("GL_"))
-                .filter(|name| {
-                    name.starts_with("OES_")
-                        || name.starts_with("EXT_")
-                        || name.starts_with("ANGLE_")
-                        || name.starts_with("WEBGL_")
-                })
+                .filter(|name| kind == CtxKind::WebGl1 && EXTENSION_ALLOWLIST.contains(name))
                 .map(JsString::from)
                 .map(JsValue::from)
                 .collect();
+            names.push(JsValue::from(js_string!("WEBGL_debug_renderer_info")));
             Ok(JsValue::from(JsArray::from_iter(names, c)))
         }
     );
-    gl_method!(cx, obj, "getExtension", move |_h, _e, gl, args, c| {
+    gl_method!(cx, obj, "getExtension", move |_h, e, gl, args, c| {
         let name = str_at(args, 0)?;
         // WEBGL_debug_renderer_info always exists (Chrome always exposes it);
         // it carries the UNMASKED_* constants.
@@ -2412,11 +2474,19 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         if !EXTENSION_ALLOWLIST.contains(&name.as_str()) {
             return Ok(JsValue::null());
         }
-        // Honest exposure: only when ANGLE advertises the backing GL extension.
-        let raw = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
         let gl_name = format!("GL_{name}");
-        if raw.split_whitespace().any(|t| t == gl_name) {
-            Ok(JsValue::from(JsObject::with_object_proto(c.intrinsics())))
+        if e.ctx.backend.enable_extension(gl, &gl_name) {
+            let extension = JsObject::with_object_proto(c.intrinsics());
+            let constants: &[(&str, u32)] = match name.as_str() {
+                "OES_standard_derivatives" => &[("FRAGMENT_SHADER_DERIVATIVE_HINT_OES", 0x8B8B)],
+                "OES_texture_half_float" => &[("HALF_FLOAT_OES", 0x8D61)],
+                "EXT_blend_minmax" => &[("MIN_EXT", 0x8007), ("MAX_EXT", 0x8008)],
+                _ => &[],
+            };
+            for (name, value) in constants {
+                extension.set(JsString::from(*name), JsValue::from(*value), false, c)?;
+            }
+            Ok(JsValue::from(extension))
         } else {
             Ok(JsValue::null())
         }

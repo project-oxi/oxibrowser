@@ -50,6 +50,10 @@ fn urlencoding_escape(s: &str) -> String {
 async fn session_with(html: &str) -> Session {
     let mut config = BrowserConfig::headless();
     config.enable_ssrf_filter = false;
+    session_with_config(html, config).await
+}
+
+async fn session_with_config(html: &str, config: BrowserConfig) -> Session {
     let context = make_context(&config);
     let mut session = Session::new(BrowserId::next(), config, context)
         .await
@@ -62,6 +66,54 @@ async fn session_with(html: &str) -> Session {
         .await
         .expect("navigate");
     session
+}
+
+fn with_draw_probe(html: String) -> String {
+    html.replace("<script>", "<script>try {")
+        .replace(
+            "gl.drawArrays(gl.TRIANGLES, 0, 3);",
+            "gl.drawArrays(gl.TRIANGLES, 0, 3);\n\
+             const pixel = new Uint8Array(4);\n\
+             gl.readPixels(16,16,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);\n\
+             globalThis.drawProbe = [...pixel, gl.getError()];",
+        )
+        .replace(
+            "</script>",
+            "} catch(error) { globalThis.drawError = String(error); }</script>",
+        )
+}
+
+#[tokio::test]
+async fn webgl_disabled_webgl2_falls_back_to_real_webgl1_without_pinning_canvas() {
+    let mut config = BrowserConfig::headless();
+    config.enable_ssrf_filter = false;
+    config.webgl2_enabled = false;
+    let html = TRIANGLE_HTML.replace(
+        "const gl = canvas.getContext('webgl', { alpha: false });",
+        "for (const type of ['webgl2', 'experimental-webgl2', 'unknown']) {\n\
+           if (canvas.getContext(type) !== null) throw new Error('unexpected context: ' + type);\n\
+         }\n\
+         const gl = canvas.getContext('webgl', { alpha: false });\n\
+         if (gl.TEXTURE_BINDING_3D !== undefined) throw new Error('WebGL2 constants');",
+    );
+    let mut session = session_with_config(&with_draw_probe(html), config).await;
+    let result = session
+        .evaluate_js("[globalThis.drawError ?? null, globalThis.drawProbe]")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value,
+        Some(serde_json::json!([null, [255, 0, 0, 255, 0]])),
+        "{result:?}"
+    );
+
+    // Capability selection belongs to each runtime's JS thread.
+    let mut default_session = session_with("<canvas id='default'></canvas>").await;
+    let result = default_session
+        .evaluate_js("!!document.getElementById('default').getContext('webgl2')")
+        .await
+        .unwrap();
+    assert_eq!(result.value, Some(serde_json::json!(true)), "{result:?}");
 }
 
 #[tokio::test]
@@ -88,6 +140,37 @@ async fn webgl_shader_precision_capability_queries_have_valid_enums() {
         result.value,
         Some(serde_json::json!(true)),
         "{result:?}; {probe:?}"
+    );
+}
+
+#[tokio::test]
+async fn webgl_requestable_derivatives_compile_and_render() {
+    let html = TRIANGLE_HTML
+        .replace(
+            "if (!gl) { throw new Error('no webgl context'); }",
+            "if (!gl) throw new Error('no webgl context');\n\
+             if (!gl.getSupportedExtensions().includes('OES_standard_derivatives')) throw new Error('derivatives not advertised');\n\
+             const extension = gl.getExtension('OES_standard_derivatives');\n\
+             if (!extension || extension.FRAGMENT_SHADER_DERIVATIVE_HINT_OES !== 0x8B8B) throw new Error('derivatives not enabled');\n\
+             if (gl.getExtension('OES_vertex_array_object') !== null || gl.getSupportedExtensions().includes('OES_vertex_array_object')) throw new Error('unimplemented extension advertised');",
+        )
+        .replace(
+            "attribute vec2 a_pos; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }",
+            "attribute vec2 a_pos; varying vec2 v_pos; void main() { v_pos = a_pos; gl_Position = vec4(a_pos, 0.0, 1.0); }",
+        )
+        .replace(
+            "precision mediump float; void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }",
+            "#extension GL_OES_standard_derivatives : require\\nprecision mediump float; varying vec2 v_pos; void main() { gl_FragColor = vec4(abs(dFdx(v_pos.x)) * 32.0, 0.0, 0.0, 1.0); }",
+        );
+    let mut session = session_with(&with_draw_probe(html)).await;
+    let result = session
+        .evaluate_js("[globalThis.drawError ?? null, globalThis.drawProbe]")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value,
+        Some(serde_json::json!([null, [255, 0, 0, 255, 0]])),
+        "{result:?}"
     );
 }
 
@@ -135,7 +218,16 @@ const TRIANGLE_HTML: &str = r##"<!doctype html>
 /// created-but-not-rasterizing backend fail loudly.
 #[tokio::test(flavor = "multi_thread")]
 async fn webgl_triangle_reaches_screenshot() {
-    let mut session = session_with(TRIANGLE_HTML).await;
+    let mut session = session_with(&with_draw_probe(TRIANGLE_HTML.to_owned())).await;
+    let probe = session
+        .evaluate_js("[globalThis.drawError ?? null, globalThis.drawProbe]")
+        .await
+        .unwrap();
+    assert_eq!(
+        probe.value,
+        Some(serde_json::json!([null, [255, 0, 0, 255, 0]])),
+        "before presentation: {probe:?}"
+    );
     let png = session.capture_screenshot_png(256).await.expect("capture");
     let img = image::load_from_memory(&png).expect("decode");
     let rgba = img.to_rgba8();

@@ -24,7 +24,7 @@ fn checked_size(size: usize) -> JsResult<()> {
     Ok(())
 }
 
-fn bytes(value: &JsValue, ctx: &mut Context) -> JsResult<Vec<u8>> {
+pub(super) fn bytes(value: &JsValue, ctx: &mut Context) -> JsResult<Vec<u8>> {
     let bytes = if let Some(value) = value.as_string() {
         checked_size(value.len())?;
         value.to_std_string_lossy().into_bytes()
@@ -614,6 +614,11 @@ const BOOTSTRAP: &str = r#"
       Object.defineProperties(this, { readable: { value: readable, enumerable: true }, writable: { value: writable, enumerable: true } });
     }
   }
+  // Captured by the image loader before page scripts run. This accessor
+  // checks the private Blob WeakMap rather than trusting public properties.
+  Object.defineProperty(globalThis, '__oxiBlobBytes', {
+    value(blob) { return copy(required(blobs, blob).bytes); }, configurable: true
+  });
   const constructors = { Blob, Response, ReadableStream, ReadableStreamDefaultReader,
     WritableStream, WritableStreamDefaultWriter, DecompressionStream };
   Object.defineProperty(ReadableStream, '__oxiBufferedBytes', { value: true });

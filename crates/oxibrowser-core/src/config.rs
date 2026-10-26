@@ -255,6 +255,11 @@ pub struct BrowserConfig {
     /// host commands. Opt-in for long-running interactive pages; default false.
     #[serde(default)]
     pub background_event_loop: bool,
+
+    /// Allow WebGL2 context creation. Disable for applications that need a
+    /// consistent WebGL1 fallback with the current partial WebGL2 surface.
+    #[serde(default = "default_true")]
+    pub webgl2_enabled: bool,
 }
 
 impl Default for BrowserConfig {
@@ -288,6 +293,7 @@ impl Default for BrowserConfig {
             download_dir: None,
             telemetry: false,
             background_event_loop: false,
+            webgl2_enabled: true,
         }
     }
 }

@@ -7,8 +7,10 @@
 //! `DocumentConfig.font_ctx` (public) carries that context into layout, so the
 //! declared fonts reach Stylo/Taffy text shaping.
 //!
-//! Scope (v1): inline `<style>` `@font-face` only. External `<link>` stylesheets
-//! are not yet fetched/applied (separate gap — the external-stylesheet panic).
+//! Session injection scans both inline styles and fetched initial stylesheets.
+//! External font URLs use their stylesheet's final response URL as the base.
+//! Dynamic stylesheet fetching and recursive network `@import` loading remain
+//! outside the current resource-loading scope.
 
 /// Extract font-file URLs from `@font-face` rules in CSS (or HTML containing
 /// inline `<style>`). Scans each `@font-face { … }` block for `src:` `url(…)`

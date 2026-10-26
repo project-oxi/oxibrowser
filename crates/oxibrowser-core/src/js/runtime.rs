@@ -55,10 +55,12 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 mod background;
+mod base64_api;
 mod binary_streams;
 mod crypto_digest;
 mod dom_properties;
 mod dom_tree;
+pub(crate) mod image;
 mod modules;
 mod native_action;
 mod style_properties;
@@ -617,6 +619,7 @@ enum JsCommand {
         /// @font-face webfont bytes (already fetched) to register into the
         /// RenderDocument's FontContext. Empty = no custom fonts.
         fonts: Vec<Vec<u8>>,
+        stylesheets: oxibrowser_render::PreloadedStylesheets,
         /// Page `<script>` sources to execute after the document is built
         /// (inline + fetched external, in document order). Empty = legacy
         /// behavior (no script execution).
@@ -1120,8 +1123,14 @@ fn capture_png_composed(
     let snap = crate::js::dom_snapshot::DomSnapshot::from_render_document(doc, "", "");
     let html = snap.to_html();
     let vp = opts.viewport.unwrap_or_else(|| doc.viewport());
-    let mut fresh = RenderDocument::from_html(&html, None, vp)
-        .map_err(|e| RenderError::Render(format!("shadow compose reparse failed: {e}")))?;
+    let mut fresh = RenderDocument::from_html_with_resources(
+        &html,
+        Some(doc.base_url()),
+        vp,
+        &[],
+        doc.preloaded_stylesheets(),
+    )
+    .map_err(|e| RenderError::Render(format!("shadow compose reparse failed: {e}")))?;
     fresh.capture_png(opts)
 }
 
@@ -1360,6 +1369,8 @@ pub enum IndexedDbMsg {
 pub struct JsRuntimeConfig {
     /// Run cooperative timer/network/microtask ticks between commands.
     pub background_event_loop: bool,
+    /// Allow WebGL2 contexts; false leaves WebGL1 available.
+    pub webgl2_enabled: bool,
     /// Default timeout in ms for each evaluate() call.
     pub timeout_ms: u64,
     /// Max recursion depth.
@@ -1393,6 +1404,7 @@ impl Default for JsRuntimeConfig {
     fn default() -> Self {
         Self {
             background_event_loop: false,
+            webgl2_enabled: true,
             timeout_ms: 5000,
             max_recursion: 100,
             max_loop_iterations: 100_000,
@@ -1416,6 +1428,7 @@ impl From<&crate::config::BrowserConfig> for JsRuntimeConfig {
     fn from(config: &crate::config::BrowserConfig) -> Self {
         Self {
             background_event_loop: config.background_event_loop,
+            webgl2_enabled: config.webgl2_enabled,
             timeout_ms: config.js_timeout_ms,
             max_recursion: config.js_max_recursion,
             max_loop_iterations: config.js_max_loop_iterations,
@@ -1459,6 +1472,7 @@ pub struct JsRuntime {
     fetch_tx: Option<std::sync::mpsc::Sender<FetchRequestMsg>>,
     /// @font-face webfont bytes staged for the next `SetDocument` (consumed on send).
     pending_fonts: Vec<Vec<u8>>,
+    pending_stylesheets: oxibrowser_render::PreloadedStylesheets,
 }
 
 impl JsRuntime {
@@ -1515,6 +1529,7 @@ impl JsRuntime {
             config,
             fetch_tx: None,
             pending_fonts: Vec::new(),
+            pending_stylesheets: Default::default(),
         }
     }
 
@@ -1523,6 +1538,14 @@ impl JsRuntime {
     /// `<style>` declares `@font-face` rules.
     pub fn set_pending_fonts(&mut self, fonts: Vec<Vec<u8>>) {
         self.pending_fonts = fonts;
+    }
+
+    /// Stage vetted stylesheet response bytes for the next document only.
+    pub fn set_pending_stylesheets(
+        &mut self,
+        stylesheets: oxibrowser_render::PreloadedStylesheets,
+    ) {
+        self.pending_stylesheets = stylesheets;
     }
 
     /// Set the channels for fetch: the request sender and the shared response
@@ -1914,6 +1937,7 @@ impl JsRuntime {
                 base_url: base_url.map(|s| s.to_string()),
                 viewport,
                 fonts: std::mem::take(&mut self.pending_fonts),
+                stylesheets: std::mem::take(&mut self.pending_stylesheets),
                 scripts,
                 nav_loop_limit: self.config.nav_script_max_loop_iterations,
                 nav_recursion_limit: self.config.nav_script_max_recursion,
@@ -2431,6 +2455,8 @@ fn js_thread_loop(
     telemetry: bool,
     config: JsRuntimeConfig,
 ) {
+    #[cfg(feature = "webgl")]
+    crate::js::webgl::set_webgl2_enabled(config.webgl2_enabled);
     let fetch_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>> =
         Arc::new(RwLock::new(None));
     let local_storage_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<LocalStorageMsg>>>> =
@@ -2896,6 +2922,7 @@ fn js_thread_loop(
                     base_url,
                     viewport,
                     fonts,
+                    stylesheets,
                     scripts,
                     nav_loop_limit,
                     nav_recursion_limit,
@@ -2905,6 +2932,7 @@ fn js_thread_loop(
                 } => {
                     background::activate(1, base_url.as_deref().unwrap_or("about:blank"));
                     background::clear_context(1, &job_queue);
+                    image::reset(&mut ctx);
                     for (id, child) in &child_frames {
                         background::clear_context(*id, &child.job_queue);
                     }
@@ -2922,11 +2950,12 @@ fn js_thread_loop(
                         height: viewport.1.max(64),
                         scale: 1.0,
                     };
-                    match RenderDocument::from_html_with_fonts(
+                    match RenderDocument::from_html_with_resources(
                         &html,
                         base_url.as_deref(),
                         vp,
                         &fonts,
+                        &stylesheets,
                     ) {
                         Ok(doc) => {
                             native_document_id =
@@ -5094,91 +5123,12 @@ fn create_context(
         telemetry,
     );
 
-    // --- atob / btoa (Base64) ---
-    let atob_fn = unsafe {
-        NativeFunction::from_closure(move |_this, args, ctx| {
-            let encoded = args
-                .first()
-                .and_then(|v| v.to_string(ctx).ok())
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_default();
-            // Decode base64
-            let decoded = base64::engine::general_purpose::STANDARD.decode(&encoded);
-            match decoded {
-                Ok(bytes) => {
-                    let s = String::from_utf8_lossy(&bytes).to_string();
-                    Ok(JsValue::from(JsString::from(s.as_str())))
-                }
-                Err(_) => {
-                    // Try URL-safe base64
-                    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&encoded);
-                    match decoded {
-                        Ok(bytes) => {
-                            let s = String::from_utf8_lossy(&bytes).to_string();
-                            Ok(JsValue::from(JsString::from(s.as_str())))
-                        }
-                        Err(_) => Ok(JsValue::undefined()),
-                    }
-                }
-            }
-        })
-    };
-    let _ = context.register_global_callable(js_string!("atob"), 1, atob_fn);
-
-    let btoa_fn = unsafe {
-        NativeFunction::from_closure(move |_this, args, ctx| {
-            let decoded = args
-                .first()
-                .and_then(|v| v.to_string(ctx).ok())
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_default();
-            // Encode base64
-            let encoded = base64::engine::general_purpose::STANDARD.encode(decoded.as_bytes());
-            Ok(JsValue::from(JsString::from(encoded.as_str())))
-        })
-    };
-    let _ = context.register_global_callable(js_string!("btoa"), 1, btoa_fn);
+    base64_api::register(&mut context).expect("failed to register Web Base64");
 
     // URL and live URLSearchParams use the Rust URL parser and browser setters.
     url_api::register(&mut context).expect("failed to register browser URL bindings");
 
-    // URL.createObjectURL / revokeObjectURL (static methods on the URL
-    // constructor). Minimal: mints a `blob:` URL; revoke is a no-op.
-    let cou_fn = unsafe {
-        NativeFunction::from_closure(move |_this, _args, _ctx| {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let url = format!("blob:https://oxibrowser.local/{id}");
-            Ok(JsValue::from(JsString::from(url.as_str())))
-        })
-    };
-    let rou_fn =
-        unsafe { NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::undefined())) };
-    let cou_built = FunctionObjectBuilder::new(context.realm(), cou_fn)
-        .name(js_string!("createObjectURL"))
-        .build();
-    let rou_built = FunctionObjectBuilder::new(context.realm(), rou_fn)
-        .name(js_string!("revokeObjectURL"))
-        .build();
-    {
-        let globals = context.global_object().clone();
-        if let Ok(url_val) = globals.get(js_string!("URL"), &mut context)
-            && let Some(url_obj) = url_val.as_object()
-        {
-            let _ = url_obj.set(
-                js_string!("createObjectURL"),
-                JsValue::from(cou_built),
-                true,
-                &mut context,
-            );
-            let _ = url_obj.set(
-                js_string!("revokeObjectURL"),
-                JsValue::from(rou_built),
-                true,
-                &mut context,
-            );
-        }
-    }
+    image::register(&mut context).expect("failed to register image loading");
     // --- crypto.getRandomValues (CSPRNG) ---
     // Supports both JsArray and TypedArray (Uint8Array, Int32Array, etc.)
     // by using object.get("length") + object.set(index, value) directly.
@@ -5731,14 +5681,6 @@ fn create_context(
                 }
             });
         // DOM element shorthand constructors.
-        if (typeof globalThis.Image === 'undefined' && typeof document !== 'undefined') {
-            globalThis.Image = function(w, h) {
-                var img = document.createElement('img');
-                if (w !== undefined) { img.width = w; }
-                if (h !== undefined) { img.height = h; }
-                return img;
-            };
-        }
         if (typeof globalThis.Option === 'undefined' && typeof document !== 'undefined') {
             globalThis.Option = function(text, value, defaultSelected, selected) {
                 var opt = document.createElement('option');
@@ -6637,6 +6579,7 @@ fn create_render_element_object(
                 doc.set_text(node_id, &text);
                 dirty_tcs.store(true, Ordering::Relaxed);
             }
+            image::sweep_connected(_ctx);
             Ok(JsValue::undefined())
         })
     };
@@ -6668,6 +6611,7 @@ fn create_render_element_object(
                 }
                 dirty_ih.store(true, Ordering::Relaxed);
             }
+            image::sweep_connected(ctx);
             Ok(JsValue::undefined())
         })
     };
@@ -7587,6 +7531,10 @@ fn create_render_element_object(
     if let Err(error) = dom_tree::attach(ctx, &obj, render_doc.clone(), node_id, dom_dirty.clone())
     {
         tracing::warn!(%error, "DOM subtree methods failed to attach");
+    }
+
+    if tag.eq_ignore_ascii_case("img") {
+        image::attach(ctx, &obj, node_id);
     }
 
     // Canvas elements get the native WebGL surface (getContext / toDataURL /
@@ -12328,6 +12276,7 @@ fn register_window_globals(
         tracing::warn!(error = %e, "web components bootstrap failed");
     }
     binary_streams::register(ctx).expect("failed to register binary streams");
+    image::mirror_window(ctx);
     xhr::mirror_window(ctx).expect("failed to mirror XMLHttpRequest");
     const FORMDATA_BOOTSTRAP: &str = r#"
 (function () {
@@ -13567,7 +13516,7 @@ mod tests {
         assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
 
         // Decode and confirm real (non-blank) CSS-rendered content.
-        let img = image::load_from_memory(&png).expect("decode captured png");
+        let img = ::image::load_from_memory(&png).expect("decode captured png");
         let rgba = img.to_rgba8();
         let has_red = rgba.pixels().any(|p| p[0] > 200 && p[1] < 80 && p[2] < 80);
         assert!(has_red, "the red .box should be rendered");
@@ -14023,7 +13972,7 @@ mod tests {
             .expect("capture_png should reflect the JS-created element");
 
         assert_eq!(&png[..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
-        let img = image::load_from_memory(&png).expect("decode captured png");
+        let img = ::image::load_from_memory(&png).expect("decode captured png");
         let has_red = img
             .to_rgba8()
             .pixels()
@@ -15152,6 +15101,7 @@ mod tests {
         // Verify custom config is applied
         let config = JsRuntimeConfig {
             background_event_loop: false,
+            webgl2_enabled: true,
             timeout_ms: 1000,
             max_recursion: 10,
             max_loop_iterations: 50,
@@ -16037,7 +15987,7 @@ mod tests {
 
         // Decode and count red pixels — the shadow box. Only present if the
         // compose-then-feed path flattened the shadow subtree before raster.
-        let red = image::load_from_memory(&png)
+        let red = ::image::load_from_memory(&png)
             .expect("decode captured png")
             .to_rgba8()
             .pixels()
@@ -17690,7 +17640,7 @@ mod tests {
         let mut rt = JsRuntime::new();
         let r = rt
             .evaluate(
-                "typeof URL.createObjectURL === 'function' && URL.createObjectURL({}).startsWith('blob:')",
+                "typeof URL.createObjectURL === 'function' && URL.createObjectURL(new Blob([])).startsWith('blob:')",
             )
             .await
             .unwrap();

@@ -35,12 +35,31 @@ Candidate assets used for integration:
 - Shader precision constants used by Babylon's engine capability checks.
 - An explicit CDP response-size setting. Oversized JS fetches reject instead
   of returning truncated bytes that could silently fail asset integrity.
+- Initial external stylesheets retain their original link identity and cascade
+  order. Their vetted HTTP responses reach the renderer through per-document
+  resources, with charset decoding and final response URLs for CSS bases.
+- An opt-in WebGL1 compatibility setting that declines WebGL2 before canvas
+  type pinning, retaining real GLES2 shader compilation and rendering.
+- Actual ANGLE requestable extension activation, including derivative shader
+  support; unsupported extension methods are not advertised as empty objects.
+- Bounded native raster decoding for Image, real Blob URL storage, and image
+  uploads with intrinsic dimensions, flip/premultiply and unpack-state handling.
+  Web Base64 preserves Latin-1 binary bytes instead of replacing invalid UTF-8.
+- Correct GL binding tracking when another canvas is created or resized.
+  Context destruction preserves another canvas's current binding. Construction
+  is guarded against the pinned ANGLE Metal first-context capability race.
 
 Modules still use synchronous network waits on the JS thread. Import maps,
 import attributes, non-HTTP module URLs, anonymous wildcard CDN imports and
 exact async script timing are not implemented. Buffered byte streams have a
 128 MiB limit and omit BYOB, tee, strategies and incremental decompression.
-The partial WebGL2 surface causes the tested Babylon engine to select WebGL1.
+Dynamic stylesheet loading and recursive network CSS imports remain unsupported.
+WebGL2 is partial and remains enabled by default; the tested game uses the
+explicit `--disable-webgl2` setting.
+Image decoding is limited to 16k dimensions and 128 MiB. Image loading supports
+data/Blob URLs and same-origin HTTP; cross-origin images and cross-origin
+redirects are rejected. WebGL image uploads currently support RGB/RGBA UNSIGNED_BYTE;
+ImageBitmap and canvas TexImageSources remain unsupported.
 
 ## Actual-game observations
 
@@ -53,27 +72,59 @@ The opt-in background loop is implemented and independently tested. The
 optimized real-game candidate then reached character initialization, revealing
 missing `AbortSignal.throwIfAborted`; exact-reason and default DOMException
 handling now pass focused tests. A subsequent unmodified-game run remained
-`aria-busy=true` for four minutes and produced a blank capture. Scene readiness
-and visual acceptance therefore **fail** at this checkpoint; input, audio and
-performance remain **unverified**.
+`aria-busy=true` for four minutes and produced a blank capture.
 
-The investigation is focused on an unresolved asset-preparation promise before
-the game's rendering-readiness timeout. Application timer counters stop while
-an independent heartbeat and `performance.now()` continue. Job-queue diagnostics
-have shown a drain cap with zero pending native futures, so dropped native async
-futures are a candidate mechanism, not an established cause of this run. Timer
-exceptions now reach the CDP event sink rather than being silently discarded;
-shader/draw calls have opt-in trace logging.
+The stalled GLTF extension imports were waiting for a CSS preload promise.
+Inlining CSS had removed the original stylesheet link, so Vite created a new
+dynamic link and waited for an unsupported load event. A controlled run restoring
+only the already-downloaded link passed that stage and downloaded character
+accessories. The implementation now preserves and renders the original links;
+it does not synthesize successful resource events.
+
+That controlled run then exposed inconsistent Babylon version detection: its
+engine downgraded a partial WebGL2 context to WebGL1 because query APIs were
+missing, while shader state detected WebGL2 constants and prepended GLSL 300 to
+WebGL1 shaders. A vertex shader failed on the reserved `attribute` keyword.
+Declining WebGL2 requests allows a consistent, real WebGL1 context instead.
+That path exposed disabled optional ANGLE extensions. Genuine extension
+activation resolved the derivative shader compilation error.
+
+The next actual run reached 1,946 scene meshes and 15 compiled, ready effects,
+but timed out during prepareMeshes. Inspection found 93 of 94 textures ready;
+the sole unready texture was the embedded EnvironmentBRDF image. Image loading,
+Blob URL decoding and TexImageSource uploads now pass actual PNG/GPU fixtures.
+The subsequent genuine WebGL1 run passed that image gate and reached PBR
+compilation. Its final fragment source uses `fwidth` in the custom stone
+program at line 909, with no derivative extension directive. ANGLE correctly
+rejects it. The game assets remain unchanged: the next completion condition is
+a genuine WebGL2 path with native queries and uniform buffers, followed by
+scene and movement acceptance. Audio and performance remain **unverified**.
+Timer exceptions reach the CDP event sink; shader/draw calls and original shader
+sources have separate opt-in trace targets.
+
+Parallel native tests isolated a second failure below Boa: the pinned ANGLE
+Metal backend sets its shared capability-initialized flag before filling the
+capabilities. Cold concurrent contexts copied zero precision/viewport limits
+and returned black pixels with GL_NO_ERROR. A standalone native control failed
+cold and passed after prewarming. Guarding construction through its first
+makeCurrent makes the cold parallel regression pass; normal draw calls remain
+independent across contexts.
 
 ## Verification and remaining work
 
-- Full workspace with WebGL, serial: 1,177 passed, 0 failed, 32 ignored. This run
-  preceded the final buffer-cap and AbortSignal/diagnostic refinements.
+- Full workspace with WebGL, serial: 1,213 passed, 0 failed, 34 ignored after
+  the Image and GL capability/lifecycle additions. After the final subtree
+  retention sweep, the core library passed 715 tests with two ignored, and
+  all three forced-GC cases and ten image tests passed.
+- Ten image lifecycle/network tests, a forced-GC connected-image regression,
+  real PNG-to-GPU uploads, cold parallel native context initialization and
+  cross-canvas creation/resize tests passed. Eight GL session tests passed
+  in parallel; binary Latin-1 Base64 checks passed.
 - Final focused checks: 18 module/DOM/URL/hash/AbortSignal, 11 background-loop,
   10 binary-stream, 6 binary-XHR and 3 binary-fetch tests passed. Five existing
   abort-related library tests also passed.
 - Core/render Clippy with all targets, WebGL and warnings denied passed after
-  the timer/GL diagnostic additions; formatting and diff checks passed.
+  these additions; formatting and diff checks passed.
 - Optimized WebGL builds passed. A pre-existing unused Result warning remains
   in the CLI agent world runtime.
 
@@ -110,8 +161,11 @@ cargo clippy -p oxibrowser-core -p oxibrowser-render --features oxibrowser-core/
 For the local retained game, serve its `public` directory over HTTP and start:
 
 ```sh
-oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864
+oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864 --disable-webgl2
 ```
+
+At this checkpoint this WebGL1 diagnostic recipe stops at the custom PBR
+shader. It does not establish playable game support.
 
 `--background-event-loop` is opt-in; MCP/Ghost sessions retain command-driven
 execution. Synchronous native calls and module I/O cannot be preempted at a

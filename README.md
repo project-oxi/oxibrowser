@@ -447,6 +447,18 @@ cannot be used with `--mcp`. The loop uses cooperative task budgets and Boa VM
 limits; synchronous native calls and module network waits can exceed the
 16 ms scheduling target, so this is not a real-time frame guarantee.
 
+The WebGL2 API is partial. Applications that require a consistent WebGL1
+fallback can use `serve --disable-webgl2`: WebGL2 context requests return null,
+and the same canvas can create a real WebGL1 context. WebGL2 stays enabled by
+default; this setting does not add the missing WebGL2 APIs.
+
+Image loading decodes real raster bytes from data/Blob URLs and same-origin
+HTTP, with a 128 MiB decoded limit and 16k dimension limit. Blob URLs retain
+actual branded Blob bytes until revoked or the document is replaced.
+WebGL image uploads support RGB/RGBA UNSIGNED_BYTE with intrinsic dimensions
+and unpack transforms. Cross-origin images, ImageBitmap and canvas image
+sources are not implemented.
+
 ### CDP Protocol (Chrome DevTools Protocol)
 
 12 domain handlers — Puppeteer and Playwright compatible:

@@ -1201,17 +1201,8 @@ impl Session {
 
         tracing::debug!(html_bytes = html.len(), "response decoded");
 
-        // Resolve external <link rel=stylesheet> into a single inline <style>
-        // block so Blitz parses the document once with the rules in place
-        // (and never tries to join hrefs against a `data:`-scheme base URL,
-        // which would panic). The fetch step happens here, before
-        // `Page::from_html` is called, so the post-injection html is what
-        // `page.content()` returns — important because `inject_dom_snapshot`
-        // re-pushes that same html into the JS thread's RenderDocument.
-        let html = self
-            .inline_external_stylesheets(&html, final_url.as_str())
-            .await;
-
+        // Keep original link elements in the transient page DOM. The live
+        // document receives vetted stylesheet bytes during injection below.
         // Create a new page for this navigation (use final URL after redirects)
         let mut page = Page::from_html(final_url.clone(), &html, status, ct_header).await?;
 
@@ -2028,14 +2019,9 @@ impl Session {
             None => return,
         };
 
-        // External <link rel=stylesheet> resolution (W2-pre / §5.2):
-        // Blitz's parser panics when a `<link>` href is joined against a
-        // `data:` base URL (cannot_be_a_base = true → unwrap in blitz-dom).
-        // To avoid that path entirely, we fetch each stylesheet, fold its
-        // rules into an inline `<style>` block, and strip the `<link>` from
-        // the HTML before handing it to `set_document_with_scripts`. The
-        // inline path is already exercised by @font-face rules.
-        let html = self.inline_external_stylesheets(&html, &url).await;
+        // Fetch through core's HTTP policy once, preserving each original
+        // stylesheet link and its place in the cascade for the live renderer.
+        let stylesheets = self.preload_external_stylesheets(&html, &url).await;
 
         // Fetch external (<script src>) bodies in document order, filling each
         // sequential + in-order for Phase 1 (parallel fetch is Phase 3).
@@ -2166,14 +2152,26 @@ impl Session {
             .unwrap_or((self.config.viewport_width, self.config.viewport_height));
         // Load @font-face webfonts declared in inline <style> and stage them for
         // the document build (public-API path via DocumentConfig.font_ctx; no fork).
-        let font_urls = crate::fonts::extract_font_face_urls(&html);
+        let base = Url::parse(&url).ok();
+        let mut font_urls: Vec<Url> = crate::fonts::extract_font_face_urls(&html)
+            .into_iter()
+            .filter_map(|font| base.as_ref()?.join(&font).ok())
+            .collect();
+        for sheet in stylesheets.iter() {
+            let Ok(base) = Url::parse(&sheet.response_url) else {
+                continue;
+            };
+            font_urls.extend(
+                crate::fonts::extract_font_face_urls(&String::from_utf8_lossy(&sheet.body))
+                    .into_iter()
+                    .filter_map(|font| base.join(&font).ok()),
+            );
+        }
+        font_urls.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        font_urls.dedup();
         if !font_urls.is_empty() {
-            let base = Url::parse(&url).ok();
             let mut fonts = Vec::new();
-            for furl in font_urls {
-                let Some(full) = base.as_ref().and_then(|b| b.join(&furl).ok()) else {
-                    continue;
-                };
+            for full in font_urls {
                 if full.scheme() != "http" && full.scheme() != "https" {
                     continue;
                 }
@@ -2190,6 +2188,7 @@ impl Session {
                 self.js_runtime.set_pending_fonts(fonts);
             }
         }
+        self.js_runtime.set_pending_stylesheets(stylesheets);
         if let Err(e) = self
             .js_runtime
             .set_document_with_scripts(&html, Some(&url), viewport, scripts)
@@ -2214,57 +2213,60 @@ impl Session {
         self.js_runtime.set_dom_snapshot(snapshot);
     }
 
-    /// Fetch each `<link rel=stylesheet href=…>`, fold the rules into a single
-    /// inline `<style>` block, and strip the `<link>` tags from `html`. Used by
-    /// [`Self::inject_dom_snapshot`] before handing HTML to Blitz, since Blitz
-    /// cannot resolve `<link>` hrefs against `data:` URLs (panics) and does
-    /// not otherwise fetch external stylesheets on its own.
-    ///
-    /// Failures (bad URL, network error) are logged and skipped — a single
-    async fn inline_external_stylesheets(&self, html: &str, base_url: &str) -> String {
-        use std::sync::atomic::Ordering;
-        let links = external_stylesheet_links(html);
-        tracing::debug!(
-            count = links.len(),
-            base_url,
-            "inline_external_stylesheets: scanning"
-        );
-        let base = match Url::parse(base_url) {
-            Ok(u) => u,
-            Err(_) => return html.to_string(),
+    /// Fetch initial stylesheets through the existing HTTP client (SSRF,
+    /// cookies, request overrides, redirects and response limits included).
+    /// The document owns these bytes; the renderer cannot initiate networking.
+    /// Failed/unsupported links retain their DOM attributes but do not acquire
+    /// fake CSS responses or synthetic load events. Dynamic CSS loading and
+    /// recursive @import fetching remain unsupported.
+    async fn preload_external_stylesheets(
+        &self,
+        html: &str,
+        base_url: &str,
+    ) -> oxibrowser_render::PreloadedStylesheets {
+        let mut loaded = oxibrowser_render::PreloadedStylesheets::default();
+        if self.offline.load(Ordering::Relaxed) {
+            return loaded;
+        }
+        let Ok(base) = Url::parse(base_url) else {
+            return loaded;
         };
-        let mut combined_css = String::new();
-        for href in links {
+        let mut attempted = std::collections::HashSet::new();
+        let overrides = self.snapshot_overrides();
+        for href in external_stylesheet_links_for_document(html, base_url) {
             let Ok(full) = base.join(&href) else { continue };
-            if full.scheme() != "http" && full.scheme() != "https" {
+            if !matches!(full.scheme(), "http" | "https") || !attempted.insert(full.to_string()) {
                 continue;
             }
-            self.in_flight.fetch_add(1, Ordering::Relaxed);
-            let _g = InFlightGuard::new(self.in_flight.clone());
-            tracing::debug!(%full, "fetching external stylesheet");
+            let _in_flight = InFlightGuard::new(self.in_flight.clone());
             match self
                 .http_client
-                .fetch_text_with_overrides(&full, Some(&self.snapshot_overrides()))
+                .fetch_response_with_overrides(&full, Some(&overrides))
                 .await
             {
-                Ok(css) => {
-                    tracing::debug!(bytes = css.len(), %full, "fetched external stylesheet");
-                    if !combined_css.is_empty() {
-                        combined_css.push('\n');
-                    }
-                    combined_css.push_str(&css);
+                Ok(response) if (200..300).contains(&response.status) => {
+                    let content_type = response
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.as_str());
+                    // Match the former fetch_text path: decode authoritative
+                    // HTTP charset metadata before Blitz's UTF-8 CSS boundary.
+                    let body =
+                        crate::encoding::decode_html(&response.body, content_type).into_bytes();
+                    loaded.insert(oxibrowser_render::PreloadedStylesheet {
+                        request_url: full.to_string(),
+                        response_url: response.final_url,
+                        body,
+                    });
                 }
-                Err(e) => {
-                    tracing::warn!(url = %full, error = %e, "failed to fetch external stylesheet")
+                Ok(response) => {
+                    tracing::warn!(url = %full, status = response.status, "stylesheet HTTP failure")
                 }
+                Err(error) => tracing::warn!(url = %full, %error, "stylesheet fetch failed"),
             }
         }
-        let stripped = strip_stylesheet_links(html);
-        if combined_css.is_empty() {
-            return stripped;
-        }
-        tracing::debug!(bytes = combined_css.len(), "injecting inline <style> block");
-        inject_inline_style(&stripped, &combined_css)
+        loaded
     }
 
     /// Build per-frame execution contexts for each **descendant** iframe
@@ -3170,7 +3172,7 @@ fn filename_from_disposition(disposition: &str) -> Option<String> {
 }
 
 // External stylesheet plumbing lives in [`crate::dom_link`].
-use crate::dom_link::{external_stylesheet_links, inject_inline_style, strip_stylesheet_links};
+use crate::dom_link::external_stylesheet_links_for_document;
 
 #[cfg(test)]
 mod tests {
@@ -4252,12 +4254,8 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        // NOTE: the <img> uses an ABSOLUTE url on purpose. blitz-html eagerly
-        // resolves relative sub-resource URLs during parsing against its
-        // placeholder `data:` base URL (RenderDocument::from_html sets the
-        // real base URL only after parsing), so a relative <img src> panics
-        // inside Page::from_html — a pre-existing render-layer bug, unrelated
-        // to the network log. Absolute URLs resolve against any base.
+        // Resource URLs resolve against the document URL during parsing.
+        // Keep this fixture absolute so the request-log assertions are clear.
         let img_url = format!("{}/img.png", server.uri());
         Mock::given(method("GET"))
             .and(path("/"))

@@ -168,6 +168,7 @@ pub fn describe_all(compact: bool) -> CliResponse {
                         "cookie-file": {"type": "string", "description": "Cookie persistence file path"},
                         "max-response-body-bytes": {"type": "int", "minimum": 1, "default": 10485760, "description": "CDP only: maximum HTTP response bytes per resource; raise for large assets. Conflicts with --mcp."},
                         "background-event-loop": {"type": "bool", "default": false, "description": "CDP only: progress timers, network callbacks and animation between commands. Conflicts with --mcp."},
+                        "disable-webgl2": {"type": "bool", "default": false, "description": "CDP only: decline WebGL2 context creation while retaining WebGL1. Conflicts with --mcp."},
                         "allow-private-ips": {"type": "bool", "description": "Disable the SSRF filter (localhost targets)"},
                         "proxy": {"type": "string", "description": "HTTP/HTTPS/SOCKS proxy for all requests"},
                         "auth-token": {"type": "string", "description": "WebSocket auth token (required for non-loopback bind)"},
