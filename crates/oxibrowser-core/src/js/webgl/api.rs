@@ -32,13 +32,13 @@ use boa_engine::{
 use glow::HasContext;
 
 use super::types::{self, CtxKind, ResourceKind};
-use super::{RegistryEntry, props};
+use super::{RegistryEntry, props, with_gl};
 
 /// Hidden prop on the context object carrying the frontend context handle.
 const CTX_HANDLE_PROP: &str = "__webglCtxHandle";
 
-/// Extensions exposed by `getExtension` when ANGLE can enable them. In WebGL2
-/// every one of these is core, so `getExtension` reports `null` there.
+/// WebGL1 extensions exposed when ANGLE can enable them. These are core in
+/// WebGL2. KHR parallel shader compilation is separately supported in both.
 const EXTENSION_ALLOWLIST: &[&str] = &[
     "OES_element_index_uint",
     "OES_standard_derivatives",
@@ -918,6 +918,9 @@ pub(crate) fn add_context_constants(target: &JsObject, kind: CtxKind, cx: &mut C
         for (name, value) in CONSTANTS_WEBGL2 {
             let _ = target.set(JsString::from(*name), JsValue::from(*value), false, cx);
         }
+        for (name, value) in webgl2::CONSTANTS {
+            let _ = target.set(JsString::from(*name), JsValue::from(*value), false, cx);
+        }
     }
 }
 
@@ -930,6 +933,9 @@ pub(crate) fn add_context_constants(target: &JsObject, kind: CtxKind, cx: &mut C
 /// A `GlError` (lost/stale context) makes the method return `undefined`.
 macro_rules! gl_method {
     ($cx:expr, $obj:expr, $name:literal, move |$handle:ident, $entry:ident, $gl:ident, $args:ident, $mcx:ident| $body:expr) => {{
+        gl_method!($cx, $obj, $name, unsigned [], move |$handle, $entry, $gl, $args, $mcx| $body);
+    }};
+    ($cx:expr, $obj:expr, $name:literal, unsigned [$($position:literal),*], move |$handle:ident, $entry:ident, $gl:ident, $args:ident, $mcx:ident| $body:expr) => {{
         // The unsafe context must NOT lexically wrap the closure body
         // (edition 2024 closures inherit it): inner glow calls keep their own
         // explicit `unsafe` blocks this way.
@@ -938,6 +944,20 @@ macro_rules! gl_method {
                 let Some($handle) = this_handle(this, cx) else {
                     return Ok(JsValue::undefined());
                 };
+                // Object-to-number conversion can run user code. Perform it
+                // before borrowing the GL registry, allowing nested GL calls.
+                // Primitive arguments retain the ordinary allocation-free path.
+                let unsigned_positions: &[usize] = &[$($position),*];
+                let mut converted;
+                let args = if unsigned_positions.iter().any(|index| args.get(*index).is_some_and(JsValue::is_object)) {
+                    converted = args.to_vec();
+                    for index in unsigned_positions {
+                        if let Some(value) = converted.get_mut(*index) {
+                            *value = JsValue::from(value.to_u32(cx)?);
+                        }
+                    }
+                    converted.as_slice()
+                } else { args };
                 let out = super::with_gl(
                     $handle,
                     |entry: &mut RegistryEntry, gl: &glow::Context| -> JsResult<JsValue> {
@@ -970,10 +990,15 @@ macro_rules! gl_method {
     }};
 }
 
+mod webgl2;
+
 // ─── Method registration ────────────────────────────────────────────────────
 
 /// Registers the full method surface for `kind` on the context object.
 fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
+    if kind == CtxKind::WebGl2 {
+        webgl2::register(cx, obj);
+    }
     // ── Resource creation ──
     gl_method!(cx, obj, "createShader", move |h, e, gl, args, c| {
         let ty = u32_at(args, 0)?;
@@ -1068,6 +1093,15 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         };
         let native = glow::NativeShader(nz(sh));
         match pname {
+            0x91B1 => {
+                if !e.ctx.parallel_shader_compile_enabled {
+                    e.ctx.push_error(types::INVALID_ENUM);
+                    return Ok(JsValue::null());
+                }
+                Ok(JsValue::from(unsafe {
+                    gl.get_shader_completion_status(native)
+                }))
+            }
             // COMPILE_STATUS
             0x8B81 => Ok(JsValue::from(unsafe {
                 gl.get_shader_compile_status(native)
@@ -1222,6 +1256,15 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         };
         let native = glow::NativeProgram(nz(p));
         match pname {
+            0x91B1 => {
+                if !e.ctx.parallel_shader_compile_enabled {
+                    e.ctx.push_error(types::INVALID_ENUM);
+                    return Ok(JsValue::null());
+                }
+                Ok(JsValue::from(unsafe {
+                    gl.get_program_completion_status(native)
+                }))
+            }
             // LINK_STATUS
             0x8B82 => Ok(JsValue::from(unsafe { gl.get_program_link_status(native) })),
             // VALIDATE_STATUS
@@ -1295,22 +1338,27 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
     gl_method!(cx, obj, "bindBuffer", move |h, e, gl, args, c| {
         let target = u32_at(args, 0)?;
         let v = args.get_or_undefined(1);
-        let native = if v.is_null_or_undefined() {
-            e.ctx.bound_array_buffer = None;
-            e.ctx.bound_element_array_buffer = None;
-            None
+        let (native, id) = if v.is_null_or_undefined() {
+            (None, None)
         } else {
             let Some(b) = resolve_resource(e, h, v, c, ResourceKind::Buffer)? else {
                 return Ok(JsValue::undefined());
             };
             let id = unwrap_wrapper(v, c).map(|x| x.1);
-            match target {
-                glow::ARRAY_BUFFER => e.ctx.bound_array_buffer = id,
-                glow::ELEMENT_ARRAY_BUFFER => e.ctx.bound_element_array_buffer = id,
-                // Unknown targets: forwarded; ANGLE generates GL_INVALID_ENUM.
-                _ => {}
+            if target == glow::UNIFORM_BUFFER && e.kind == CtxKind::WebGl2 {
+                webgl2::remember_buffer(e, v, c)?;
             }
-            Some(glow::NativeBuffer(nz(b)))
+            (Some(glow::NativeBuffer(nz(b))), id)
+        };
+        // Unbinding one target must leave the other target mirrors intact.
+        match target {
+            glow::ARRAY_BUFFER => e.ctx.bound_array_buffer = id,
+            glow::ELEMENT_ARRAY_BUFFER => e.ctx.bound_element_array_buffer = id,
+            glow::UNIFORM_BUFFER if e.kind == CtxKind::WebGl2 => {
+                e.ctx.bound_uniform_buffer = id;
+            }
+            // Unknown targets: forwarded; ANGLE generates GL_INVALID_ENUM.
+            _ => {}
         };
         unsafe { gl.bind_buffer(target, native) };
         Ok(JsValue::undefined())
@@ -2157,12 +2205,20 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
     gl_method!(cx, obj, "drawElements", move |_h, e, gl, args, _c| {
         let (mode, count, ty) = (u32_at(args, 0)?, i32_at(args, 1)?, u32_at(args, 2)?);
         let offset = i32_at(args, 3)?;
-        // WebGL drawElements offsets are element counts; GL wants bytes.
+        // Both WebGL and GLES offsets are bytes, aligned to the index type.
         let Some(elt) = index_type_size(ty) else {
             e.ctx.push_error(types::INVALID_ENUM);
             return Ok(JsValue::undefined());
         };
-        unsafe { gl.draw_elements(mode, count, ty, offset * elt) };
+        if offset < 0 {
+            e.ctx.push_error(types::INVALID_VALUE);
+            return Ok(JsValue::undefined());
+        }
+        if offset % elt != 0 {
+            e.ctx.push_error(types::INVALID_OPERATION);
+            return Ok(JsValue::undefined());
+        }
+        unsafe { gl.draw_elements(mode, count, ty, offset) };
         Ok(JsValue::undefined())
     });
 
@@ -2439,7 +2495,10 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                 .iter()
                 .map(String::as_str)
                 .filter_map(|token| token.strip_prefix("GL_"))
-                .filter(|name| kind == CtxKind::WebGl1 && EXTENSION_ALLOWLIST.contains(name))
+                .filter(|name| {
+                    *name == "KHR_parallel_shader_compile"
+                        || (kind == CtxKind::WebGl1 && EXTENSION_ALLOWLIST.contains(name))
+                })
                 .map(JsString::from)
                 .map(JsValue::from)
                 .collect();
@@ -2449,6 +2508,29 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
     );
     gl_method!(cx, obj, "getExtension", move |_h, e, gl, args, c| {
         let name = str_at(args, 0)?;
+        if name == "KHR_parallel_shader_compile" {
+            if !e
+                .ctx
+                .backend
+                .enable_extension(gl, "GL_KHR_parallel_shader_compile")
+            {
+                return Ok(JsValue::null());
+            }
+            e.ctx.parallel_shader_compile_enabled = true;
+            const CACHE: &str = "__parallelShaderCompileExtension";
+            let cached = e.js.get(JsString::from(CACHE), c)?;
+            if cached.is_object() {
+                return Ok(cached);
+            }
+            let extension = JsObject::with_object_proto(c.intrinsics());
+            extension.create_data_property_or_throw(
+                js_string!("COMPLETION_STATUS_KHR"),
+                0x91B1,
+                c,
+            )?;
+            e.js.create_data_property_or_throw(JsString::from(CACHE), extension.clone(), c)?;
+            return Ok(extension.into());
+        }
         // WEBGL_debug_renderer_info always exists (Chrome always exposes it);
         // it carries the UNMASKED_* constants.
         if name == "WEBGL_debug_renderer_info" {
@@ -2516,6 +2598,10 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
         if e.ctx.bound_element_array_buffer == id {
             e.ctx.bound_element_array_buffer = None;
         }
+        if e.ctx.bound_uniform_buffer == id {
+            e.ctx.bound_uniform_buffer = None;
+        }
+        webgl2::forget(e, id, c)?;
         Ok(JsValue::undefined())
     });
     gl_method!(cx, obj, "deleteTexture", move |_h, e, gl, args, c| {
@@ -2676,9 +2762,15 @@ fn register_methods(cx: &mut Context, obj: &JsObject, kind: CtxKind) {
                     e.ctx.push_error(types::INVALID_ENUM);
                     return Ok(JsValue::undefined());
                 };
-                unsafe {
-                    gl.draw_elements_instanced(mode, count, ty, offset * elt, instance_count)
-                };
+                if offset < 0 {
+                    e.ctx.push_error(types::INVALID_VALUE);
+                    return Ok(JsValue::undefined());
+                }
+                if offset % elt != 0 {
+                    e.ctx.push_error(types::INVALID_OPERATION);
+                    return Ok(JsValue::undefined());
+                }
+                unsafe { gl.draw_elements_instanced(mode, count, ty, offset, instance_count) };
                 Ok(JsValue::undefined())
             }
         );
@@ -2804,6 +2896,11 @@ fn get_parameter_value(
     pname: u32,
     cx: &mut Context,
 ) -> JsValue {
+    if entry.kind == CtxKind::WebGl2
+        && let Some(value) = webgl2::parameter(entry, gl, pname, cx)
+    {
+        return value;
+    }
     let fctx = &mut entry.ctx;
     match pname {
         // Binding mirrors (frontend resource ids → wrappers).

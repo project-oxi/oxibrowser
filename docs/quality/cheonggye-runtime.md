@@ -48,14 +48,20 @@ Candidate assets used for integration:
 - Correct GL binding tracking when another canvas is created or resized.
   Context destruction preserves another canvas's current binding. Construction
   is guarded against the pinned ANGLE Metal first-context capability race.
+- Native WebGL2 queries, uniform-buffer binding/reflection and depth comparison
+  constants keep Babylon on the genuine WebGL2 shader path. Indexed draws use
+  byte offsets for all index widths, including instanced draws.
+- KHR_parallel_shader_compile activates real ANGLE compiler workers and exposes
+  native shader/program completion. Babylon selects its asynchronous pipeline.
 
 Modules still use synchronous network waits on the JS thread. Import maps,
 import attributes, non-HTTP module URLs, anonymous wildcard CDN imports and
 exact async script timing are not implemented. Buffered byte streams have a
 128 MiB limit and omit BYOB, tee, strategies and incremental decompression.
 Dynamic stylesheet loading and recursive network CSS imports remain unsupported.
-WebGL2 is partial and remains enabled by default; the tested game uses the
-explicit `--disable-webgl2` setting.
+WebGL2 is partial and remains enabled by default. Query availability uses native
+completion without browser task-boundary snapshots. Unimplemented WebGL2 groups
+such as MSAA/MRT/3D textures remain outside this increment.
 Image decoding is limited to 16k dimensions and 128 MiB. Image loading supports
 data/Blob URLs and same-origin HTTP; cross-origin images and cross-origin
 redirects are rejected. WebGL image uploads currently support RGB/RGBA UNSIGNED_BYTE;
@@ -96,9 +102,20 @@ Blob URL decoding and TexImageSource uploads now pass actual PNG/GPU fixtures.
 The subsequent genuine WebGL1 run passed that image gate and reached PBR
 compilation. Its final fragment source uses `fwidth` in the custom stone
 program at line 909, with no derivative extension directive. ANGLE correctly
-rejects it. The game assets remain unchanged: the next completion condition is
-a genuine WebGL2 path with native queries and uniform buffers, followed by
-scene and movement acceptance. Audio and performance remain **unverified**.
+rejects it. Native query/UBO support now keeps Babylon on WebGL2 and compiles
+those shaders correctly. The retained Engine fixture reports version 2 and GL
+error 0. Its default Mac Chrome driver workaround disables UBO usage; independent
+UBO tests verify actual GPU updates.
+
+The next real runs, including genuine parallel compilation, still exceeded the
+45-second readiness deadline. All 34 shared effects and all textures were ready,
+but the first readiness sweep had not reached a render (render ID 0). A controlled
+recreation of an actual PBR effect took 1,891 ms to dispatch and 1,912 ms to
+complete. Native samples put 338 of 408 JS-thread samples in Boa String.split /
+StringIndexOf: its Windows iterator repeatedly skips the whole prefix rather
+than jumping to the requested offset. A bounded string-library optimization is
+the next step before scene and movement acceptance. Audio and frame-rate
+performance remain **unverified**; game sources and assets are unchanged.
 Timer exceptions reach the CDP event sink; shader/draw calls and original shader
 sources have separate opt-in trace targets.
 
@@ -127,6 +144,16 @@ independent across contexts.
   these additions; formatting and diff checks passed.
 - Optimized WebGL builds passed. A pre-existing unused Result warning remains
   in the CLI agent world runtime.
+- Native WebGL2 GPU/query/UBO tests, the parallel-compiler test in both context
+  versions, nonzero-offset draws and serial existing GL tests pass. The retained
+  Babylon fixture uses its real async pipeline and completes a synthetic tiny
+  effect callback; this is not a game startup or frame-rate result.
+
+Parallel controls remain non-green: the pre-existing two-canvas screenshot
+fixture can retain an earlier color, and an occlusion result can be zero in a
+concurrent run. Isolated/serial controls pass; expectations remain unchanged.
+The native cold-capability race fix does not establish general parallel GPU
+isolation. These failures remain separate follow-up evidence.
 
 A separate module-concurrency regression reproduced loss of 207 native
 continuations after 1,000 productive passes. The executor now yields unstarted
@@ -161,11 +188,12 @@ cargo clippy -p oxibrowser-core -p oxibrowser-render --features oxibrowser-core/
 For the local retained game, serve its `public` directory over HTTP and start:
 
 ```sh
-oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864 --disable-webgl2
+oxibrowser serve --allow-private-ips --background-event-loop --max-response-body-bytes 67108864
 ```
 
-At this checkpoint this WebGL1 diagnostic recipe stops at the custom PBR
-shader. It does not establish playable game support.
+At this checkpoint readiness still fails. Adding `--disable-webgl2` is a
+diagnostic fallback that stops at the custom PBR shader; neither recipe yet
+establishes playable game support.
 
 `--background-event-loop` is opt-in; MCP/Ghost sessions retain command-driven
 execution. Synchronous native calls and module I/O cannot be preempted at a

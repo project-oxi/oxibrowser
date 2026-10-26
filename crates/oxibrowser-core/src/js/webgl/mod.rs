@@ -85,6 +85,9 @@ pub struct FrontContext {
     /// resource ids (`FrontContext.resources` keys), not GL names.
     pub bound_array_buffer: Option<u32>,
     pub bound_element_array_buffer: Option<u32>,
+    pub bound_uniform_buffer: Option<u32>,
+    /// KHR completion pnames become valid only after getExtension succeeds.
+    pub parallel_shader_compile_enabled: bool,
     pub bound_framebuffer: Option<u32>,
     pub bound_renderbuffer: Option<u32>,
     pub bound_texture_2d: Option<u32>,
@@ -107,6 +110,8 @@ impl FrontContext {
             unpack_premultiply: false,
             bound_array_buffer: None,
             bound_element_array_buffer: None,
+            bound_uniform_buffer: None,
+            parallel_shader_compile_enabled: false,
             bound_framebuffer: None,
             bound_renderbuffer: None,
             bound_texture_2d: None,

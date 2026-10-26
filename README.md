@@ -452,6 +452,11 @@ fallback can use `serve --disable-webgl2`: WebGL2 context requests return null,
 and the same canvas can create a real WebGL1 context. WebGL2 stays enabled by
 default; this setting does not add the missing WebGL2 APIs.
 
+The WebGL2 subset includes native uniform-buffer binding and occlusion queries.
+KHR_parallel_shader_compile uses actual ANGLE worker compilation and completion
+status in WebGL1 and WebGL2. Query availability uses native timing; browser task
+snapshots and the remaining unimplemented WebGL2 groups are not provided.
+
 Image loading decodes real raster bytes from data/Blob URLs and same-origin
 HTTP, with a 128 MiB decoded limit and 16k dimension limit. Blob URLs retain
 actual branded Blob bytes until revoked or the document is replaced.
