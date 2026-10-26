@@ -75,8 +75,9 @@ impl TokioJobQueue {
     /// Async jobs borrow the drain's Context cell, so started futures cannot
     /// safely outlive that drain. Leave unstarted jobs queued at the budget
     /// boundary; when one reaches the front, use the existing cooperative
-    /// executor unchanged. That drain can exceed the ordinary tick budget,
-    /// and retains its documented 1,000-pass pending-future limitation.
+    /// executor. That drain can exceed the ordinary tick budget while its
+    /// local futures make progress, and retains the documented external-wait
+    /// limitation after 1,000 consecutive passes without progress.
     pub(crate) fn run_background_jobs(
         self: &Rc<Self>,
         context: &mut Context,
@@ -256,19 +257,38 @@ impl TokioJobQueue {
     /// - awaiting the poll suspends forever when the future pends on an
     ///   external event.
     ///
-    /// Hence: non-blocking poll + no-op waker + pass cap. Past the cap,
-    /// incomplete futures are dropped (continuation lost — the same visible
-    /// outcome as the pre-upgrade hang, minus the hang).
+    /// Hence: non-blocking poll + no-op waker. Ordinary job volume yields
+    /// unstarted work only when no local async futures are alive. A separate
+    /// no-progress cap retains the existing external-wait limitation: these
+    /// futures borrow `cell` and cannot outlive this drain. It must never drop
+    /// live continuations merely because a productive graph exceeds a budget.
     fn drain_jobs(self: &Rc<Self>, context: &mut Context) -> JsResult<()> {
         use futures::stream::{FuturesUnordered, StreamExt};
         let cell = RefCell::new(context);
         let mut async_jobs: FuturesUnordered<_> = FuturesUnordered::new();
-        let mut passes = 0u32;
+        const JOB_BUDGET: usize = 1_000;
+        const NO_PROGRESS_LIMIT: u32 = 1_000;
+        let mut work = 0usize;
+        let mut no_progress = 0u32;
 
         loop {
-            // Classify whatever enqueue_job queued since the last pass.
-            let queued: Vec<Job> = self.microtasks.borrow_mut().drain(..).collect();
-            for job in queued {
+            let mut progressed = false;
+            // Keep the FIFO batch boundary, but leave unstarted jobs in the
+            // queue when yielding. A drained temporary Vec would lose them.
+            let queued = self.microtasks.borrow().len();
+            for _ in 0..queued {
+                if work >= JOB_BUDGET && async_jobs.is_empty() {
+                    tracing::debug!(
+                        queued = self.microtasks.borrow().len(),
+                        "job drain work budget reached; yielding queued jobs"
+                    );
+                    return Ok(());
+                }
+                let Some(job) = self.microtasks.borrow_mut().pop_front() else {
+                    break;
+                };
+                progressed = true;
+                work = work.saturating_add(1);
                 if is_async_job(&job) {
                     let Job::AsyncJob(a) = job else {
                         unreachable!("is_async_job guarantees AsyncJob here");
@@ -285,26 +305,34 @@ impl TokioJobQueue {
                 return Ok(());
             }
 
-            passes += 1;
-            if passes > 1_000 {
-                tracing::debug!(
-                    pending = async_jobs.len(),
-                    "async job drain pass cap reached; dropping incomplete continuations"
-                );
-                return Ok(());
-            }
-
             // One non-blocking poll of the async jobs; anything they enqueue
             // (promise jobs, more async jobs) is drained on the next pass.
             let waker = std::task::Waker::noop();
             let mut cx = std::task::Context::from_waker(waker);
             let mut next = async_jobs.next();
-            if let std::task::Poll::Ready(Some(Err(err))) =
-                std::pin::Pin::new(&mut next).poll(&mut cx)
-            {
-                tracing::warn!(error = %err, "asynchronous JavaScript job failed; clearing pending microtasks");
-                self.microtasks.borrow_mut().clear();
-                return Err(err);
+            match std::pin::Pin::new(&mut next).poll(&mut cx) {
+                std::task::Poll::Ready(Some(Ok(_))) => progressed = true,
+                std::task::Poll::Ready(Some(Err(err))) => {
+                    tracing::warn!(error = %err, "asynchronous JavaScript job failed; clearing pending microtasks");
+                    self.microtasks.borrow_mut().clear();
+                    return Err(err);
+                }
+                _ => {}
+            }
+            // Polling can itself enqueue a dependency without completing the
+            // awaiting async job. That is productive work, not an idle wait.
+            progressed |= !self.microtasks.borrow().is_empty();
+            if progressed {
+                no_progress = 0;
+            } else {
+                no_progress += 1;
+                if no_progress > NO_PROGRESS_LIMIT {
+                    tracing::warn!(
+                        pending = async_jobs.len(),
+                        "async job drain made no progress; dropping externally pending continuations"
+                    );
+                    return Ok(());
+                }
             }
         }
     }

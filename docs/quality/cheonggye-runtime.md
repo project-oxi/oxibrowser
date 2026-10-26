@@ -77,10 +77,19 @@ shader/draw calls have opt-in trace logging.
 - Optimized WebGL builds passed. A pre-existing unused Result warning remains
   in the CLI agent world runtime.
 
-The existing native async executor still drops unfinished futures after its
-1,000-pass limit. Individual native calls and cooperative async drains may
-exceed the background loop's ordinary task budget. These are explicit limits,
-not a promise of full browser scheduling or frame-rate parity.
+A separate module-concurrency regression reproduced loss of 207 native
+continuations after 1,000 productive passes. The executor now yields unstarted
+jobs only when no local native futures remain, and counts consecutive lack of
+progress separately. Fixed 32-root graphs with and without top-level await,
+plus a 25,000-Promise responsiveness fixture, pass. Retained shader/glTF import
+controls pass too, but passed before this correction and do not establish the
+game's readiness.
+
+The native executor's borrowed futures still cannot survive an indefinitely
+external wait; its 1,000-consecutive-no-progress guard remains explicit.
+Individual native calls and cooperative async drains may exceed the background
+loop's ordinary task budget. These are limits, not a promise of full browser
+scheduling or frame-rate parity.
 
 Earlier workspace runs timed out in the Ghost handoff cancellation fixture.
 A native stack sample showed the child stalled writing agent stdout before
