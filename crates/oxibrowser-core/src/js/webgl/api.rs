@@ -635,6 +635,12 @@ const CONSTANTS: &[(&str, f64)] = &[
     ("VERTEX_SHADER", 0x8B31 as f64),
     ("FRAGMENT_SHADER", 0x8B30 as f64),
     ("SHADER_TYPE", 0x8B4F as f64),
+    ("LOW_FLOAT", glow::LOW_FLOAT as f64),
+    ("MEDIUM_FLOAT", glow::MEDIUM_FLOAT as f64),
+    ("HIGH_FLOAT", glow::HIGH_FLOAT as f64),
+    ("LOW_INT", glow::LOW_INT as f64),
+    ("MEDIUM_INT", glow::MEDIUM_INT as f64),
+    ("HIGH_INT", glow::HIGH_INT as f64),
     ("MAX_VERTEX_TEXTURE_IMAGE_UNITS", 0x8B4C as f64),
     ("MAX_COMBINED_TEXTURE_IMAGE_UNITS", 0x8B4D as f64),
     ("MAX_TEXTURE_IMAGE_UNITS", 0x8872 as f64),
@@ -900,6 +906,15 @@ macro_rules! gl_method {
                         $body
                     },
                 );
+                if matches!($name, "createShader" | "compileShader" | "linkProgram" | "getShaderParameter" | "getProgramParameter" | "drawElements" | "drawArrays") {
+                    tracing::trace!(
+                        method = $name,
+                        context = $handle,
+                        parameter = ?args.get(1).and_then(JsValue::as_number),
+                        result = ?out.as_ref().ok().and_then(|result| result.as_ref().ok()).and_then(JsValue::as_boolean),
+                        "WebGL shader/draw call"
+                    );
+                }
                 match out {
                     Ok(v) => v,
                     // Lost/stale context: silently no-op (WebGL spec).

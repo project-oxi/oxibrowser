@@ -64,6 +64,33 @@ async fn session_with(html: &str) -> Session {
     session
 }
 
+#[tokio::test]
+async fn webgl_shader_precision_capability_queries_have_valid_enums() {
+    let mut session = session_with("<canvas id='gl'></canvas>").await;
+    let result=session.evaluate_js(r#"(() => {
+      const gl=document.getElementById('gl').getContext('webgl');
+      const formats=['LOW_FLOAT','MEDIUM_FLOAT','HIGH_FLOAT','LOW_INT','MEDIUM_INT','HIGH_INT'];
+      const results=formats.map(name=>({name,value:gl[name],
+        shaders:[gl.VERTEX_SHADER,gl.FRAGMENT_SHADER].map(shader=>{
+          const result=gl.getShaderPrecisionFormat(shader,gl[name]);
+          return result&&{precision:result.precision,rangeMin:result.rangeMin,rangeMax:result.rangeMax};
+        })}));
+      const error=gl.getError();
+      globalThis.__precisionProbe=JSON.stringify({results,error});
+      return results.every(result=>typeof result.value==='number'&&result.shaders.every(format=>
+        format&&Number.isFinite(format.precision)&&Number.isFinite(format.rangeMin)&&Number.isFinite(format.rangeMax)))&&error===gl.NO_ERROR;
+    })()"#).await.unwrap();
+    let probe = session
+        .evaluate_js("globalThis.__precisionProbe")
+        .await
+        .unwrap();
+    assert_eq!(
+        result.value,
+        Some(serde_json::json!(true)),
+        "{result:?}; {probe:?}"
+    );
+}
+
 const TRIANGLE_HTML: &str = r##"<!doctype html>
 <html><head><style>
   body { margin: 0; }

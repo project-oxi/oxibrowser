@@ -3573,6 +3573,7 @@ dependencies = [
  "chrono",
  "criterion",
  "encoding_rs",
+ "flate2",
  "futures",
  "getrandom 0.3.4",
  "glow",
@@ -3640,6 +3641,7 @@ dependencies = [
  "png 0.18.1",
  "printpdf",
  "stylo",
+ "stylo_traits",
  "thiserror 2.0.21",
  "tracing",
 ]

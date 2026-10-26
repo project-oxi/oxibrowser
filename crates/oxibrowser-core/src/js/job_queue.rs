@@ -1,7 +1,7 @@
 //! Custom JobQueue for boa_engine that enables async operations and timer support.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -26,6 +26,7 @@ pub struct TokioJobQueue {
     microtasks: RefCell<VecDeque<Job>>,
     timers: RefCell<Vec<TimerEntry>>,
     next_timer_id: RefCell<u64>,
+    active_timer_ids: RefCell<HashSet<u64>>,
 }
 
 impl TokioJobQueue {
@@ -34,6 +35,7 @@ impl TokioJobQueue {
             microtasks: RefCell::new(VecDeque::new()),
             timers: RefCell::new(Vec::new()),
             next_timer_id: RefCell::new(1),
+            active_timer_ids: RefCell::new(HashSet::new()),
         }
     }
 
@@ -49,6 +51,48 @@ impl TokioJobQueue {
             .borrow_mut()
             .extract_if(.., |t| t.deadline <= now)
             .collect()
+    }
+
+    /// Take a finite due batch, leaving remaining timers queued for a later tick.
+    pub(crate) fn pop_due_timers_bounded(&self, limit: usize) -> Vec<TimerEntry> {
+        let now = Instant::now();
+        let mut timers = self.timers.borrow_mut();
+        let count = timers
+            .iter()
+            .take(limit)
+            .take_while(|t| t.deadline <= now)
+            .count();
+        timers.drain(..count).collect()
+    }
+
+    /// A replaced document must not inherit its predecessor's promise jobs.
+    pub(crate) fn clear(&self) {
+        self.clear_all_timers();
+        self.microtasks.borrow_mut().clear();
+    }
+
+    /// Cooperative idle tick. Work left in the queue is resumed next tick.
+    /// Async jobs borrow the drain's Context cell, so started futures cannot
+    /// safely outlive that drain. Leave unstarted jobs queued at the budget
+    /// boundary; when one reaches the front, use the existing cooperative
+    /// executor unchanged. That drain can exceed the ordinary tick budget,
+    /// and retains its documented 1,000-pass pending-future limitation.
+    pub(crate) fn run_background_jobs(
+        self: &Rc<Self>,
+        context: &mut Context,
+        limit: usize,
+    ) -> JsResult<()> {
+        for _ in 0..limit {
+            let Some(job) = self.microtasks.borrow_mut().pop_front() else {
+                return Ok(());
+            };
+            if is_async_job(&job) {
+                self.microtasks.borrow_mut().push_front(job);
+                return self.drain_jobs(context);
+            }
+            call_sync_job(job, context)?;
+        }
+        Ok(())
     }
 
     /// Schedule a new timer. Returns the timer ID.
@@ -73,6 +117,7 @@ impl TokioJobQueue {
         };
 
         self.timers.borrow_mut().push(entry);
+        self.active_timer_ids.borrow_mut().insert(id);
         // Sort by deadline ascending
         self.timers.borrow_mut().sort_by_key(|t| t.deadline);
         id
@@ -80,15 +125,38 @@ impl TokioJobQueue {
 
     /// Cancel a timer by ID.
     pub fn cancel_timer(&self, timer_id: u64) -> bool {
+        let existed = self.active_timer_ids.borrow_mut().remove(&timer_id);
         let mut timers = self.timers.borrow_mut();
-        let len_before = timers.len();
         timers.retain(|t| t.id != timer_id);
-        timers.len() != len_before
+        existed
+    }
+
+    pub(crate) fn timer_is_active(&self, timer_id: u64) -> bool {
+        self.active_timer_ids.borrow().contains(&timer_id)
+    }
+
+    /// Complete a popped callback, preserving an interval's public ID. The
+    /// active set also records cancellation while a callback is in flight;
+    /// completed/cancelled IDs are removed rather than accumulating tombstones.
+    pub(crate) fn complete_timer(&self, mut timer: TimerEntry, rearm: bool) {
+        if !self.timer_is_active(timer.id) {
+            return;
+        }
+        if !timer.is_interval || !rearm {
+            self.active_timer_ids.borrow_mut().remove(&timer.id);
+            return;
+        }
+        timer.deadline = Instant::now()
+            + std::time::Duration::from_millis(timer.interval_ms.unwrap_or(0).max(1));
+        let mut timers = self.timers.borrow_mut();
+        timers.push(timer);
+        timers.sort_by_key(|t| t.deadline);
     }
 
     /// Clear all timers (used on context reset).
     pub fn clear_all_timers(&self) {
         self.timers.borrow_mut().clear();
+        self.active_timer_ids.borrow_mut().clear();
     }
 
     /// Number of pending timers.
@@ -207,6 +275,7 @@ impl TokioJobQueue {
                     };
                     async_jobs.push(Box::pin(a.call(&cell)));
                 } else if let Err(err) = call_sync_job(job, *cell.borrow_mut()) {
+                    tracing::warn!(error = %err, "JavaScript job failed; clearing pending microtasks");
                     self.microtasks.borrow_mut().clear();
                     return Err(err);
                 }
@@ -233,6 +302,7 @@ impl TokioJobQueue {
             if let std::task::Poll::Ready(Some(Err(err))) =
                 std::pin::Pin::new(&mut next).poll(&mut cx)
             {
+                tracing::warn!(error = %err, "asynchronous JavaScript job failed; clearing pending microtasks");
                 self.microtasks.borrow_mut().clear();
                 return Err(err);
             }

@@ -231,8 +231,9 @@ pub struct BrowserConfig {
     pub clear_cookies_on_close: bool,
 
     /// Maximum HTTP response body size in bytes (default 10 MiB).
-    /// Responses larger than this are truncated at the limit; truncation is
-    /// logged but not treated as an error.
+    /// Oversized JS fetch responses fail instead of exposing corrupted bytes.
+    /// Document/navigation text and convenience reads are truncated at the
+    /// limit with a warning.
     #[serde(default = "default_max_response_body")]
     pub max_response_body_bytes: usize,
 
@@ -249,6 +250,11 @@ pub struct BrowserConfig {
     /// fetch `--json` `meta.api_gaps`로 집계된다. 기본값 `false`.
     #[serde(default)]
     pub telemetry: bool,
+
+    /// Keep timers, network callbacks and animation frames progressing between
+    /// host commands. Opt-in for long-running interactive pages; default false.
+    #[serde(default)]
+    pub background_event_loop: bool,
 }
 
 impl Default for BrowserConfig {
@@ -281,6 +287,7 @@ impl Default for BrowserConfig {
             max_response_body_bytes: default_max_response_body(),
             download_dir: None,
             telemetry: false,
+            background_event_loop: false,
         }
     }
 }

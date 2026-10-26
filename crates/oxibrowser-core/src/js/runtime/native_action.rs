@@ -155,30 +155,25 @@ pub(super) fn pump(
             .run_bounded_jobs(ctx, budget)
             .map_err(|_| failed("NATIVE_JOB_FAILED_OR_LIMIT", true))?;
         budget -= jobs;
-        let due = queue.pop_due_timers();
-        if due.is_empty() {
-            return Ok(());
-        }
-        for timer in due {
-            if budget == 0 || start.elapsed() > Duration::from_millis(500) {
+        if budget == 0 || start.elapsed() > Duration::from_millis(500) {
+            if queue
+                .next_timer_deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
                 return Err(failed("NATIVE_JOB_FAILED_OR_LIMIT", true));
             }
-            budget -= 1;
-            timer
-                .callback
-                .call(&JsValue::undefined(), &timer.args, ctx)
-                .map_err(|_| failed("NATIVE_JOB_FAILED_OR_LIMIT", true))?;
-            if timer.is_interval {
-                let ms = timer.interval_ms.unwrap_or(1).max(1);
-                queue.schedule_timer(
-                    Instant::now() + Duration::from_millis(ms),
-                    timer.callback,
-                    timer.args,
-                    true,
-                    Some(ms),
-                );
-            }
+            return Ok(());
         }
+        let Some(timer) = queue.pop_due_timers_bounded(1).pop() else {
+            return Ok(());
+        };
+        if !queue.timer_is_active(timer.id) {
+            continue;
+        }
+        budget -= 1;
+        let result = timer.callback.call(&JsValue::undefined(), &timer.args, ctx);
+        queue.complete_timer(timer, result.is_ok());
+        result.map_err(|_| failed("NATIVE_JOB_FAILED_OR_LIMIT", true))?;
     }
 }
 

@@ -405,20 +405,47 @@ Powered by [`boa_engine`](https://boajs.dev/) — pure Rust, no V8 dependency:
 | `element.cloneNode` / `remove()` | ✅ Full |
 | `element.style` (CSSStyleDeclaration) | ✅ Property accessor |
 | `element.classList` (DOMTokenList) | ✅ Property accessor |
+| `element.dataset` / `getAttributeNames` | ✅ Live attribute reads, writes, deletion and enumeration |
 | `element.textContent` / `innerHTML` | ✅ Read/Write |
 | `element.addEventListener` / `dispatchEvent` | ✅ Full |
 | `element.click()` | ✅ With event handlers |
-| `fetch()` | ✅ Full (channel bridge) |
+| `fetch()` | ✅ Channel bridge with UTF-8 text/JSON and byte-preserving `arrayBuffer()` |
 | `XMLHttpRequest` | ✅ Full with callbacks |
 | `localStorage` | ✅ Persistent |
 | `MutationObserver` | ✅ observe/disconnect/takeRecords |
 | `setTimeout` / `setInterval` | ✅ TokioJobQueue |
 | `console.log/warn/error` | ✅ With formatting |
-| `URL` / `URLSearchParams` | ✅ Full |
-| `crypto.getRandomValues` | ✅ Pseudo-random |
+| `URL` / `URLSearchParams` | ✅ Base URLs, component setters and live query parameters |
+| `crypto.subtle.digest` | ✅ SHA-256 / SHA-384 / SHA-512 over ArrayBuffer and views |
+| `crypto.getRandomValues` | ✅ System random source |
 | `TextEncoder` / `TextDecoder` | ✅ UTF-8 |
+| `Blob` / `Response` byte bodies | ✅ ArrayBuffers, views, UTF-8 text and Blob slices |
+| Byte streams / `DecompressionStream` | ✅ Buffered gzip, deflate and deflate-raw with integrity checks |
 | `atob` / `btoa` | ✅ Base64 |
 | `requestAnimationFrame` | ✅ Polyfill |
+| ES modules | ✅ HTTP(S) imports, dynamic `import()`, `import.meta.url` / `resolve`, top-level await |
+
+Module graphs use a cache per document and the existing network policy. The
+current loader fetches synchronously on the JS thread within navigation or
+evaluation deadlines. Import maps, import attributes and non-HTTP module URLs
+are unsupported. Cross-origin modules require explicit credentialed CORS
+approval; anonymous CDN imports with wildcard approval are not yet supported.
+Async script scheduling remains approximate.
+
+JS fetch rejects responses exceeding the configured body limit. The CDP server
+defaults to 10 MiB per resource; use `serve --max-response-body-bytes 67108864`
+for larger game assets.
+Blob, constructed Response bodies and decompression are buffered with a 128 MiB
+limit. The byte stream subset supports reader/writer locks, cancellation,
+errors and piping; BYOB, tee, stream strategies and incremental decompression
+are unsupported. Network fetch responses still use the existing response
+wrapper rather than these constructed Response streams.
+
+Interactive pages can opt into continuous timer, fetch/WebSocket callback and
+animation progress with `serve --background-event-loop`. It defaults off and
+cannot be used with `--mcp`. The loop uses cooperative task budgets and Boa VM
+limits; synchronous native calls and module network waits can exceed the
+16 ms scheduling target, so this is not a real-time frame guarantee.
 
 ### CDP Protocol (Chrome DevTools Protocol)
 

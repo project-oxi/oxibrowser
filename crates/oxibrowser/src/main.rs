@@ -241,6 +241,13 @@ enum Commands {
         /// Cookie persistence file.
         #[arg(long)]
         cookie_file: Option<String>,
+        /// Maximum HTTP response bytes per resource (default 10 MiB).
+        /// Increase for large assets. Applies to CDP mode only.
+        #[arg(long, conflicts_with = "mcp")]
+        max_response_body_bytes: Option<std::num::NonZeroUsize>,
+        /// Progress timers, network callbacks and animation between CDP commands.
+        #[arg(long, conflicts_with = "mcp")]
+        background_event_loop: bool,
         /// Allow navigation to private/internal IP ranges (disables SSRF filter).
         /// Use for local development only.
         #[arg(long)]
@@ -517,6 +524,8 @@ async fn main() {
             host,
             port,
             cookie_file,
+            max_response_body_bytes,
+            background_event_loop,
             allow_private_ips,
             proxy,
             auth_token,
@@ -554,6 +563,8 @@ async fn main() {
                     allow_private_ips,
                     proxy,
                     auth_token,
+                    max_response_body_bytes.map(std::num::NonZeroUsize::get),
+                    background_event_loop,
                     account.as_deref(),
                     ref_tag.as_deref(),
                     audit_ctx.lock.clone(),
@@ -1653,6 +1664,8 @@ async fn run_serve(
     allow_private_ips: bool,
     proxy: Option<String>,
     auth_token: Option<String>,
+    max_response_body_bytes: Option<usize>,
+    background_event_loop: bool,
     accounts: Option<&str>,
     ref_tag: Option<&str>,
     lock_policy: oxibrowser_core::account::LockPolicy,
@@ -1675,6 +1688,10 @@ async fn run_serve(
     info!(addr = %addr, "starting CDP server");
 
     let mut config = oxibrowser_core::BrowserConfig::headless();
+    config.background_event_loop = background_event_loop;
+    if let Some(max) = max_response_body_bytes {
+        config.max_response_body_bytes = max;
+    }
     if let Some(path) = cookie_file {
         config.cookie_file = Some(std::path::PathBuf::from(path));
     }

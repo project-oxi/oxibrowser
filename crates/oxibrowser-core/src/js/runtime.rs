@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::css::LayoutEngine;
 use crate::error::{CoreError, Result};
-use crate::js::dom_snapshot::{DomMutation, DomNode, DomSnapshot, ScriptSource};
+use crate::js::dom_snapshot::{DomMutation, DomNode, DomSnapshot, ScriptKind, ScriptSource};
 use crate::js::form_activation;
 use crate::js::job_queue::TokioJobQueue;
 use crate::network::cookie::CookieJar;
@@ -54,7 +54,16 @@ use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+mod background;
+mod binary_streams;
+mod crypto_digest;
+mod dom_properties;
+mod dom_tree;
+mod modules;
 mod native_action;
+mod style_properties;
+mod url_api;
+mod xhr;
 pub use native_action::{NativeInput, NativeObservation, NativeReceipt, NativeTarget};
 static NEXT_NATIVE_DOCUMENT: AtomicU64 = AtomicU64::new(1);
 
@@ -167,13 +176,8 @@ enum PendingFetch {
         context_id: u32,
     },
     Xhr {
-        ready_state: Arc<RwLock<f64>>,
-        status: Arc<RwLock<f64>>,
-        resp_body: Arc<RwLock<String>>,
-        resp_hdrs: Arc<RwLock<String>>,
-        onload: Arc<RwLock<Option<JsValue>>>,
-        onerror: Arc<RwLock<Option<JsValue>>>,
-        onrsc: Arc<RwLock<Option<JsValue>>>,
+        object: JsObject,
+        state: JsObject,
         /// Owning execution context (frame).
         context_id: u32,
     },
@@ -741,6 +745,8 @@ pub struct FetchResponseMsg {
     pub headers: Vec<(String, String)>,
     /// Response body text.
     pub body: String,
+    /// Original response bytes. Text-only mock responses may omit these.
+    pub body_bytes: Option<Vec<u8>>,
     /// Error message if request failed.
     pub error: Option<String>,
 }
@@ -1352,6 +1358,8 @@ pub enum IndexedDbMsg {
 /// Configuration for JS runtime limits and timeouts.
 #[derive(Debug, Clone)]
 pub struct JsRuntimeConfig {
+    /// Run cooperative timer/network/microtask ticks between commands.
+    pub background_event_loop: bool,
     /// Default timeout in ms for each evaluate() call.
     pub timeout_ms: u64,
     /// Max recursion depth.
@@ -1384,6 +1392,7 @@ pub struct JsRuntimeConfig {
 impl Default for JsRuntimeConfig {
     fn default() -> Self {
         Self {
+            background_event_loop: false,
             timeout_ms: 5000,
             max_recursion: 100,
             max_loop_iterations: 100_000,
@@ -1406,6 +1415,7 @@ impl Default for JsRuntimeConfig {
 impl From<&crate::config::BrowserConfig> for JsRuntimeConfig {
     fn from(config: &crate::config::BrowserConfig) -> Self {
         Self {
+            background_event_loop: config.background_event_loop,
             timeout_ms: config.js_timeout_ms,
             max_recursion: config.js_max_recursion,
             max_loop_iterations: config.js_max_loop_iterations,
@@ -1471,6 +1481,7 @@ impl JsRuntime {
         let viewport = (config.viewport_width, config.viewport_height);
         let user_agent = config.user_agent.clone();
         let telemetry = config.telemetry;
+        let thread_config = config.clone();
         let _local_storage = Arc::new(RwLock::new(HashMap::<String, String>::new()));
         // JS frames execute on this thread's native stack; boa's RuntimeLimits
         // bound logical recursion but not per-frame native consumption, so a
@@ -1490,6 +1501,7 @@ impl JsRuntime {
                     None,
                     user_agent,
                     telemetry,
+                    thread_config,
                 );
             })
             .expect("failed to spawn JS thread");
@@ -1878,8 +1890,8 @@ impl JsRuntime {
     /// Build the render document AND execute the supplied page `<script>`
     /// sources in document order, then fire `DOMContentLoaded`/`load` and
     /// settle the timer/microtask queue — mirroring a real browser's
-    /// navigation. External scripts must already be fetched (`source` filled);
-    /// entries with an empty `source` and a `src_url` are skipped with a warn.
+    /// navigation. External classic scripts must already be fetched (`source`
+    /// filled); modules are fetched with their graphs by the URL module loader.
     pub async fn set_document_with_scripts(
         &mut self,
         html: &str,
@@ -2168,6 +2180,7 @@ impl Drop for JsRuntime {
 /// main frame's context. The main frame (context_id=1) is NOT stored here —
 /// it lives directly in `js_thread_loop` as `ctx`/`render_doc_cell`.
 struct ChildFrame {
+    url: String,
     ctx: Context,
     job_queue: Rc<TokioJobQueue>,
     render_doc_cell: Rc<RefCell<Option<RenderDocument>>>,
@@ -2310,7 +2323,10 @@ fn run_eval(
     await_promise: bool,
 ) -> EvalOutcome {
     console_output.write().clear();
-    mutations.write().clear();
+    // Pending navigation/form/window-open effects belong to the document,
+    // including effects produced by idle ticks before this evaluation. Only
+    // Session reconciliation or document replacement may clear the journal.
+    let _ = mutations;
 
     let loop_limit = max_loop_iterations.unwrap_or(100_000);
     let recursion_limit = max_recursion.unwrap_or(100);
@@ -2325,6 +2341,9 @@ fn run_eval(
 
     let timeout = timeout_ms.unwrap_or(5000);
     let start = std::time::Instant::now();
+    let _module_deadline = ctx
+        .downcast_module_loader::<modules::WebModuleLoader>()
+        .map(|loader| loader.limit_for(Duration::from_millis(timeout)));
     let result = if source_nesting_exceeds(expression) {
         Err(boa_engine::JsError::from_native(
             boa_engine::JsNativeError::syntax()
@@ -2410,6 +2429,7 @@ fn js_thread_loop(
     _fetch_tx: Option<std::sync::mpsc::Sender<FetchRequestMsg>>,
     user_agent: String,
     telemetry: bool,
+    config: JsRuntimeConfig,
 ) {
     let fetch_tx_arc: Arc<RwLock<Option<std::sync::mpsc::Sender<FetchRequestMsg>>>> =
         Arc::new(RwLock::new(None));
@@ -2450,193 +2470,227 @@ fn js_thread_loop(
     let mut current_page_url = String::new();
     let mut native_document_id = 0;
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            JsCommand::NativeObserve { url, response_tx } => {
-                ACTIVE_CONTEXT_ID.with(|id| id.set(1));
-                let limits = ctx.runtime_limits_mut();
-                limits.set_loop_iteration_limit(100_000);
-                limits.set_recursion_limit(100);
-                limits.set_stack_size_limit(1024);
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    native_action::pump(&mut ctx, &job_queue)?;
-                    if native_action::pending_navigation(&mutations) {
-                        return Err(native_action::Failure {
-                            message: "stale ref — re-observe",
-                            may_have_acted: false,
-                        });
-                    }
-                    let mut guard = render_doc_cell.borrow_mut();
-                    Ok(match guard.as_mut() {
-                        Some(doc) => native_action::observe(doc, native_document_id, &url),
-                        None => NativeObservation::empty(native_document_id),
-                    })
-                }));
-                let response = match outcome {
-                    Ok(Ok(o)) => JsResponse::NativeObservation(Box::new(o)),
-                    Ok(Err(e)) => JsResponse::NativeFailure {
-                        message: e.message.into(),
-                        may_have_acted: e.may_have_acted,
-                    },
-                    Err(_) => JsResponse::NativeFailure {
-                        message: "NATIVE_RUNTIME_PANIC".into(),
-                        may_have_acted: true,
-                    },
-                };
-                let _ = response_tx.send(response);
+    let mut next_tick = Instant::now() + background::INTERVAL;
+    let mut child_cursor = 0usize;
+    loop {
+        background::activate(1, &current_page_url);
+        let cmd = if config.background_event_loop {
+            match cmd_rx.recv_timeout(next_tick.saturating_duration_since(Instant::now())) {
+                Ok(cmd) => Some(cmd),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            JsCommand::NativeAct {
-                target,
-                input,
-                response_tx,
-            } => {
-                ACTIVE_CONTEXT_ID.with(|id| id.set(1));
-                let limits = ctx.runtime_limits_mut();
-                limits.set_loop_iteration_limit(100_000);
-                limits.set_recursion_limit(100);
-                limits.set_stack_size_limit(1024);
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    native_action::pump(&mut ctx, &job_queue)?;
-                    let mut r = native_action::act(
-                        &mut ctx,
-                        &render_doc_cell,
-                        &dom_dirty,
-                        &mutations,
-                        native_document_id,
-                        &target,
-                        input,
-                        &current_page_url,
-                    )?;
-                    native_action::pump(&mut ctx, &job_queue)?;
-                    r.navigation_requested = native_action::pending_navigation(&mutations);
-                    Ok::<_, native_action::Failure>(r)
-                }));
-                let response = match outcome {
-                    Ok(Ok(r)) => JsResponse::NativeReceipt(r),
-                    Ok(Err(e)) => JsResponse::NativeFailure {
-                        message: e.message.into(),
-                        may_have_acted: e.may_have_acted,
-                    },
-                    Err(_) => JsResponse::NativeFailure {
-                        message: "NATIVE_RUNTIME_PANIC".into(),
-                        may_have_acted: true,
-                    },
-                };
-                let _ = response_tx.send(response);
+        } else {
+            match cmd_rx.recv() {
+                Ok(cmd) => Some(cmd),
+                Err(_) => break,
             }
-            JsCommand::Eval {
-                context_id,
-                expression,
-                timeout_ms,
-                max_loop_iterations,
-                max_recursion,
-                max_stack_size,
-                await_promise,
-                response_tx,
-            } => {
-                ACTIVE_CONTEXT_ID.set(context_id);
-
-                // A native binding that panics must not unwind out of this
-                // loop — that killed the JS thread, and every later command
-                // failed with "JS thread has died" (issue #2). Contain the
-                // panic here and answer with a proper error. The context is
-                // deliberately kept: most panics originate in the render-doc
-                // bindings before boa state is touched, and recreating it
-                // would drop all page JS state.
-                let eval_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    if context_id == 1 {
-                        Some(run_eval(
-                            &mut ctx,
-                            &job_queue,
-                            &console_output,
-                            &mutations,
-                            &expression,
-                            timeout_ms,
-                            max_loop_iterations,
-                            max_recursion,
-                            max_stack_size,
-                            await_promise,
-                        ))
-                    } else {
-                        child_frames.get_mut(&context_id).map(|cf| {
-                            run_eval(
-                                &mut cf.ctx,
-                                &cf.job_queue,
-                                &console_output,
-                                &mutations,
-                                &expression,
-                                timeout_ms,
-                                max_loop_iterations,
-                                max_recursion,
-                                max_stack_size,
-                                await_promise,
-                            )
-                        })
-                    }
-                }));
-
-                let outcome = match eval_result {
-                    Ok(Some(outcome)) => outcome,
-                    Ok(None) => {
-                        let _ = response_tx.send(JsResponse::Error {
-                            message: format!("unknown execution context id {context_id}"),
-                        });
-                        ACTIVE_CONTEXT_ID.set(1);
-                        continue;
-                    }
-                    Err(payload) => {
-                        let detail = panic_message(payload.as_ref());
-                        let _ = response_tx.send(JsResponse::Error {
-                            message: format!("native binding panicked during evaluation: {detail}"),
-                        });
-                        ACTIVE_CONTEXT_ID.set(1);
-                        continue;
-                    }
-                };
-
-                match outcome {
-                    EvalOutcome::Response(resp) => {
-                        let _ = response_tx.send(resp);
-                    }
-                    EvalOutcome::TimedOut {
-                        console,
-                        elapsed_ms,
-                    } => {
-                        // Recreate the timed-out context.
-                        if context_id == 1 {
-                            let (new_ctx, new_queue) = create_context(
-                                &console_output,
-                                &dom_snapshot,
-                                &mutations,
-                                &dom_dirty,
-                                viewport,
-                                "",
-                                &effective_user_agent(&user_agent),
-                                &fetch_tx_arc,
-                                &cookie_jar_arc,
-                                &render_doc_cell,
-                                telemetry,
-                            );
-                            ctx = new_ctx;
-                            job_queue = new_queue;
-                        } else if let Some(cf) = child_frames.get_mut(&context_id) {
-                            let (new_ctx, new_queue) = create_context(
-                                &console_output,
-                                &cf.dom_snapshot_arc,
-                                &mutations,
-                                &dom_dirty,
-                                viewport,
-                                "",
-                                &effective_user_agent(&user_agent),
-                                &fetch_tx_arc,
-                                &cookie_jar_arc,
-                                &cf.render_doc_cell,
-                                telemetry,
-                            );
-                            cf.ctx = new_ctx;
-                            cf.job_queue = new_queue;
+        };
+        // A queued command is serviced before a due tick. A stream of commands
+        // still gets one fair tick after each command once the deadline passes.
+        if let Some(cmd) = cmd {
+            match cmd {
+                JsCommand::NativeObserve { url, response_tx } => {
+                    ACTIVE_CONTEXT_ID.with(|id| id.set(1));
+                    let limits = ctx.runtime_limits_mut();
+                    limits.set_loop_iteration_limit(100_000);
+                    limits.set_recursion_limit(100);
+                    limits.set_stack_size_limit(1024);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        native_action::pump(&mut ctx, &job_queue)?;
+                        if native_action::pending_navigation(&mutations) {
+                            return Err(native_action::Failure {
+                                message: "stale ref — re-observe",
+                                may_have_acted: false,
+                            });
                         }
-                        let _ = response_tx.send(JsResponse::EvalResult {
+                        let mut guard = render_doc_cell.borrow_mut();
+                        Ok(match guard.as_mut() {
+                            Some(doc) => native_action::observe(doc, native_document_id, &url),
+                            None => NativeObservation::empty(native_document_id),
+                        })
+                    }));
+                    let response = match outcome {
+                        Ok(Ok(o)) => JsResponse::NativeObservation(Box::new(o)),
+                        Ok(Err(e)) => JsResponse::NativeFailure {
+                            message: e.message.into(),
+                            may_have_acted: e.may_have_acted,
+                        },
+                        Err(_) => JsResponse::NativeFailure {
+                            message: "NATIVE_RUNTIME_PANIC".into(),
+                            may_have_acted: true,
+                        },
+                    };
+                    let _ = response_tx.send(response);
+                }
+                JsCommand::NativeAct {
+                    target,
+                    input,
+                    response_tx,
+                } => {
+                    ACTIVE_CONTEXT_ID.with(|id| id.set(1));
+                    let limits = ctx.runtime_limits_mut();
+                    limits.set_loop_iteration_limit(100_000);
+                    limits.set_recursion_limit(100);
+                    limits.set_stack_size_limit(1024);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        native_action::pump(&mut ctx, &job_queue)?;
+                        let mut r = native_action::act(
+                            &mut ctx,
+                            &render_doc_cell,
+                            &dom_dirty,
+                            &mutations,
+                            native_document_id,
+                            &target,
+                            input,
+                            &current_page_url,
+                        )?;
+                        native_action::pump(&mut ctx, &job_queue)?;
+                        r.navigation_requested = native_action::pending_navigation(&mutations);
+                        Ok::<_, native_action::Failure>(r)
+                    }));
+                    let response = match outcome {
+                        Ok(Ok(r)) => JsResponse::NativeReceipt(r),
+                        Ok(Err(e)) => JsResponse::NativeFailure {
+                            message: e.message.into(),
+                            may_have_acted: e.may_have_acted,
+                        },
+                        Err(_) => JsResponse::NativeFailure {
+                            message: "NATIVE_RUNTIME_PANIC".into(),
+                            may_have_acted: true,
+                        },
+                    };
+                    let _ = response_tx.send(response);
+                }
+                JsCommand::Eval {
+                    context_id,
+                    expression,
+                    timeout_ms,
+                    max_loop_iterations,
+                    max_recursion,
+                    max_stack_size,
+                    await_promise,
+                    response_tx,
+                } => {
+                    let url = if context_id == 1 {
+                        current_page_url.as_str()
+                    } else {
+                        child_frames
+                            .get(&context_id)
+                            .map(|cf| cf.url.as_str())
+                            .unwrap_or("")
+                    };
+                    background::activate(context_id, url);
+
+                    // A native binding that panics must not unwind out of this
+                    // loop — that killed the JS thread, and every later command
+                    // failed with "JS thread has died" (issue #2). Contain the
+                    // panic here and answer with a proper error. The context is
+                    // deliberately kept: most panics originate in the render-doc
+                    // bindings before boa state is touched, and recreating it
+                    // would drop all page JS state.
+                    let eval_result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if context_id == 1 {
+                                Some(run_eval(
+                                    &mut ctx,
+                                    &job_queue,
+                                    &console_output,
+                                    &mutations,
+                                    &expression,
+                                    timeout_ms,
+                                    max_loop_iterations,
+                                    max_recursion,
+                                    max_stack_size,
+                                    await_promise,
+                                ))
+                            } else {
+                                child_frames.get_mut(&context_id).map(|cf| {
+                                    run_eval(
+                                        &mut cf.ctx,
+                                        &cf.job_queue,
+                                        &console_output,
+                                        &mutations,
+                                        &expression,
+                                        timeout_ms,
+                                        max_loop_iterations,
+                                        max_recursion,
+                                        max_stack_size,
+                                        await_promise,
+                                    )
+                                })
+                            }
+                        }));
+
+                    let outcome = match eval_result {
+                        Ok(Some(outcome)) => outcome,
+                        Ok(None) => {
+                            let _ = response_tx.send(JsResponse::Error {
+                                message: format!("unknown execution context id {context_id}"),
+                            });
+                            ACTIVE_CONTEXT_ID.set(1);
+                            continue;
+                        }
+                        Err(payload) => {
+                            let detail = panic_message(payload.as_ref());
+                            let _ = response_tx.send(JsResponse::Error {
+                                message: format!(
+                                    "native binding panicked during evaluation: {detail}"
+                                ),
+                            });
+                            ACTIVE_CONTEXT_ID.set(1);
+                            continue;
+                        }
+                    };
+
+                    match outcome {
+                        EvalOutcome::Response(resp) => {
+                            let _ = response_tx.send(resp);
+                        }
+                        EvalOutcome::TimedOut {
+                            console,
+                            elapsed_ms,
+                        } => {
+                            if context_id == 1 {
+                                background::clear_context(1, &job_queue);
+                            } else if let Some(cf) = child_frames.get(&context_id) {
+                                background::clear_context(context_id, &cf.job_queue);
+                            }
+                            // Recreate the timed-out context.
+                            if context_id == 1 {
+                                let (new_ctx, new_queue) = create_context(
+                                    &console_output,
+                                    &dom_snapshot,
+                                    &mutations,
+                                    &dom_dirty,
+                                    viewport,
+                                    &current_page_url,
+                                    &effective_user_agent(&user_agent),
+                                    &fetch_tx_arc,
+                                    &cookie_jar_arc,
+                                    &render_doc_cell,
+                                    telemetry,
+                                );
+                                ctx = new_ctx;
+                                job_queue = new_queue;
+                            } else if let Some(cf) = child_frames.get_mut(&context_id) {
+                                let (new_ctx, new_queue) = create_context(
+                                    &console_output,
+                                    &cf.dom_snapshot_arc,
+                                    &mutations,
+                                    &dom_dirty,
+                                    viewport,
+                                    &cf.url,
+                                    &effective_user_agent(&user_agent),
+                                    &fetch_tx_arc,
+                                    &cookie_jar_arc,
+                                    &cf.render_doc_cell,
+                                    telemetry,
+                                );
+                                cf.ctx = new_ctx;
+                                cf.job_queue = new_queue;
+                            }
+                            let _ = response_tx.send(JsResponse::EvalResult {
                             value: None,
                             exception: Some(format!(
                                 "JS execution timed out after {elapsed_ms}ms — context was reset, previous state lost"
@@ -2644,474 +2698,529 @@ fn js_thread_loop(
                             console_output: console,
                             timed_out: true,
                         });
+                        }
                     }
+                    ACTIVE_CONTEXT_ID.set(1);
                 }
-                ACTIVE_CONTEXT_ID.set(1);
-            }
-            JsCommand::SetGlobal {
-                name,
-                value,
-                response_tx,
-            } => {
-                let js_val = json_to_js_value(&value, &mut ctx);
-                let _ = ctx.register_global_property(
-                    JsString::from(name.as_str()),
-                    js_val,
-                    Attribute::all(),
-                );
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetDom {
-                snapshot,
-                response_tx,
-            } => {
-                *dom_snapshot.write() = *snapshot;
-                // Update document title/URL in the JS context
-                let snap = dom_snapshot.read();
-                if let Some(ref s) = *snap {
+                JsCommand::SetGlobal {
+                    name,
+                    value,
+                    response_tx,
+                } => {
+                    let js_val = json_to_js_value(&value, &mut ctx);
                     let _ = ctx.register_global_property(
-                        js_string!("__domTitle"),
-                        JsValue::from(JsString::from(s.title.as_str())),
+                        JsString::from(name.as_str()),
+                        js_val,
                         Attribute::all(),
                     );
-                    let _ = ctx.register_global_property(
-                        js_string!("__domUrl"),
-                        JsValue::from(JsString::from(s.url.as_str())),
-                        Attribute::all(),
-                    );
+                    let _ = response_tx.send(JsResponse::Done);
                 }
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetPageUrl {
-                url,
-                seed_storage,
-                seed_idb,
-                response_tx,
-            } => {
-                set_current_origin(&url);
-                current_page_url = url.clone();
-                // Re-register window.location with the new URL
-                let snap = dom_snapshot.read();
-                let dom_snapshot_ref = dom_snapshot.clone();
-                drop(snap);
-                register_window_globals(
-                    &mut ctx,
-                    &dom_snapshot_ref,
-                    &mutations,
-                    viewport,
-                    &url.clone(),
-                    &effective_user_agent(&user_agent),
-                    &fetch_tx_arc,
-                    &render_doc_cell,
-                    telemetry,
-                );
-                // M-A: the seed is the origin-keyed bucket for THIS page,
-                // derived by Session from the shared context map on every
-                // document injection. Always re-register so the JS-side map
-                // mirrors exactly that bucket — cross-origin bleeding is gone
-                // because each navigation swaps in its own origin's storage
-                // (this resolves the former TODO(#sop), which preserved one
-                // flat map across all navigations). Opaque origins
-                // (`about:`, `data:`) key their bucket by the full URL
-                // string (see `storage_origin_of`), so the same opaque URL
-                // revisits its own bucket while different opaque URLs stay
-                // isolated. The origin is
-                // also stamped onto outgoing LocalStorageMsg writes so the
-                // sync thread routes them to THIS bucket even if another
-                // navigation lands before the message is processed.
-                let ls_origin = url::Url::parse(&url)
-                    .map(|u| crate::context::storage_origin_of(&u))
-                    .unwrap_or_else(|_| "null".to_string());
-                register_local_storage(
-                    &mut ctx,
-                    seed_storage.unwrap_or_default(),
-                    &dom_snapshot_ref,
-                    local_storage_tx_arc.clone(),
-                    ls_origin.clone(),
-                );
-                // IndexedDB (item 12): same seeding contract as localStorage —
-                // the origin bucket replaces the JS-side map wholesale.
-                let seed_dbs: std::collections::BTreeMap<String, super::idb::IdbDbState> = seed_idb
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(name, db)| {
-                        (
-                            name,
-                            super::idb::IdbDbState {
-                                version: db.version,
-                                stores: db.stores,
-                                key_paths: db.key_paths,
-                            },
-                        )
-                    })
-                    .collect();
-                let idb_tx = { indexed_db_tx_arc.read().as_ref().cloned() };
-                super::idb::register_indexed_db(
-                    &mut ctx,
-                    seed_dbs,
-                    std::rc::Rc::new(std::cell::RefCell::new(idb_tx)),
-                    ls_origin,
-                );
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetMediaColorScheme { dark, response_tx } => {
-                // Layout/media-query reflection happens at the NEXT document
-                // build: `RenderDocument` construction reads the override
-                // static and bakes it into the viewport, so a live document is
-                // not re-styled. The JS-side flag below takes effect
-                // immediately for `matchMedia` probes.
-                oxibrowser_render::set_color_scheme_override(dark);
-                let _ = ctx.register_global_property(
-                    js_string!("__oxi_prefer_dark"),
-                    JsValue::from(dark.unwrap_or(false)),
-                    Attribute::all(),
-                );
-                tracing::debug!(dark = ?dark, "media color scheme override updated");
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetUserAgent {
-                user_agent: ua_override,
-                response_tx,
-            } => {
-                // Record the override, then re-register the main frame's
-                // window globals so `navigator.userAgent` and the stealth
-                // profile reflect the effective UA immediately. Child-frame
-                // contexts rebuild with the new UA on their next navigation.
-                *USER_AGENT_OVERRIDE.write() = ua_override;
-                let ua = effective_user_agent(&user_agent);
-                set_active_ua(&ua);
-                let dom_snapshot_ref = dom_snapshot.clone();
-                register_window_globals(
-                    &mut ctx,
-                    &dom_snapshot_ref,
-                    &mutations,
-                    viewport,
-                    &current_page_url,
-                    &ua,
-                    &fetch_tx_arc,
-                    &render_doc_cell,
-                    telemetry,
-                );
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetLocalStorageChannel { tx, response_tx } => {
-                *local_storage_tx_arc.write() = Some(tx);
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetIndexedDbChannel { tx, response_tx } => {
-                *indexed_db_tx_arc.write() = Some(tx);
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetFetchChannel {
-                request_tx,
-                response_rx,
-                response_tx,
-            } => {
-                *fetch_tx_arc.write() = Some(request_tx);
-                RESPONSE_RX.with(|cell| *cell.borrow_mut() = Some(response_rx));
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetWsChannel {
-                request_tx,
-                response_rx,
-                response_tx,
-            } => {
-                WS_REQ_TX.with(|cell| *cell.borrow_mut() = Some(request_tx));
-                WS_EVENT_RX.with(|cell| *cell.borrow_mut() = Some(response_rx));
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetCookieJar { jar, response_tx } => {
-                *cookie_jar_arc.write() = Some(jar);
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetEventSink { tx, response_tx } => {
-                EVENT_TX.with(|cell| *cell.borrow_mut() = Some(tx));
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetDialogGate { gate, response_tx } => {
-                DIALOG_GATE.with(|cell| *cell.borrow_mut() = Some(gate));
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::SetDocument {
-                html,
-                base_url,
-                viewport,
-                fonts,
-                scripts,
-                nav_loop_limit,
-                nav_recursion_limit,
-                nav_stack_limit,
-                nav_timeout_ms,
-                response_tx,
-            } => {
-                // The base_url (document URL) drives the page origin for CORS/Referer.
-                if let Some(bu) = &base_url {
-                    set_current_origin(bu);
-                    current_page_url = bu.clone();
-                }
-                let vp = Viewport {
-                    width: viewport.0.max(64),
-                    height: viewport.1.max(64),
-                    scale: 1.0,
-                };
-                match RenderDocument::from_html_with_fonts(&html, base_url.as_deref(), vp, &fonts) {
-                    Ok(doc) => {
-                        native_document_id = NEXT_NATIVE_DOCUMENT.fetch_add(1, Ordering::Relaxed);
-                        LISTENER_REGISTRY
-                            .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
-                        NATIVE_LISTENERS
-                            .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
-                        // WebGL contexts die with their document (EGL teardown
-                        // happens here on the JS thread via GlContext::Drop).
-                        #[cfg(feature = "webgl")]
-                        crate::js::webgl::reset_for_document();
-                        *render_doc_cell.borrow_mut() = Some(doc);
-                        // Shadow roots are per-document; drop stale entries.
-                        crate::js::dom_snapshot::clear_shadow_roots();
-                        // Attach declarative shadow roots
-                        // (`<template shadowrootmode>`) from the parsed
-                        // document before scripts run, so the page sees them.
-                        {
-                            let mut guard = render_doc_cell.borrow_mut();
-                            if let Some(doc) = guard.as_mut() {
-                                process_declarative_shadow_dom(doc);
-                            }
-                        }
-                        // Build the DomSnapshot from the render doc so its node
-                        // ids stay consistent with the Taffy layout boxes (used
-                        // by layout-based hit-testing and getBoundingClientRect).
-                        {
-                            let guard = render_doc_cell.borrow();
-                            if let Some(doc) = guard.as_ref() {
-                                let title = doc
-                                    .query_selector("title")
-                                    .map(|id| doc.node_text(id))
-                                    .unwrap_or_default();
-                                let snap =
-                                    crate::js::dom_snapshot::DomSnapshot::from_render_document(
-                                        doc,
-                                        base_url.as_deref().unwrap_or(""),
-                                        &title,
-                                    );
-                                *dom_snapshot.write() = Some(snap);
-                            }
-                        }
-                        // Contained like the Eval arm: a panic in a page
-                        // script's native binding must not kill the JS thread
-                        // — set_document reports it instead.
-                        let nav = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run_navigation_scripts(
-                                &mut ctx,
-                                &job_queue,
-                                &scripts,
-                                nav_loop_limit,
-                                nav_recursion_limit,
-                                nav_stack_limit,
-                                nav_timeout_ms,
-                            );
-                        }));
-                        match nav {
-                            Ok(()) => {
-                                let _ = response_tx.send(JsResponse::Done);
-                            }
-                            Err(payload) => {
-                                let _ = response_tx.send(JsResponse::Error {
-                                    message: format!(
-                                        "native binding panicked during navigation scripts: {}",
-                                        panic_message(payload.as_ref())
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let _ = response_tx.send(JsResponse::Error {
-                            message: e.to_string(),
-                        });
-                    }
-                }
-            }
-            JsCommand::Capture { opts, response_tx } => {
-                let mut guard = render_doc_cell.borrow_mut();
-                let result = match guard.as_mut() {
-                    Some(doc) => {
-                        // Present WebGL canvases into their nodes before
-                        // painting (clear-after-compositing semantics).
-                        #[cfg(feature = "webgl")]
-                        crate::js::webgl::flush_canvas(doc, true);
-                        capture_png_composed(doc, &opts)
-                    }
-                    None => Err(RenderError::Render("no render document set".into())),
-                };
-                drop(guard);
-                match result {
-                    Ok(bytes) => {
-                        let _ = response_tx.send(JsResponse::CaptureResult { png: bytes });
-                    }
-                    Err(e) => {
-                        let _ = response_tx.send(JsResponse::Error {
-                            message: e.to_string(),
-                        });
-                    }
-                }
-            }
-            JsCommand::Query {
-                selector,
-                response_tx,
-            } => {
-                let nodes = match render_doc_cell.borrow().as_ref() {
-                    Some(doc) => doc
-                        .query_selector_all(&selector)
-                        .into_iter()
-                        .map(|id| NodeInfo {
-                            id,
-                            tag: doc.tag_name(id),
-                            text: doc.node_text(id),
-                            attributes: doc.node_attributes(id),
-                        })
-                        .collect(),
-                    None => Vec::new(),
-                };
-                let _ = response_tx.send(JsResponse::QueryResult { nodes });
-            }
-            JsCommand::GetDocumentSnapshot { url, response_tx } => {
-                let snap = {
-                    let guard = render_doc_cell.borrow();
-                    guard.as_ref().map(|doc| {
-                        let title = doc
-                            .query_selector("title")
-                            .map(|id| doc.node_text(id))
-                            .unwrap_or_default();
-                        crate::js::dom_snapshot::DomSnapshot::from_render_document(
-                            doc, &url, &title,
-                        )
-                    })
-                };
-                match snap {
-                    Some(s) => {
-                        let _ = response_tx.send(JsResponse::Snapshot(Box::new(s)));
-                    }
-                    None => {
-                        let _ = response_tx.send(JsResponse::Error {
-                            message: "no render document set".into(),
-                        });
-                    }
-                }
-            }
-            JsCommand::SetFrameDocument {
-                context_id,
-                html,
-                base_url,
-                viewport: vp,
-                scripts,
-                nav_loop_limit,
-                nav_recursion_limit,
-                nav_stack_limit,
-                nav_timeout_ms,
-                response_tx,
-            } => {
-                ACTIVE_CONTEXT_ID.set(context_id);
-                let child_dom_snapshot: Arc<RwLock<Option<DomSnapshot>>> =
-                    Arc::new(RwLock::new(None));
-                let child_render_doc: Rc<RefCell<Option<RenderDocument>>> =
-                    Rc::new(RefCell::new(None));
-                let (mut child_ctx, child_jq) = create_context(
-                    &console_output,
-                    &child_dom_snapshot,
-                    &mutations,
-                    &dom_dirty,
-                    vp,
-                    &base_url,
-                    &effective_user_agent(&user_agent),
-                    &fetch_tx_arc,
-                    &cookie_jar_arc,
-                    &child_render_doc,
-                    telemetry,
-                );
-                // Build the child frame's RenderDocument + run scripts.
-                let boar_vp = Viewport {
-                    width: vp.0.max(64),
-                    height: vp.1.max(64),
-                    scale: 1.0,
-                };
-                match RenderDocument::from_html(&html, Some(&base_url), boar_vp) {
-                    Ok(doc) => {
-                        *child_render_doc.borrow_mut() = Some(doc);
-                        crate::js::dom_snapshot::clear_shadow_roots();
-                        {
-                            let mut guard = child_render_doc.borrow_mut();
-                            if let Some(doc) = guard.as_mut() {
-                                process_declarative_shadow_dom(doc);
-                            }
-                        }
-                        {
-                            let guard = child_render_doc.borrow();
-                            if let Some(doc) = guard.as_ref() {
-                                let title = doc
-                                    .query_selector("title")
-                                    .map(|id| doc.node_text(id))
-                                    .unwrap_or_default();
-                                let snap =
-                                    crate::js::dom_snapshot::DomSnapshot::from_render_document(
-                                        doc, &base_url, &title,
-                                    );
-                                *child_dom_snapshot.write() = Some(snap);
-                            }
-                        }
-                        // Contained like the Eval arm (same panic class).
-                        let nav = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            run_navigation_scripts(
-                                &mut child_ctx,
-                                &child_jq,
-                                &scripts,
-                                nav_loop_limit,
-                                nav_recursion_limit,
-                                nav_stack_limit,
-                                nav_timeout_ms,
-                            );
-                        }));
-                        // Register the frame even when scripts panicked: the
-                        // document itself is intact and the context id stays
-                        // resolvable for later commands.
-                        child_frames.insert(
-                            context_id,
-                            ChildFrame {
-                                ctx: child_ctx,
-                                job_queue: child_jq,
-                                render_doc_cell: child_render_doc,
-                                dom_snapshot_arc: child_dom_snapshot,
-                            },
+                JsCommand::SetDom {
+                    snapshot,
+                    response_tx,
+                } => {
+                    *dom_snapshot.write() = *snapshot;
+                    // Update document title/URL in the JS context
+                    let snap = dom_snapshot.read();
+                    if let Some(ref s) = *snap {
+                        let _ = ctx.register_global_property(
+                            js_string!("__domTitle"),
+                            JsValue::from(JsString::from(s.title.as_str())),
+                            Attribute::all(),
                         );
-                        match nav {
-                            Ok(()) => {
-                                let _ = response_tx.send(JsResponse::Done);
+                        let _ = ctx.register_global_property(
+                            js_string!("__domUrl"),
+                            JsValue::from(JsString::from(s.url.as_str())),
+                            Attribute::all(),
+                        );
+                    }
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetPageUrl {
+                    url,
+                    seed_storage,
+                    seed_idb,
+                    response_tx,
+                } => {
+                    background::clear_context(1, &job_queue);
+                    set_current_origin(&url);
+                    current_page_url = url.clone();
+                    if let Some(loader) = ctx.downcast_module_loader::<modules::WebModuleLoader>() {
+                        loader.set_document_url(&url);
+                    }
+                    // Re-register window.location with the new URL
+                    let snap = dom_snapshot.read();
+                    let dom_snapshot_ref = dom_snapshot.clone();
+                    drop(snap);
+                    register_window_globals(
+                        &mut ctx,
+                        &dom_snapshot_ref,
+                        &mutations,
+                        viewport,
+                        &url.clone(),
+                        &effective_user_agent(&user_agent),
+                        &fetch_tx_arc,
+                        &render_doc_cell,
+                        telemetry,
+                    );
+                    // M-A: the seed is the origin-keyed bucket for THIS page,
+                    // derived by Session from the shared context map on every
+                    // document injection. Always re-register so the JS-side map
+                    // mirrors exactly that bucket — cross-origin bleeding is gone
+                    // because each navigation swaps in its own origin's storage
+                    // (this resolves the former TODO(#sop), which preserved one
+                    // flat map across all navigations). Opaque origins
+                    // (`about:`, `data:`) key their bucket by the full URL
+                    // string (see `storage_origin_of`), so the same opaque URL
+                    // revisits its own bucket while different opaque URLs stay
+                    // isolated. The origin is
+                    // also stamped onto outgoing LocalStorageMsg writes so the
+                    // sync thread routes them to THIS bucket even if another
+                    // navigation lands before the message is processed.
+                    let ls_origin = url::Url::parse(&url)
+                        .map(|u| crate::context::storage_origin_of(&u))
+                        .unwrap_or_else(|_| "null".to_string());
+                    register_local_storage(
+                        &mut ctx,
+                        seed_storage.unwrap_or_default(),
+                        &dom_snapshot_ref,
+                        local_storage_tx_arc.clone(),
+                        ls_origin.clone(),
+                    );
+                    // IndexedDB (item 12): same seeding contract as localStorage —
+                    // the origin bucket replaces the JS-side map wholesale.
+                    let seed_dbs: std::collections::BTreeMap<String, super::idb::IdbDbState> =
+                        seed_idb
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(name, db)| {
+                                (
+                                    name,
+                                    super::idb::IdbDbState {
+                                        version: db.version,
+                                        stores: db.stores,
+                                        key_paths: db.key_paths,
+                                    },
+                                )
+                            })
+                            .collect();
+                    let idb_tx = { indexed_db_tx_arc.read().as_ref().cloned() };
+                    super::idb::register_indexed_db(
+                        &mut ctx,
+                        seed_dbs,
+                        std::rc::Rc::new(std::cell::RefCell::new(idb_tx)),
+                        ls_origin,
+                    );
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetMediaColorScheme { dark, response_tx } => {
+                    // Layout/media-query reflection happens at the NEXT document
+                    // build: `RenderDocument` construction reads the override
+                    // static and bakes it into the viewport, so a live document is
+                    // not re-styled. The JS-side flag below takes effect
+                    // immediately for `matchMedia` probes.
+                    oxibrowser_render::set_color_scheme_override(dark);
+                    let _ = ctx.register_global_property(
+                        js_string!("__oxi_prefer_dark"),
+                        JsValue::from(dark.unwrap_or(false)),
+                        Attribute::all(),
+                    );
+                    tracing::debug!(dark = ?dark, "media color scheme override updated");
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetUserAgent {
+                    user_agent: ua_override,
+                    response_tx,
+                } => {
+                    // Record the override, then re-register the main frame's
+                    // window globals so `navigator.userAgent` and the stealth
+                    // profile reflect the effective UA immediately. Child-frame
+                    // contexts rebuild with the new UA on their next navigation.
+                    *USER_AGENT_OVERRIDE.write() = ua_override;
+                    let ua = effective_user_agent(&user_agent);
+                    set_active_ua(&ua);
+                    let dom_snapshot_ref = dom_snapshot.clone();
+                    register_window_globals(
+                        &mut ctx,
+                        &dom_snapshot_ref,
+                        &mutations,
+                        viewport,
+                        &current_page_url,
+                        &ua,
+                        &fetch_tx_arc,
+                        &render_doc_cell,
+                        telemetry,
+                    );
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetLocalStorageChannel { tx, response_tx } => {
+                    *local_storage_tx_arc.write() = Some(tx);
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetIndexedDbChannel { tx, response_tx } => {
+                    *indexed_db_tx_arc.write() = Some(tx);
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetFetchChannel {
+                    request_tx,
+                    response_rx,
+                    response_tx,
+                } => {
+                    *fetch_tx_arc.write() = Some(request_tx);
+                    RESPONSE_RX.with(|cell| *cell.borrow_mut() = Some(response_rx));
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetWsChannel {
+                    request_tx,
+                    response_rx,
+                    response_tx,
+                } => {
+                    WS_REQ_TX.with(|cell| *cell.borrow_mut() = Some(request_tx));
+                    WS_EVENT_RX.with(|cell| *cell.borrow_mut() = Some(response_rx));
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetCookieJar { jar, response_tx } => {
+                    *cookie_jar_arc.write() = Some(jar);
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetEventSink { tx, response_tx } => {
+                    EVENT_TX.with(|cell| *cell.borrow_mut() = Some(tx));
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetDialogGate { gate, response_tx } => {
+                    DIALOG_GATE.with(|cell| *cell.borrow_mut() = Some(gate));
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::SetDocument {
+                    html,
+                    base_url,
+                    viewport,
+                    fonts,
+                    scripts,
+                    nav_loop_limit,
+                    nav_recursion_limit,
+                    nav_stack_limit,
+                    nav_timeout_ms,
+                    response_tx,
+                } => {
+                    background::activate(1, base_url.as_deref().unwrap_or("about:blank"));
+                    background::clear_context(1, &job_queue);
+                    for (id, child) in &child_frames {
+                        background::clear_context(*id, &child.job_queue);
+                    }
+                    child_frames.clear();
+                    mutations.write().clear();
+                    dom_dirty.store(false, Ordering::Relaxed);
+                    // The base_url (document URL) drives the page origin for CORS/Referer.
+                    current_page_url = base_url.clone().unwrap_or_else(|| "about:blank".into());
+                    set_current_origin(&current_page_url);
+                    if let Some(loader) = ctx.downcast_module_loader::<modules::WebModuleLoader>() {
+                        loader.set_document_url(base_url.as_deref().unwrap_or("about:blank"));
+                    }
+                    let vp = Viewport {
+                        width: viewport.0.max(64),
+                        height: viewport.1.max(64),
+                        scale: 1.0,
+                    };
+                    match RenderDocument::from_html_with_fonts(
+                        &html,
+                        base_url.as_deref(),
+                        vp,
+                        &fonts,
+                    ) {
+                        Ok(doc) => {
+                            native_document_id =
+                                NEXT_NATIVE_DOCUMENT.fetch_add(1, Ordering::Relaxed);
+                            LISTENER_REGISTRY
+                                .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
+                            NATIVE_LISTENERS
+                                .with(|r| r.borrow_mut().retain(|(context, _), _| *context != 1));
+                            // WebGL contexts die with their document (EGL teardown
+                            // happens here on the JS thread via GlContext::Drop).
+                            #[cfg(feature = "webgl")]
+                            crate::js::webgl::reset_for_document();
+                            *render_doc_cell.borrow_mut() = Some(doc);
+                            // Shadow roots are per-document; drop stale entries.
+                            crate::js::dom_snapshot::clear_shadow_roots();
+                            // Attach declarative shadow roots
+                            // (`<template shadowrootmode>`) from the parsed
+                            // document before scripts run, so the page sees them.
+                            {
+                                let mut guard = render_doc_cell.borrow_mut();
+                                if let Some(doc) = guard.as_mut() {
+                                    process_declarative_shadow_dom(doc);
+                                }
                             }
-                            Err(payload) => {
-                                let _ = response_tx.send(JsResponse::Error {
-                                    message: format!(
-                                        "native binding panicked during navigation scripts: {}",
-                                        panic_message(payload.as_ref())
-                                    ),
-                                });
+                            // Build the DomSnapshot from the render doc so its node
+                            // ids stay consistent with the Taffy layout boxes (used
+                            // by layout-based hit-testing and getBoundingClientRect).
+                            {
+                                let guard = render_doc_cell.borrow();
+                                if let Some(doc) = guard.as_ref() {
+                                    let title = doc
+                                        .query_selector("title")
+                                        .map(|id| doc.node_text(id))
+                                        .unwrap_or_default();
+                                    let snap =
+                                        crate::js::dom_snapshot::DomSnapshot::from_render_document(
+                                            doc,
+                                            base_url.as_deref().unwrap_or(""),
+                                            &title,
+                                        );
+                                    *dom_snapshot.write() = Some(snap);
+                                }
+                            }
+                            // Contained like the Eval arm: a panic in a page
+                            // script's native binding must not kill the JS thread
+                            // — set_document reports it instead.
+                            let nav =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_navigation_scripts(
+                                        &mut ctx,
+                                        &job_queue,
+                                        &scripts,
+                                        nav_loop_limit,
+                                        nav_recursion_limit,
+                                        nav_stack_limit,
+                                        nav_timeout_ms,
+                                    );
+                                }));
+                            match nav {
+                                Ok(()) => {
+                                    let _ = response_tx.send(JsResponse::Done);
+                                }
+                                Err(payload) => {
+                                    let _ = response_tx.send(JsResponse::Error {
+                                        message: format!(
+                                            "native binding panicked during navigation scripts: {}",
+                                            panic_message(payload.as_ref())
+                                        ),
+                                    });
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = response_tx.send(JsResponse::Error {
-                            message: e.to_string(),
-                        });
+                        Err(e) => {
+                            let _ = response_tx.send(JsResponse::Error {
+                                message: e.to_string(),
+                            });
+                        }
                     }
                 }
-                ACTIVE_CONTEXT_ID.set(1);
-            }
-            JsCommand::ClearChildContexts { response_tx } => {
-                child_frames.clear();
-                let _ = response_tx.send(JsResponse::Done);
-            }
-            JsCommand::Shutdown => {
-                break;
+                JsCommand::Capture { opts, response_tx } => {
+                    let mut guard = render_doc_cell.borrow_mut();
+                    let result = match guard.as_mut() {
+                        Some(doc) => {
+                            // Present WebGL canvases into their nodes before
+                            // painting (clear-after-compositing semantics).
+                            #[cfg(feature = "webgl")]
+                            crate::js::webgl::flush_canvas(doc, true);
+                            capture_png_composed(doc, &opts)
+                        }
+                        None => Err(RenderError::Render("no render document set".into())),
+                    };
+                    drop(guard);
+                    match result {
+                        Ok(bytes) => {
+                            let _ = response_tx.send(JsResponse::CaptureResult { png: bytes });
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(JsResponse::Error {
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                JsCommand::Query {
+                    selector,
+                    response_tx,
+                } => {
+                    let nodes = match render_doc_cell.borrow().as_ref() {
+                        Some(doc) => doc
+                            .query_selector_all(&selector)
+                            .into_iter()
+                            .map(|id| NodeInfo {
+                                id,
+                                tag: doc.tag_name(id),
+                                text: doc.node_text(id),
+                                attributes: doc.node_attributes(id),
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    let _ = response_tx.send(JsResponse::QueryResult { nodes });
+                }
+                JsCommand::GetDocumentSnapshot { url, response_tx } => {
+                    let snap = {
+                        let guard = render_doc_cell.borrow();
+                        guard.as_ref().map(|doc| {
+                            let title = doc
+                                .query_selector("title")
+                                .map(|id| doc.node_text(id))
+                                .unwrap_or_default();
+                            crate::js::dom_snapshot::DomSnapshot::from_render_document(
+                                doc, &url, &title,
+                            )
+                        })
+                    };
+                    match snap {
+                        Some(s) => {
+                            let _ = response_tx.send(JsResponse::Snapshot(Box::new(s)));
+                        }
+                        None => {
+                            let _ = response_tx.send(JsResponse::Error {
+                                message: "no render document set".into(),
+                            });
+                        }
+                    }
+                }
+                JsCommand::SetFrameDocument {
+                    context_id,
+                    html,
+                    base_url,
+                    viewport: vp,
+                    scripts,
+                    nav_loop_limit,
+                    nav_recursion_limit,
+                    nav_stack_limit,
+                    nav_timeout_ms,
+                    response_tx,
+                } => {
+                    if let Some(old) = child_frames.remove(&context_id) {
+                        background::clear_context(context_id, &old.job_queue);
+                    }
+                    background::activate(context_id, &base_url);
+                    let child_dom_snapshot: Arc<RwLock<Option<DomSnapshot>>> =
+                        Arc::new(RwLock::new(None));
+                    let child_render_doc: Rc<RefCell<Option<RenderDocument>>> =
+                        Rc::new(RefCell::new(None));
+                    let (mut child_ctx, child_jq) = create_context(
+                        &console_output,
+                        &child_dom_snapshot,
+                        &mutations,
+                        &dom_dirty,
+                        vp,
+                        &base_url,
+                        &effective_user_agent(&user_agent),
+                        &fetch_tx_arc,
+                        &cookie_jar_arc,
+                        &child_render_doc,
+                        telemetry,
+                    );
+                    let origin = url::Url::parse(&base_url)
+                        .map(|u| crate::context::storage_origin_of(&u))
+                        .unwrap_or_else(|_| "null".to_string());
+                    super::idb::register_indexed_db(
+                        &mut child_ctx,
+                        BTreeMap::new(),
+                        Rc::new(RefCell::new(indexed_db_tx_arc.read().as_ref().cloned())),
+                        origin,
+                    );
+                    // Build the child frame's RenderDocument + run scripts.
+                    let boar_vp = Viewport {
+                        width: vp.0.max(64),
+                        height: vp.1.max(64),
+                        scale: 1.0,
+                    };
+                    match RenderDocument::from_html(&html, Some(&base_url), boar_vp) {
+                        Ok(doc) => {
+                            *child_render_doc.borrow_mut() = Some(doc);
+                            crate::js::dom_snapshot::clear_shadow_roots();
+                            {
+                                let mut guard = child_render_doc.borrow_mut();
+                                if let Some(doc) = guard.as_mut() {
+                                    process_declarative_shadow_dom(doc);
+                                }
+                            }
+                            {
+                                let guard = child_render_doc.borrow();
+                                if let Some(doc) = guard.as_ref() {
+                                    let title = doc
+                                        .query_selector("title")
+                                        .map(|id| doc.node_text(id))
+                                        .unwrap_or_default();
+                                    let snap =
+                                        crate::js::dom_snapshot::DomSnapshot::from_render_document(
+                                            doc, &base_url, &title,
+                                        );
+                                    *child_dom_snapshot.write() = Some(snap);
+                                }
+                            }
+                            // Contained like the Eval arm (same panic class).
+                            let nav =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    run_navigation_scripts(
+                                        &mut child_ctx,
+                                        &child_jq,
+                                        &scripts,
+                                        nav_loop_limit,
+                                        nav_recursion_limit,
+                                        nav_stack_limit,
+                                        nav_timeout_ms,
+                                    );
+                                }));
+                            // Register the frame even when scripts panicked: the
+                            // document itself is intact and the context id stays
+                            // resolvable for later commands.
+                            child_frames.insert(
+                                context_id,
+                                ChildFrame {
+                                    url: base_url.clone(),
+                                    ctx: child_ctx,
+                                    job_queue: child_jq,
+                                    render_doc_cell: child_render_doc,
+                                    dom_snapshot_arc: child_dom_snapshot,
+                                },
+                            );
+                            match nav {
+                                Ok(()) => {
+                                    let _ = response_tx.send(JsResponse::Done);
+                                }
+                                Err(payload) => {
+                                    let _ = response_tx.send(JsResponse::Error {
+                                        message: format!(
+                                            "native binding panicked during navigation scripts: {}",
+                                            panic_message(payload.as_ref())
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = response_tx.send(JsResponse::Error {
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                    ACTIVE_CONTEXT_ID.set(1);
+                }
+                JsCommand::ClearChildContexts { response_tx } => {
+                    for (id, child) in &child_frames {
+                        background::clear_context(*id, &child.job_queue);
+                    }
+                    child_frames.clear();
+                    let _ = response_tx.send(JsResponse::Done);
+                }
+                JsCommand::Shutdown => {
+                    break;
+                }
             }
         }
+        if config.background_event_loop && Instant::now() >= next_tick {
+            background::activate(1, &current_page_url);
+            background::tick(&mut ctx, &job_queue, &config);
+            let mut ids: Vec<u32> = child_frames.keys().copied().collect();
+            ids.sort_unstable();
+            if !ids.is_empty() {
+                let id = ids[child_cursor % ids.len()];
+                child_cursor = child_cursor.wrapping_add(1);
+                if let Some(child) = child_frames.get_mut(&id) {
+                    background::activate(id, &child.url);
+                    background::tick(&mut child.ctx, &child.job_queue, &config);
+                }
+            }
+            next_tick = Instant::now() + background::INTERVAL;
+        }
+        background::activate(1, &current_page_url);
     }
 }
 
@@ -3233,6 +3342,10 @@ fn run_navigation_scripts(
     stack_limit: usize,
     timeout_ms: u64,
 ) {
+    let loader = ctx
+        .downcast_module_loader::<modules::WebModuleLoader>()
+        .expect("browser contexts have a URL module loader");
+    let _module_deadline = loader.begin_document(Duration::from_millis(timeout_ms));
     // No scripts → document is immediately complete (legacy set_document path).
     if scripts.is_empty() {
         DOC_READY_STATE.with(|c| c.set("complete"));
@@ -3252,7 +3365,20 @@ fn run_navigation_scripts(
         limits.set_stack_size_limit(stack_limit);
     };
 
-    for (script_idx, script) in scripts.iter().enumerate() {
+    // Blocking scripts precede the ordered module/classic-defer queue.
+    // Async script timing remains the existing ordered-after-parse model.
+    use crate::js::dom_snapshot::ExecuteTiming;
+    let ordered = scripts
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.execute != ExecuteTiming::Defer)
+        .chain(
+            scripts
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.execute == ExecuteTiming::Defer),
+        );
+    for (script_idx, script) in ordered {
         if start.elapsed() >= budget {
             tracing::warn!(
                 elapsed_ms = start.elapsed().as_millis() as u64,
@@ -3263,7 +3389,7 @@ fn run_navigation_scripts(
         }
         // External scripts must be fetched by the caller; an empty source with
         // a src_url means it was not retrieved — skip (mirrors onerror).
-        if script.source.is_empty() {
+        if script.source.is_empty() && script.kind == ScriptKind::Classic {
             if let Some(src) = &script.src_url {
                 tracing::warn!(src, "external script not fetched; skipping");
             }
@@ -3272,7 +3398,28 @@ fn run_navigation_scripts(
         // Re-arm limits per script: boa's loop counter can accumulate across
         // evals, and a prior script's runaway would otherwise starve siblings.
         apply_limits(ctx);
-        let eval_result = if source_nesting_exceeds(&script.source) {
+        let eval_result = if script.kind == ScriptKind::Module {
+            loader.entry(script, ctx).and_then(|module| {
+                let promise = module.load_link_evaluate(ctx);
+                // Observe asynchronous link/evaluation failures too.
+                let on_error = NativeFunction::from_fn_ptr(|_, args, ctx| {
+                    let err =
+                        boa_engine::JsError::from_opaque(args.first().cloned().unwrap_or_default());
+                    let (message, name, stack) = error_sink_details(&err, ctx);
+                    tracing::warn!(error = %message, "page module failed");
+                    push_event(CoreEvent::Exception {
+                        message,
+                        name,
+                        stack,
+                        timestamp: now_ms(),
+                    });
+                    Ok(JsValue::undefined())
+                })
+                .to_js_function(ctx.realm());
+                promise.catch(on_error, ctx)?;
+                Ok(JsValue::undefined())
+            })
+        } else if source_nesting_exceeds(&script.source) {
             Err(boa_engine::JsError::from_native(
                 boa_engine::JsNativeError::syntax()
                     .with_message("script nesting depth exceeds the engine limit"),
@@ -3283,11 +3430,10 @@ fn run_navigation_scripts(
             // makes minified-bundle failures attributable (measured:
             // spotify.com frames were misattributed across bundles).
             let script_path = match &script.src_url {
-                Some(src) => std::path::PathBuf::from(src),
-                None => std::path::PathBuf::from(format!(
-                    "{}#inline-script-{}",
-                    "about:page", script_idx
-                )),
+                Some(src) => std::path::PathBuf::from(loader.script_url(src)),
+                None => std::path::PathBuf::from(
+                    loader.script_url(&format!("#inline-script-{script_idx}")),
+                ),
             };
             ctx.eval(Source::from_bytes(script.source.as_str()).with_path(script_path.as_path()))
         };
@@ -3474,6 +3620,8 @@ fn settle_to_idle(
 /// Response object (status/headers/text/json/arrayBuffer) and resolves it —
 /// or rejects on a transport error.
 fn settle_fetch(resolvers: ResolvingFunctions, resp: FetchResponseMsg, ctx: &mut Context) {
+    use boa_engine::object::builtins::{AlignedVec, JsArrayBuffer};
+
     if let Some(err) = resp.error {
         let err_json =
             serde_json::to_string(&err).unwrap_or_else(|_| "\"fetch failed\"".to_string());
@@ -3486,51 +3634,51 @@ fn settle_fetch(resolvers: ResolvingFunctions, resp: FetchResponseMsg, ctx: &mut
         return;
     }
 
-    let text_fn = unsafe {
-        NativeFunction::from_closure(move |this, _args, ctx| {
-            let body = this
-                .as_object()
-                .and_then(|o| o.get(js_string!("__body"), ctx).ok())
-                .unwrap_or(JsValue::undefined());
-            let _ = ctx.register_global_property(js_string!("__text_body"), body, Attribute::all());
-            ctx.eval(Source::from_bytes(
-                "(() => { const v = __text_body; delete globalThis.__text_body; return Promise.resolve(v); })()",
-            ))
-        })
-    };
+    let text_fn = NativeFunction::from_fn_ptr(|this, _args, ctx| {
+        let body = this
+            .as_object()
+            .and_then(|o| o.get(js_string!("__body"), ctx).ok())
+            .unwrap_or(JsValue::undefined());
+        JsPromise::resolve(body, ctx).map(JsValue::from)
+    });
 
-    let json_fn = unsafe {
-        NativeFunction::from_closure(move |this, _args, ctx| {
-            let body = this
-                .as_object()
-                .and_then(|o| o.get(js_string!("__body"), ctx).ok())
-                .unwrap_or(JsValue::undefined());
-            let _ = ctx.register_global_property(js_string!("__json_body"), body, Attribute::all());
-            ctx.eval(Source::from_bytes(
-                "(() => { const v = __json_body; delete globalThis.__json_body; return Promise.resolve(JSON.parse(v)); })()",
-            ))
-        })
-    };
+    let json_fn = NativeFunction::from_fn_ptr(|this, _args, ctx| {
+        let body = this
+            .as_object()
+            .and_then(|o| o.get(js_string!("__body"), ctx).ok())
+            .unwrap_or(JsValue::undefined());
+        let json = ctx.intrinsics().objects().json();
+        let parsed = json.get(js_string!("parse"), ctx).and_then(|parse| {
+            let parse = parse
+                .as_callable()
+                .ok_or_else(|| JsNativeError::typ().with_message("JSON.parse is not callable"))?;
+            parse.call(&json.into(), &[body], ctx)
+        });
+        match parsed {
+            Ok(value) => JsPromise::resolve(value, ctx).map(JsValue::from),
+            Err(error) => JsPromise::reject(error, ctx).map(JsValue::from),
+        }
+    });
 
-    let array_buffer_fn = unsafe {
-        NativeFunction::from_closure(move |this, _args, ctx| {
-            let body_owned = {
-                if let Some(obj) = this.as_object()
-                    && let Ok(v) = obj.get(js_string!("__body"), ctx)
-                    && let Some(s) = v.as_string()
-                {
-                    s.to_std_string_escaped()
-                } else {
-                    String::new()
-                }
-            };
-            let bytes_json =
-                serde_json::to_string(body_owned.as_bytes()).unwrap_or_else(|_| String::from("[]"));
-            ctx.eval(Source::from_bytes(
-                format!("Promise.resolve(new Uint8Array({}))", bytes_json).as_str(),
-            ))
-        })
-    };
+    let body_bytes = resp
+        .body_bytes
+        .unwrap_or_else(|| resp.body.as_bytes().to_vec());
+    let decoded_body = String::from_utf8_lossy(&body_bytes);
+    // Fetch's UTF-8 decode operation removes a leading byte-order mark.
+    let decoded_body = decoded_body
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&decoded_body);
+    let decoded_body = JsString::from(decoded_body);
+    let array_buffer_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, bytes: &Vec<u8>, ctx| {
+            let buffer = JsArrayBuffer::from_byte_block(
+                AlignedVec::from_iter(0, bytes.iter().copied()),
+                ctx,
+            )?;
+            JsPromise::resolve(buffer, ctx).map(JsValue::from)
+        },
+        body_bytes,
+    );
 
     let headers_obj = boa_engine::object::ObjectInitializer::new(ctx).build();
     for (k, v) in &resp.headers {
@@ -3575,7 +3723,7 @@ fn settle_fetch(resolvers: ResolvingFunctions, resp: FetchResponseMsg, ctx: &mut
         )
         .property(
             js_string!("__body"),
-            JsValue::from(JsString::from(resp.body.as_str())),
+            JsValue::from(decoded_body),
             Attribute::all(),
         )
         .property(
@@ -3593,52 +3741,9 @@ fn settle_fetch(resolvers: ResolvingFunctions, resp: FetchResponseMsg, ctx: &mut
         .call(&JsValue::undefined(), &[JsValue::from(response_obj)], ctx);
 }
 
-/// Call a JS callback stored in a shared slot, if it is set and callable.
-fn fire_callback(slot: &Arc<RwLock<Option<JsValue>>>, ctx: &mut Context) {
-    let cb = slot.read().clone();
-    if let Some(v) = cb
-        && let Some(cb_obj) = v.as_object()
-        && cb_obj.is_callable()
-    {
-        let _ = cb_obj.call(&JsValue::undefined(), &[], ctx);
-    }
-}
-
-/// Settle a pending XHR: drive the shared state cells through LOADING (3) →
-/// DONE (4), firing `onreadystatechange` at each transition and `onload` (or
-/// `onerror`) at DONE.
-#[allow(clippy::too_many_arguments)]
-fn settle_xhr(
-    ready_state: Arc<RwLock<f64>>,
-    status: Arc<RwLock<f64>>,
-    resp_body: Arc<RwLock<String>>,
-    resp_hdrs: Arc<RwLock<String>>,
-    onload: Arc<RwLock<Option<JsValue>>>,
-    onerror: Arc<RwLock<Option<JsValue>>>,
-    onrsc: Arc<RwLock<Option<JsValue>>>,
-    resp: FetchResponseMsg,
-    ctx: &mut Context,
-) {
-    // LOADING (3)
-    *ready_state.write() = 3.0;
-    *status.write() = resp.status as f64;
-    *resp_body.write() = resp.body.clone();
-    let mut hdr_str = String::new();
-    for (k, v) in &resp.headers {
-        hdr_str.push_str(&format!("{}: {}\r\n", k, v));
-    }
-    *resp_hdrs.write() = hdr_str;
-    fire_callback(&onrsc, ctx);
-
-    // DONE (4)
-    *ready_state.write() = 4.0;
-    if resp.error.is_none() {
-        fire_callback(&onload, ctx);
-    } else {
-        *status.write() = 0.0;
-        fire_callback(&onerror, ctx);
-    }
-    fire_callback(&onrsc, ctx);
+/// Settle a pending XHR through its traced JS state and event dispatcher.
+fn settle_xhr(object: JsObject, state: JsObject, resp: FetchResponseMsg, ctx: &mut Context) {
+    xhr::settle(object, state, resp, ctx);
 }
 
 /// Drain all currently-available fetch/XHR responses from the shared channel
@@ -3647,6 +3752,10 @@ fn settle_xhr(
 /// top-level `evaluate()`. Responses are collected before settling to release
 /// the channel borrow before re-entering boa (settling may issue more JS/fetch).
 fn drain_pending_fetch_responses(ctx: &mut Context) {
+    drain_pending_fetch_responses_bounded(ctx, usize::MAX, true);
+}
+
+fn drain_pending_fetch_responses_bounded(ctx: &mut Context, limit: usize, run_jobs: bool) {
     let active = active_context_id();
     // Abort pass: reject any pending fetch whose AbortSignal has fired since
     // the last pump. Only checks the active context's fetches — other frames'
@@ -3656,6 +3765,7 @@ fn drain_pending_fetch_responses(ctx: &mut Context) {
             m.borrow()
                 .iter()
                 .filter(|(_, pf)| pf.context_id() == active)
+                .take(limit)
                 .filter_map(|(id, pf)| match pf {
                     PendingFetch::Fetch { signal, .. } => signal.clone().map(|s| (*id, s)),
                     PendingFetch::Xhr { .. } => None,
@@ -3688,16 +3798,22 @@ fn drain_pending_fetch_responses(ctx: &mut Context) {
     // Collect deferred responses (from a previous context's pump) + fresh
     // channel responses, then settle only those belonging to the active
     // context. Others are re-deferred for their owning context's next pump.
-    let mut responses: Vec<FetchResponseMsg> =
-        DEFERRED_RESPONSES.with(|d| d.borrow_mut().drain(..).collect());
+    let mut responses: Vec<FetchResponseMsg> = DEFERRED_RESPONSES.with(|d| {
+        let mut d = d.borrow_mut();
+        let count = d.len().min(limit);
+        d.drain(..count).collect()
+    });
     responses.extend(RESPONSE_RX.with(|cell| {
         let mut borrowed = cell.borrow_mut();
         let Some(rx) = borrowed.as_mut() else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        while let Ok(resp) = rx.try_recv() {
-            out.push(resp);
+        for _ in 0..limit {
+            match rx.try_recv() {
+                Ok(resp) => out.push(resp),
+                Err(_) => break,
+            }
         }
         out
     }));
@@ -3735,26 +3851,7 @@ fn drain_pending_fetch_responses(ctx: &mut Context) {
         let entry = PENDING_FETCH.with(|m| m.borrow_mut().remove(&resp.id));
         match entry {
             Some(PendingFetch::Fetch { resolvers, .. }) => settle_fetch(resolvers, resp, ctx),
-            Some(PendingFetch::Xhr {
-                ready_state,
-                status,
-                resp_body,
-                resp_hdrs,
-                onload,
-                onerror,
-                onrsc,
-                ..
-            }) => settle_xhr(
-                ready_state,
-                status,
-                resp_body,
-                resp_hdrs,
-                onload,
-                onerror,
-                onrsc,
-                resp,
-                ctx,
-            ),
+            Some(PendingFetch::Xhr { object, state, .. }) => settle_xhr(object, state, resp, ctx),
             None => {
                 tracing::trace!(id = resp.id, "stale fetch response — no pending entry");
             }
@@ -3767,7 +3864,9 @@ fn drain_pending_fetch_responses(ctx: &mut Context) {
     // `.then` reactions) within this pump. Without it, an abort that empties
     // `pending_fetch` suppresses the settle_to_idle loop and leaves the
     // rejection reaction un-drained until the next evaluate.
-    let _ = ctx.run_jobs();
+    if run_jobs {
+        let _ = ctx.run_jobs();
+    }
 }
 
 /// Block an explicitly synchronous XHR until its response arrives, then settle
@@ -3797,17 +3896,28 @@ fn wait_for_sync_xhr(id: u64, ctx: &mut Context) -> bool {
 /// Collects into a Vec first to release the `WS_EVENT_RX` borrow before
 /// re-entering boa (settling may issue more JS / WS / fetch).
 fn drain_ws_events(ctx: &mut Context) {
+    drain_ws_events_bounded(ctx, usize::MAX);
+}
+
+fn drain_ws_events_bounded(ctx: &mut Context, limit: usize) {
     let active = active_context_id();
     // Collect deferred events + fresh channel events.
-    let mut events: Vec<WsEvent> = DEFERRED_WS_EVENTS.with(|d| d.borrow_mut().drain(..).collect());
+    let mut events: Vec<WsEvent> = DEFERRED_WS_EVENTS.with(|d| {
+        let mut d = d.borrow_mut();
+        let count = d.len().min(limit);
+        d.drain(..count).collect()
+    });
     events.extend(WS_EVENT_RX.with(|cell| {
         let mut borrowed = cell.borrow_mut();
         let Some(rx) = borrowed.as_mut() else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        while let Ok(ev) = rx.try_recv() {
-            out.push(ev);
+        for _ in 0..limit {
+            match rx.try_recv() {
+                Ok(ev) => out.push(ev),
+                Err(_) => break,
+            }
         }
         out
     }));
@@ -3970,11 +4080,60 @@ fn settle_ws_message(id: u64, data: WsData, ctx: &mut Context) {
     ws_fire(&obj, "message", event.into(), ctx);
 }
 
+fn copy_buffer_source(value: &JsValue, ctx: &mut Context) -> JsResult<Vec<u8>> {
+    use boa_engine::object::builtins::{JsArrayBuffer, JsDataView, JsTypedArray};
+    let object = value
+        .as_object()
+        .ok_or_else(|| JsNativeError::typ().with_message("expected a BufferSource"))?;
+    let (buffer, offset, length) = if let Ok(buffer) = JsArrayBuffer::from_object(object.clone()) {
+        return buffer.data().map(|data| data.to_vec()).ok_or_else(|| {
+            JsNativeError::typ()
+                .with_message("ArrayBuffer is detached")
+                .into()
+        });
+    } else if let Ok(view) = JsTypedArray::from_object(object.clone()) {
+        (
+            view.buffer(ctx)?,
+            view.byte_offset(ctx)?,
+            view.byte_length(ctx)?,
+        )
+    } else if let Ok(view) = JsDataView::from_object(object) {
+        (
+            view.buffer(ctx)?,
+            view.byte_offset(ctx)? as usize,
+            view.byte_length(ctx)? as usize,
+        )
+    } else {
+        return Err(JsNativeError::typ()
+            .with_message("expected an ArrayBuffer or view")
+            .into());
+    };
+    let buffer = JsArrayBuffer::from_object(
+        buffer
+            .as_object()
+            .ok_or_else(|| JsNativeError::typ().with_message("Shared buffers are unsupported"))?,
+    )?;
+    let data = buffer
+        .data()
+        .ok_or_else(|| JsNativeError::typ().with_message("ArrayBuffer is detached"))?;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| JsNativeError::typ().with_message("buffer view is out of bounds"))?;
+    data.get(offset..end).map(<[u8]>::to_vec).ok_or_else(|| {
+        JsNativeError::typ()
+            .with_message("buffer view is out of bounds")
+            .into()
+    })
+}
+
 /// Best-effort extraction of a byte buffer from a JS value, for WebSocket
 /// binary `send()`. Recognises ArrayBuffer / TypedArray / a plain `Array` of
 /// numbers — anything exposing a numeric `length` (or `byteLength`) whose
 /// indexed elements are numbers. Returns `None` for strings/other values.
 fn extract_binary_bytes(v: &JsValue, ctx: &mut Context) -> Option<Vec<u8>> {
+    if let Ok(bytes) = copy_buffer_source(v, ctx) {
+        return Some(bytes);
+    }
     let obj = v.as_object()?;
     let len = obj
         .get(js_string!("length"), ctx)
@@ -4007,7 +4166,7 @@ fn normalize_fetch_body(value: &JsValue, ctx: &mut Context) -> Option<(Vec<u8>, 
     if let Some(s) = value.as_string() {
         return Some((s.to_std_string_escaped().into_bytes(), None));
     }
-    // FormData / Blob via the JS serializer installed by FORMDATA_BLOB_BOOTSTRAP.
+    // FormData / Blob via the JS serializer installed by FORMDATA_BOOTSTRAP.
     let serializer = ctx
         .global_object()
         .get(js_string!("__oxi_serialize_body"), ctx)
@@ -4158,6 +4317,25 @@ fn timer_deadline_after(delay_ms: u64) -> Instant {
         .unwrap_or(now)
 }
 
+/// Bound retained logs even when a page runs without automation commands.
+fn retain_console_line(output: &Arc<RwLock<Vec<String>>>, mut line: String) {
+    const MAX_LINES: usize = 1_000;
+    const MAX_LINE_BYTES: usize = 16 * 1024;
+    if line.len() > MAX_LINE_BYTES {
+        let mut end = MAX_LINE_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+    }
+    let mut output = output.write();
+    if output.len() >= MAX_LINES {
+        let drop_count = output.len() - MAX_LINES + 1;
+        output.drain(..drop_count);
+    }
+    output.push(line);
+}
+
 fn drain_timers(queue: &Rc<TokioJobQueue>, ctx: &mut Context) {
     // Settle any fetch/XHR responses first — they may enqueue microtasks or
     // timers that the rest of this drain must then process (Phase 3).
@@ -4172,19 +4350,20 @@ fn drain_timers(queue: &Rc<TokioJobQueue>, ctx: &mut Context) {
         }
 
         for timer in due {
-            let _ = timer.callback.call(&JsValue::undefined(), &timer.args, ctx);
-
-            // Re-schedule interval timers
-            if timer.is_interval {
-                let interval_ms = timer.interval_ms.unwrap_or(0).max(1);
-                let deadline = Instant::now() + Duration::from_millis(interval_ms);
-                queue.schedule_timer(
-                    deadline,
-                    timer.callback,
-                    timer.args,
-                    true,
-                    Some(interval_ms),
-                );
+            if !queue.timer_is_active(timer.id) {
+                continue;
+            }
+            let result = timer.callback.call(&JsValue::undefined(), &timer.args, ctx);
+            queue.complete_timer(timer, true);
+            if let Err(error) = result {
+                let (message, name, stack) = error_sink_details(&error, ctx);
+                tracing::warn!(%message, ?stack, "asynchronous JavaScript callback threw");
+                push_event(CoreEvent::Exception {
+                    message,
+                    name,
+                    stack,
+                    timestamp: now_ms(),
+                });
             }
         }
 
@@ -4262,8 +4441,14 @@ fn create_context(
     let job_queue = Rc::new(TokioJobQueue::new());
     let mut context = Context::builder()
         .job_executor(job_queue.clone())
+        .module_loader(Rc::new(modules::WebModuleLoader::new(
+            fetch_tx_arc.clone(),
+            page_url,
+        )))
         .build()
         .expect("failed to build boa Engine context");
+    dom_properties::register(&mut context);
+    style_properties::register(&mut context);
 
     // --- Console functions ---
 
@@ -4283,10 +4468,7 @@ fn create_context(
                             strs.push(s);
                         }
                         let line = strs.join(" ");
-                        {
-                            let mut guard = $out.write();
-                            guard.push(line);
-                        }
+                        retain_console_line(&$out, line);
                         // Mirror to the CoreEvent sink (CDP Runtime.consoleAPICalled /
                         // Log.entryAdded). No-op when no observer is attached.
                         push_event(CoreEvent::Console {
@@ -4323,7 +4505,7 @@ fn create_context(
                 typed.push(classify_console_arg(arg, &value, ctx));
                 strings.push(value);
             }
-            out_assert.write().push(strings.join(" "));
+            retain_console_line(&out_assert, strings.join(" "));
             push_event(CoreEvent::Console {
                 level: ConsoleLevel::Error,
                 args: typed,
@@ -4611,374 +4793,7 @@ fn create_context(
     let _ = context.register_global_callable(js_string!("fetch"), 2, fetch_fn);
 
     // --- XMLHttpRequest ---
-    let xhr_fetch_tx = fetch_tx_arc.clone();
-    let xhr_ctor = unsafe {
-        NativeFunction::from_closure(move |_this, _args, ctx| {
-            let open_method: Arc<RwLock<String>> = Arc::new(RwLock::new("GET".to_string()));
-            let open_url: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
-            let open_async: Arc<RwLock<bool>> = Arc::new(RwLock::new(true));
-            let ready_state: Arc<RwLock<f64>> = Arc::new(RwLock::new(0.0)); // UNSENT
-            let status_val: Arc<RwLock<f64>> = Arc::new(RwLock::new(0.0));
-            let response_text: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
-            let response_headers: Arc<RwLock<String>> = Arc::new(RwLock::new(String::new()));
-
-            // Event handler callbacks
-            let onload_cb: Arc<RwLock<Option<JsValue>>> = Arc::new(RwLock::new(None));
-            let onerror_cb: Arc<RwLock<Option<JsValue>>> = Arc::new(RwLock::new(None));
-            let onreadystatechange_cb: Arc<RwLock<Option<JsValue>>> = Arc::new(RwLock::new(None));
-
-            // onload setter
-            let onload_set = onload_cb.clone();
-            let onload_setter = {
-                NativeFunction::from_closure(move |_this, args, _ctx| {
-                    if let Some(v) = args.first() {
-                        *onload_set.write() = Some(v.clone());
-                    }
-                    Ok(JsValue::undefined())
-                })
-            };
-            let onload_setter_fn = FunctionObjectBuilder::new(ctx.realm(), onload_setter)
-                .name(js_string!("set onload"))
-                .build();
-
-            // onerror setter
-            let onerror_set = onerror_cb.clone();
-            let onerror_setter = {
-                NativeFunction::from_closure(move |_this, args, _ctx| {
-                    if let Some(v) = args.first() {
-                        *onerror_set.write() = Some(v.clone());
-                    }
-                    Ok(JsValue::undefined())
-                })
-            };
-            let onerror_setter_fn = FunctionObjectBuilder::new(ctx.realm(), onerror_setter)
-                .name(js_string!("set onerror"))
-                .build();
-
-            // onreadystatechange setter
-            let onrsc_set = onreadystatechange_cb.clone();
-            let onrsc_setter = {
-                NativeFunction::from_closure(move |_this, args, _ctx| {
-                    if let Some(v) = args.first() {
-                        *onrsc_set.write() = Some(v.clone());
-                    }
-                    Ok(JsValue::undefined())
-                })
-            };
-            let onrsc_setter_fn = FunctionObjectBuilder::new(ctx.realm(), onrsc_setter)
-                .name(js_string!("set onreadystatechange"))
-                .build();
-
-            // .open(method, url, async)
-            let om = open_method.clone();
-            let ou = open_url.clone();
-            let oa = open_async.clone();
-            let rs = ready_state.clone();
-            let open_fn = {
-                NativeFunction::from_closure(move |_this, args, ctx| {
-                    let method = args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let url = args
-                        .get(1)
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let async_flag = args.get(2).and_then(|v| v.as_boolean()).unwrap_or(true);
-                    *om.write() = method;
-                    *ou.write() = url;
-                    *oa.write() = async_flag;
-                    *rs.write() = 1.0; // OPENED
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // .send(body?)
-            let send_method = open_method.clone();
-            let send_url = open_url.clone();
-            let send_async = open_async.clone();
-            let send_rs = ready_state.clone();
-            let send_status = status_val.clone();
-            let send_resp = response_text.clone();
-            let send_hdrs = response_headers.clone();
-            let send_onload = onload_cb.clone();
-            let send_onerror = onerror_cb.clone();
-            let send_onrsc = onreadystatechange_cb.clone();
-            let send_tx = xhr_fetch_tx.clone();
-            let send_fn = {
-                NativeFunction::from_closure(move |_this, args, ctx| {
-                    let (body, content_type) = match args.first() {
-                        Some(v) => match normalize_fetch_body(v, ctx) {
-                            Some((bytes, ct)) => (Some(bytes), ct),
-                            None => (None, None),
-                        },
-                        None => (None, None),
-                    };
-                    let mut headers: Vec<(String, String)> = Vec::new();
-                    if let Some(ct) = content_type {
-                        headers.push(("content-type".to_string(), ct));
-                    }
-                    let method = send_method.read().clone();
-                    let url = send_url.read().clone();
-                    let is_async = *send_async.read();
-
-                    *send_rs.write() = 2.0; // HEADERS_RECEIVED
-
-                    let tx = {
-                        let guard = send_tx.read();
-                        guard.as_ref().cloned()
-                    };
-
-                    if let Some(tx) = tx {
-                        let id = next_fetch_id();
-                        if event_sink_attached() {
-                            push_event(CoreEvent::FetchRequest {
-                                request_id: cdp_request_id(id),
-                                url: url.clone(),
-                                method: method.clone(),
-                                headers: headers.clone(),
-                                post_data: body.clone(),
-                                timestamp: now_ms(),
-                            });
-                        }
-                        let request = FetchRequestMsg {
-                            id,
-                            url: url.clone(),
-                            method: method.clone(),
-                            headers,
-                            body,
-                            origin: current_origin(),
-                        };
-                        if tx.send(request).is_ok() {
-                            // Non-blocking (Phase 3): register the XHR's shared
-                            // state cells + callbacks; `settle_xhr` mutates them
-                            // and fires callbacks when the response arrives on
-                            // the shared channel (drained by the pump).
-                            PENDING_FETCH.with(|m| {
-                                m.borrow_mut().insert(
-                                    id,
-                                    PendingFetch::Xhr {
-                                        ready_state: send_rs.clone(),
-                                        status: send_status.clone(),
-                                        resp_body: send_resp.clone(),
-                                        resp_hdrs: send_hdrs.clone(),
-                                        onload: send_onload.clone(),
-                                        onerror: send_onerror.clone(),
-                                        onrsc: send_onrsc.clone(),
-                                        context_id: active_context_id(),
-                                    },
-                                );
-                            });
-                            if !is_async && !wait_for_sync_xhr(id, ctx) {
-                                PENDING_FETCH.with(|pending| {
-                                    pending.borrow_mut().remove(&id);
-                                });
-                                *send_rs.write() = 4.0;
-                                *send_status.write() = 0.0;
-                                fire_callback(&send_onerror, ctx);
-                                fire_callback(&send_onrsc, ctx);
-                            }
-                        } else {
-                            *send_rs.write() = 4.0;
-                            *send_status.write() = 0.0;
-                        }
-                    }
-
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // FetchResponse carries decoded UTF-8 text. MIME overrides that
-            // request another charset cannot be honored without raw bytes.
-            // Accept valid UTF-8-compatible overrides and reject unsupported
-            // decodings instead of silently returning mislabeled text.
-            let override_mime_fn = {
-                NativeFunction::from_closure(move |_this, args, ctx| {
-                    let value = args
-                        .first()
-                        .ok_or_else(|| {
-                            JsNativeError::typ()
-                                .with_message("overrideMimeType requires a MIME type")
-                        })?
-                        .to_string(ctx)?
-                        .to_std_string_escaped();
-                    let mut parts = value.split(';');
-                    let media_type = parts.next().unwrap_or_default().trim();
-                    if !media_type.contains('/') {
-                        return Err(JsNativeError::typ()
-                            .with_message("overrideMimeType expects a MIME type")
-                            .into());
-                    }
-                    for parameter in parts {
-                        if let Some((name, value)) = parameter.trim().split_once('=')
-                            && name.trim().eq_ignore_ascii_case("charset")
-                            && !matches!(
-                                value
-                                    .trim()
-                                    .trim_matches(['"', '\''])
-                                    .to_ascii_lowercase()
-                                    .as_str(),
-                                "utf-8" | "utf8"
-                            )
-                        {
-                            return Err(JsNativeError::typ()
-                                .with_message("only UTF-8 XHR response decoding is supported")
-                                .into());
-                        }
-                    }
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // .setRequestHeader(name, value) — noop for now
-            let set_req_header_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| Ok(JsValue::undefined()))
-            };
-
-            // .getResponseHeader(name)
-            let get_hdr_rs = response_headers.clone();
-            let get_header_fn = {
-                NativeFunction::from_closure(move |_this, args, ctx| {
-                    let name = args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let hdrs = get_hdr_rs.read();
-                    for line in hdrs.lines() {
-                        if let Some(eq) = line.find(':') {
-                            let key = line[..eq].trim();
-                            if key.eq_ignore_ascii_case(&name) {
-                                return Ok(JsValue::from(JsString::from(line[eq + 1..].trim())));
-                            }
-                        }
-                    }
-                    Ok(JsValue::null())
-                })
-            };
-
-            // .abort() — reset state
-            let abort_rs = ready_state.clone();
-            let abort_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    *abort_rs.write() = 0.0;
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // Build object
-            let rs_clone = ready_state.clone();
-            let rs_getter = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    Ok(JsValue::from(*rs_clone.read()))
-                })
-            };
-            let rs_getter_fn = FunctionObjectBuilder::new(ctx.realm(), rs_getter)
-                .name(js_string!("get readyState"))
-                .build();
-
-            let st_clone = status_val.clone();
-            let st_getter = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    Ok(JsValue::from(*st_clone.read()))
-                })
-            };
-            let st_getter_fn = FunctionObjectBuilder::new(ctx.realm(), st_getter)
-                .name(js_string!("get status"))
-                .build();
-
-            let rt_clone = response_text.clone();
-            let rt_getter = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    Ok(JsValue::from(JsString::from(rt_clone.read().as_str())))
-                })
-            };
-            let rt_getter_fn = FunctionObjectBuilder::new(ctx.realm(), rt_getter)
-                .name(js_string!("get responseText"))
-                .build();
-
-            let ol_clone = onload_cb.clone();
-            let ol_getter = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    Ok(ol_clone.read().clone().unwrap_or(JsValue::null()))
-                })
-            };
-            let ol_getter_fn = FunctionObjectBuilder::new(ctx.realm(), ol_getter)
-                .name(js_string!("get onload"))
-                .build();
-
-            let oe_clone = onerror_cb.clone();
-            let oe_getter = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    Ok(oe_clone.read().clone().unwrap_or(JsValue::null()))
-                })
-            };
-            let oe_getter_fn = FunctionObjectBuilder::new(ctx.realm(), oe_getter)
-                .name(js_string!("get onerror"))
-                .build();
-
-            let obj = boa_engine::object::ObjectInitializer::new(ctx)
-                .accessor(
-                    js_string!("readyState"),
-                    Some(rs_getter_fn),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("status"),
-                    Some(st_getter_fn),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("responseText"),
-                    Some(rt_getter_fn),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("onload"),
-                    Some(ol_getter_fn),
-                    Some(onload_setter_fn),
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("onerror"),
-                    Some(oe_getter_fn),
-                    Some(onerror_setter_fn),
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("onreadystatechange"),
-                    None,
-                    Some(onrsc_setter_fn),
-                    Attribute::all(),
-                )
-                .property(
-                    js_string!("responseType"),
-                    JsValue::from(JsString::from("")),
-                    Attribute::all(),
-                )
-                .property(js_string!("timeout"), JsValue::from(0), Attribute::all())
-                .property(
-                    js_string!("withCredentials"),
-                    JsValue::from(false),
-                    Attribute::all(),
-                )
-                .function(open_fn, js_string!("open"), 3)
-                .function(send_fn, js_string!("send"), 1)
-                .function(override_mime_fn, js_string!("overrideMimeType"), 1)
-                .function(set_req_header_fn, js_string!("setRequestHeader"), 2)
-                .function(get_header_fn, js_string!("getResponseHeader"), 1)
-                .function(abort_fn, js_string!("abort"), 0)
-                .build();
-
-            Ok(JsValue::from(obj))
-        })
-    };
-    let _ = context.register_global_callable(js_string!("XMLHttpRequest"), 0, xhr_ctor);
+    xhr::register(&mut context, fetch_tx_arc.clone()).expect("failed to register XMLHttpRequest");
     // --- WebSocket (Phase 4) ---
     let ws_ctor = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
@@ -5324,543 +5139,8 @@ fn create_context(
     };
     let _ = context.register_global_callable(js_string!("btoa"), 1, btoa_fn);
 
-    // --- URLSearchParams (minimal) ---
-    // URLSearchParams is typically used as: new URLSearchParams("foo=bar&baz=1")
-    // We create a class-like constructor that returns an object with
-    // get, set, append, delete, has, keys, values, entries, forEach methods.
-    let search_params_ctor = unsafe {
-        NativeFunction::from_closure(move |_this, args, ctx| {
-            let query_string = args
-                .first()
-                .and_then(|v| v.to_string(ctx).ok())
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_default();
-
-            // Parse query string into HashMap
-            let map: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            let storage = std::cell::RefCell::new(map);
-
-            for pair in query_string.split('&') {
-                if let Some(eq) = pair.find('=') {
-                    let key = pair[..eq].to_string();
-                    let val = pair[eq + 1..].to_string();
-                    let mut s = storage.borrow_mut();
-                    s.entry(key).or_default().push(val);
-                } else if !pair.is_empty() {
-                    let mut s = storage.borrow_mut();
-                    s.entry(pair.to_string()).or_default();
-                }
-            }
-
-            let storage_arc = std::sync::Arc::new(storage);
-            let _sp_storage = storage_arc.clone();
-
-            // --- get ---
-            let get_sp = storage_arc.clone();
-            let get_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    let key = _args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let val = get_sp
-                        .borrow()
-                        .get(&key)
-                        .and_then(|v| v.first())
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(val.as_str())))
-                })
-            };
-
-            // --- set ---
-            let set_sp = storage_arc.clone();
-            let set_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    let key = _args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let val = _args
-                        .get(1)
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    set_sp.borrow_mut().insert(key, vec![val]);
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // --- append ---
-            let app_sp = storage_arc.clone();
-            let app_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    let key = _args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let val = _args
-                        .get(1)
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    app_sp.borrow_mut().entry(key).or_default().push(val);
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // --- delete ---
-            let del_sp = storage_arc.clone();
-            let del_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    let key = _args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    del_sp.borrow_mut().remove(&key);
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // --- has ---
-            let has_sp = storage_arc.clone();
-            let has_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    let key = _args
-                        .first()
-                        .and_then(|v| v.to_string(ctx).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let result = has_sp.borrow().contains_key(&key);
-                    Ok(JsValue::from(result))
-                })
-            };
-
-            // --- forEach ---
-            let foreach_sp = storage_arc.clone();
-            let foreach_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    if let Some(callback) = _args.first()
-                        && let Some(cb_obj) = callback.as_object()
-                        && cb_obj.is_callable()
-                    {
-                        for (key, values) in foreach_sp.borrow().iter() {
-                            for val in values {
-                                let cb_args = &[
-                                    JsValue::from(JsString::from(val.as_str())),
-                                    JsValue::from(JsString::from(key.as_str())),
-                                    JsValue::undefined(),
-                                ];
-                                let _ = cb_obj.call(&JsValue::undefined(), cb_args, ctx);
-                            }
-                        }
-                    }
-                    Ok(JsValue::undefined())
-                })
-            };
-
-            // --- toString ---
-            let str_sp = storage_arc.clone();
-            let str_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let mut parts = Vec::new();
-                    for (key, values) in str_sp.borrow().iter() {
-                        for val in values {
-                            parts.push(format!("{}={}", key, val));
-                        }
-                    }
-                    Ok(JsValue::from(JsString::from(parts.join("&").as_str())))
-                })
-            };
-
-            // Build the URLSearchParams object
-            let sp_obj = boa_engine::object::ObjectInitializer::new(ctx)
-                .function(get_fn, js_string!("get"), 1)
-                .function(set_fn, js_string!("set"), 2)
-                .function(app_fn, js_string!("append"), 2)
-                .function(del_fn, js_string!("delete"), 1)
-                .function(has_fn, js_string!("has"), 1)
-                .function(foreach_fn, js_string!("forEach"), 1)
-                .function(str_fn, js_string!("toString"), 0)
-                .build();
-
-            Ok(JsValue::from(sp_obj))
-        })
-    };
-    let _ = context.register_global_callable(js_string!("URLSearchParams"), 1, search_params_ctor);
-
-    // --- URL class (stub) ---
-    // new URL(url) — basic URL parsing with protocol, host, pathname, search
-    let url_ctor = unsafe {
-        NativeFunction::from_closure(move |_this, args, ctx| {
-            let url_str = args
-                .first()
-                .and_then(|v| v.to_string(ctx).ok())
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_default();
-
-            let parsed = url::Url::parse(&url_str);
-
-            // Storage object for URL properties
-            let url_storage =
-                std::sync::Arc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
-
-            // url_storage holds parsed values as strings
-            {
-                let mut s = url_storage.borrow_mut();
-                match &parsed {
-                    Ok(u) => {
-                        s.insert("href".to_string(), u.to_string());
-                        s.insert("origin".to_string(), u.origin().ascii_serialization());
-                        s.insert("protocol".to_string(), format!("{}:", u.scheme()));
-                        s.insert(
-                            "host".to_string(),
-                            u.host().map(|h| h.to_string()).unwrap_or_default(),
-                        );
-                        s.insert(
-                            "hostname".to_string(),
-                            u.host().map(|h| h.to_string()).unwrap_or_default(),
-                        );
-                        s.insert("pathname".to_string(), u.path().to_string());
-                        s.insert(
-                            "search".to_string(),
-                            u.query().map(|q| format!("?{}", q)).unwrap_or_default(),
-                        );
-                        s.insert(
-                            "hash".to_string(),
-                            u.fragment().map(|f| format!("#{}", f)).unwrap_or_default(),
-                        );
-                        s.insert(
-                            "port".to_string(),
-                            u.port().map(|p| p.to_string()).unwrap_or_default(),
-                        );
-                        s.insert("username".to_string(), u.username().to_string());
-                        s.insert(
-                            "password".to_string(),
-                            u.password().map(|p| p.to_string()).unwrap_or_default(),
-                        );
-                        s.insert("searchParams".to_string(), "URLSearchParams".to_string());
-                        // marker
-                    }
-                    Err(_) => {
-                        s.insert("href".to_string(), url_str.clone());
-                        s.insert("origin".to_string(), url_str);
-                        s.insert("protocol".to_string(), String::new());
-                        s.insert("host".to_string(), String::new());
-                        s.insert("hostname".to_string(), String::new());
-                        s.insert("pathname".to_string(), String::new());
-                        s.insert("search".to_string(), String::new());
-                        s.insert("hash".to_string(), String::new());
-                        s.insert("port".to_string(), String::new());
-                        s.insert("username".to_string(), String::new());
-                        s.insert("password".to_string(), String::new());
-                    }
-                }
-            }
-
-            let us_storage = url_storage.clone();
-            let href_storage = url_storage.clone();
-            let us_storage2 = url_storage.clone();
-            let us_storage3 = url_storage.clone();
-            let us_storage4 = url_storage.clone();
-            let us_storage5 = url_storage.clone();
-            let us_storage6 = url_storage.clone();
-            let us_storage7 = url_storage.clone();
-            let _us_storage8 = url_storage.clone();
-
-            // href getter
-            let href_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let href = href_storage
-                        .borrow()
-                        .get("href")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(href.as_str())))
-                })
-            };
-
-            // origin getter
-            let origin_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let origin = us_storage
-                        .borrow()
-                        .get("origin")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(origin.as_str())))
-                })
-            };
-
-            // protocol getter
-            let proto_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let proto = us_storage2
-                        .borrow()
-                        .get("protocol")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(proto.as_str())))
-                })
-            };
-
-            // host getter
-            let host_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let host = us_storage3
-                        .borrow()
-                        .get("host")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(host.as_str())))
-                })
-            };
-
-            // pathname getter
-            let path_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let path = us_storage4
-                        .borrow()
-                        .get("pathname")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(path.as_str())))
-                })
-            };
-
-            // search getter
-            let search_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let search = us_storage5
-                        .borrow()
-                        .get("search")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(search.as_str())))
-                })
-            };
-
-            // hash getter
-            let hash_fn = {
-                NativeFunction::from_closure(move |_this, _args, _ctx| {
-                    let hash = us_storage6
-                        .borrow()
-                        .get("hash")
-                        .cloned()
-                        .unwrap_or_default();
-                    Ok(JsValue::from(JsString::from(hash.as_str())))
-                })
-            };
-
-            // searchParams getter (returns URLSearchParams-like object)
-            let sp_storage = us_storage7.clone();
-            let sp_fn = {
-                NativeFunction::from_closure(move |_this, _args, ctx| {
-                    let search = sp_storage
-                        .borrow()
-                        .get("search")
-                        .cloned()
-                        .unwrap_or_default();
-                    let query = search.trim_start_matches('?').to_string();
-
-                    // Parse query string into key-value pairs
-                    let params: Vec<(String, String)> = if query.is_empty() {
-                        Vec::new()
-                    } else {
-                        query
-                            .split('&')
-                            .filter_map(|pair| {
-                                let mut kv = pair.splitn(2, '=');
-                                let key = kv.next().unwrap_or("").to_string();
-                                let val = kv.next().unwrap_or("").to_string();
-                                if !key.is_empty() {
-                                    Some((key, val))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect()
-                    };
-
-                    // Build a JS object that acts like URLSearchParams
-                    let _sp_get_fn = {
-                        NativeFunction::from_closure(move |_this, _args, _ctx| {
-                            Ok(JsValue::undefined())
-                        })
-                    };
-
-                    // Store params in an array for methods to use
-                    let params_arr = JsArray::new(ctx)
-                        .expect("creating an empty array with the default prototype must not fail");
-                    for (k, v) in &params {
-                        let entry = boa_engine::object::ObjectInitializer::new(ctx)
-                            .property(
-                                js_string!("0"),
-                                JsValue::from(JsString::from(k.as_str())),
-                                Attribute::all(),
-                            )
-                            .property(
-                                js_string!("1"),
-                                JsValue::from(JsString::from(v.as_str())),
-                                Attribute::all(),
-                            )
-                            .build();
-                        let _ = params_arr.push(JsValue::from(entry), ctx);
-                    }
-
-                    // get(name) — returns first value for the key
-                    let get_params = params.clone();
-                    let sp_get = {
-                        NativeFunction::from_closure(move |_this, args, _ctx| {
-                            let key = args
-                                .first()
-                                .and_then(|v| v.as_string())
-                                .map(|s| s.to_std_string_escaped())
-                                .unwrap_or_default();
-                            for (k, v) in &get_params {
-                                if k == &key {
-                                    return Ok(JsValue::from(JsString::from(v.as_str())));
-                                }
-                            }
-                            Ok(JsValue::null())
-                        })
-                    };
-
-                    // has(name)
-                    let has_params = params.clone();
-                    let sp_has = {
-                        NativeFunction::from_closure(move |_this, args, _ctx| {
-                            let key = args
-                                .first()
-                                .and_then(|v| v.as_string())
-                                .map(|s| s.to_std_string_escaped())
-                                .unwrap_or_default();
-                            Ok(JsValue::from(has_params.iter().any(|(k, _)| k == &key)))
-                        })
-                    };
-
-                    // toString()
-                    let to_str_query = query.clone();
-                    let sp_to_string = {
-                        NativeFunction::from_closure(move |_this, _args, _ctx| {
-                            Ok(JsValue::from(JsString::from(to_str_query.as_str())))
-                        })
-                    };
-
-                    // getAll(name)
-                    let getall_params = params.clone();
-                    let sp_get_all = {
-                        NativeFunction::from_closure(move |_this, args, ctx2| {
-                            let key = args
-                                .first()
-                                .and_then(|v| v.as_string())
-                                .map(|s| s.to_std_string_escaped())
-                                .unwrap_or_default();
-                            let vals: Vec<JsValue> = getall_params
-                                .iter()
-                                .filter(|(k, _)| k == &key)
-                                .map(|(_, v)| JsValue::from(JsString::from(v.as_str())))
-                                .collect();
-                            Ok(JsValue::from(JsArray::from_iter(vals, ctx2)))
-                        })
-                    };
-
-                    let sp_obj = boa_engine::object::ObjectInitializer::new(ctx)
-                        .function(sp_get, js_string!("get"), 1)
-                        .function(sp_has, js_string!("has"), 1)
-                        .function(sp_get_all, js_string!("getAll"), 1)
-                        .function(sp_to_string, js_string!("toString"), 0)
-                        .build();
-                    Ok(JsValue::from(sp_obj))
-                })
-            };
-
-            // Build URL object — convert NativeFunction to JsFunction via FunctionObjectBuilder
-            let href_getter = FunctionObjectBuilder::new(ctx.realm(), href_fn)
-                .name("get href")
-                .build();
-            let origin_getter = FunctionObjectBuilder::new(ctx.realm(), origin_fn)
-                .name("get origin")
-                .build();
-            let proto_getter = FunctionObjectBuilder::new(ctx.realm(), proto_fn)
-                .name("get protocol")
-                .build();
-            let host_getter = FunctionObjectBuilder::new(ctx.realm(), host_fn)
-                .name("get host")
-                .build();
-            let path_getter = FunctionObjectBuilder::new(ctx.realm(), path_fn)
-                .name("get pathname")
-                .build();
-            let search_getter = FunctionObjectBuilder::new(ctx.realm(), search_fn)
-                .name("get search")
-                .build();
-            let hash_getter = FunctionObjectBuilder::new(ctx.realm(), hash_fn)
-                .name("get hash")
-                .build();
-            let sp_getter = FunctionObjectBuilder::new(ctx.realm(), sp_fn)
-                .name("get searchParams")
-                .build();
-
-            let url_obj = boa_engine::object::ObjectInitializer::new(ctx)
-                .accessor(
-                    js_string!("href"),
-                    Some(href_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("origin"),
-                    Some(origin_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("protocol"),
-                    Some(proto_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("host"),
-                    Some(host_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("pathname"),
-                    Some(path_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("search"),
-                    Some(search_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("hash"),
-                    Some(hash_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .accessor(
-                    js_string!("searchParams"),
-                    Some(sp_getter),
-                    None,
-                    Attribute::all(),
-                )
-                .build();
-
-            Ok(JsValue::from(url_obj))
-        })
-    };
-    let _ = context.register_global_callable(js_string!("URL"), 1, url_ctor);
+    // URL and live URLSearchParams use the Rust URL parser and browser setters.
+    url_api::register(&mut context).expect("failed to register browser URL bindings");
 
     // URL.createObjectURL / revokeObjectURL (static methods on the URL
     // constructor). Minimal: mints a `blob:` URL; revoke is a no-op.
@@ -5925,6 +5205,8 @@ fn create_context(
     let crypto_obj = boa_engine::object::ObjectInitializer::new(&mut context)
         .function(get_random_values_fn, js_string!("getRandomValues"), 1)
         .build();
+    crypto_digest::register(&mut context, &crypto_obj)
+        .expect("failed to register Web Crypto digest");
     let _ = context.register_global_property(
         js_string!("crypto"),
         JsValue::from(crypto_obj),
@@ -5932,67 +5214,26 @@ fn create_context(
     );
 
     // --- TextEncoder ---
-    let _te_encode_fn = unsafe {
-        NativeFunction::from_closure(move |_this, args, ctx| {
-            let input = args
-                .first()
-                .and_then(|v| v.to_string(ctx).ok())
-                .map(|s| s.to_std_string_escaped())
-                .unwrap_or_default();
-            let bytes = input.as_bytes();
-            let arr = JsArray::new(ctx)
-                .expect("creating an empty array with the default prototype must not fail");
-            for &b in bytes {
-                let _ = arr.push(JsValue::from(b), ctx);
-            }
-            let _obj = boa_engine::object::ObjectInitializer::new(ctx)
-                .property(
-                    js_string!("encoding"),
-                    JsValue::from(JsString::from("utf-8")),
-                    Attribute::all(),
-                )
-                .build();
-            // Return Uint8Array-like object
-            let result = boa_engine::object::ObjectInitializer::new(ctx)
-                .property(
-                    js_string!("buffer"),
-                    JsValue::from(arr.clone()),
-                    Attribute::all(),
-                )
-                .build();
-            Ok(JsValue::from(result))
-        })
-    };
-    // Avoid recursive closure — use a simpler approach
-    let te_ctor = unsafe {
-        NativeFunction::from_closure(move |_this, _args, ctx| {
-            let encode_fn = {
-                NativeFunction::from_closure(move |_this2, args2, ctx2| {
-                    let input = args2
-                        .first()
-                        .and_then(|v| v.to_string(ctx2).ok())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    let bytes = input.as_bytes();
-                    let arr = JsArray::new(ctx2)
-                        .expect("creating an empty array with the default prototype must not fail");
-                    for &b in bytes {
-                        let _ = arr.push(JsValue::from(b), ctx2);
-                    }
-                    Ok(JsValue::from(arr))
-                })
+    let te_ctor = NativeFunction::from_fn_ptr(|_, _, ctx| {
+        let encode_fn = NativeFunction::from_fn_ptr(|_, args, ctx| {
+            let input = if let Some(value) = args.first().filter(|value| !value.is_undefined()) {
+                value.to_string(ctx)?.to_std_string_lossy()
+            } else {
+                String::new()
             };
-            let obj = boa_engine::object::ObjectInitializer::new(ctx)
-                .property(
-                    js_string!("encoding"),
-                    JsValue::from(JsString::from("utf-8")),
-                    Attribute::all(),
-                )
-                .function(encode_fn, js_string!("encode"), 1)
-                .build();
-            Ok(JsValue::from(obj))
-        })
-    };
+            boa_engine::object::builtins::JsUint8Array::from_iter(input.bytes(), ctx)
+                .map(JsValue::from)
+        });
+        Ok(boa_engine::object::ObjectInitializer::new(ctx)
+            .property(
+                js_string!("encoding"),
+                js_string!("utf-8"),
+                Attribute::all(),
+            )
+            .function(encode_fn, js_string!("encode"), 0)
+            .build()
+            .into())
+    });
     let _ = context.register_global_callable(js_string!("TextEncoder"), 0, te_ctor);
 
     // --- TextDecoder ---
@@ -7339,37 +6580,28 @@ fn create_render_element_object(
     let rd_style = render_doc.clone();
     let dirty_style_outer = dom_dirty.clone();
     let style_fn = unsafe {
-        NativeFunction::from_closure(move |_this, _args, ctx| {
-            let sp = rd_style.clone();
-            let dirty_style = dirty_style_outer.clone();
-            let set_prop = NativeFunction::from_closure(move |_this, args, _ctx| {
-                let prop = args
-                    .first()
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.to_std_string_escaped())
-                    .unwrap_or_default();
-                let val = args
-                    .get(1)
-                    .and_then(|v| v.as_string())
-                    .map(|s| s.to_std_string_escaped())
-                    .unwrap_or_default();
-                if let Some(doc) = sp.borrow_mut().as_mut() {
-                    doc.set_inline_style(node_id, &prop, &val);
-                    dirty_style.store(true, Ordering::Relaxed);
-                }
-                Ok(JsValue::undefined())
-            });
-            let gp = rd_style.clone();
-            let get_prop = NativeFunction::from_closure(move |_this, _args, _ctx| {
-                // Inline-style reads aren't tracked separately; return "".
-                let _ = gp;
-                Ok(JsValue::from(JsString::from("")))
-            });
-            let style_obj = boa_engine::object::ObjectInitializer::new(ctx)
-                .function(set_prop, js_string!("setProperty"), 2)
-                .function(get_prop, js_string!("getPropertyValue"), 1)
-                .build();
-            Ok(JsValue::from(style_obj))
+        NativeFunction::from_closure(move |this, _args, ctx| {
+            let object = this
+                .as_object()
+                .ok_or_else(|| JsNativeError::typ().with_message("style requires an element"))?;
+            let cached = object.get(js_string!("__oxiStyle"), ctx)?;
+            if cached.is_object() {
+                return Ok(cached);
+            }
+            let style = style_properties::create(
+                ctx,
+                rd_style.clone(),
+                node_id,
+                dirty_style_outer.clone(),
+            )?;
+            object.define_property_or_throw(
+                js_string!("__oxiStyle"),
+                boa_engine::property::PropertyDescriptor::builder()
+                    .value(style.clone())
+                    .configurable(true),
+                ctx,
+            )?;
+            Ok(style)
         })
     };
     let style_getter_fn = FunctionObjectBuilder::new(ctx.realm(), style_fn)
@@ -7812,7 +7044,7 @@ fn create_render_element_object(
                 .as_ref()
                 .and_then(|d| d.node_attr(node_id, name))
                 .unwrap_or_default();
-            if name == "src" && !value.is_empty() {
+            if matches!(name, "src" | "href") && !value.is_empty() {
                 let base = ctx
                     .global_object()
                     .get(js_string!("__oxiPageUrl"), ctx)
@@ -7861,6 +7093,29 @@ fn create_render_element_object(
     let src_getter_fn = FunctionObjectBuilder::new(ctx.realm(), src_get_fn)
         .name(js_string!("get src"))
         .build();
+
+    let attr_setter = |name: &'static str| {
+        let rd = render_doc.clone();
+        let dirty = dom_dirty.clone();
+        unsafe {
+            NativeFunction::from_closure(move |_, args, ctx| {
+                let value = args
+                    .first()
+                    .unwrap_or(&JsValue::undefined())
+                    .to_string(ctx)?
+                    .to_std_string_escaped();
+                if let Some(doc) = rd.borrow_mut().as_mut() {
+                    doc.set_attribute(node_id, name, &value);
+                    dirty.store(true, Ordering::Relaxed);
+                }
+                Ok(JsValue::undefined())
+            })
+        }
+        .to_js_function(ctx.realm())
+    };
+    let href_setter_fn = attr_setter("href");
+    let src_setter_fn = attr_setter("src");
+    let type_setter_fn = attr_setter("type");
 
     // slot.assignedNodes() / assignedElements(): the light-DOM children
     // distributed into this <slot>. Refreshes the compose view from the live
@@ -8297,7 +7552,7 @@ fn create_render_element_object(
         .accessor(
             js_string!("type"),
             Some(type_getter_fn),
-            None,
+            Some(type_setter_fn),
             Attribute::CONFIGURABLE,
         )
         .accessor(
@@ -8309,13 +7564,13 @@ fn create_render_element_object(
         .accessor(
             js_string!("href"),
             Some(href_getter_fn),
-            None,
+            Some(href_setter_fn),
             Attribute::CONFIGURABLE,
         )
         .accessor(
             js_string!("src"),
             Some(src_getter_fn),
-            None,
+            Some(src_setter_fn),
             Attribute::CONFIGURABLE,
         )
         .function(assigned_nodes_fn, js_string!("assignedNodes"), 0)
@@ -8327,6 +7582,12 @@ fn create_render_element_object(
             Attribute::CONFIGURABLE,
         )
         .build();
+
+    dom_properties::attach(ctx, &obj, render_doc.clone(), node_id, dom_dirty.clone());
+    if let Err(error) = dom_tree::attach(ctx, &obj, render_doc.clone(), node_id, dom_dirty.clone())
+    {
+        tracing::warn!(%error, "DOM subtree methods failed to attach");
+    }
 
     // Canvas elements get the native WebGL surface (getContext / toDataURL /
     // width / height) so parsed and created canvases behave identically. The
@@ -9304,7 +8565,22 @@ fn register_document_object(
     })
     .name(js_string!("get readyState"))
     .build();
+    let default_view_getter =
+        NativeFunction::from_fn_ptr(|_, _, ctx| ctx.global_object().get(js_string!("window"), ctx))
+            .to_js_function(ctx.realm());
     let document_obj = boa_engine::object::ObjectInitializer::new(ctx)
+        .property(js_string!("nodeType"), 9, Attribute::CONFIGURABLE)
+        .property(
+            js_string!("nodeName"),
+            js_string!("#document"),
+            Attribute::CONFIGURABLE,
+        )
+        .accessor(
+            js_string!("defaultView"),
+            Some(default_view_getter),
+            None,
+            Attribute::CONFIGURABLE,
+        )
         .accessor(
             js_string!("title"),
             Some(title_getter_fn),
@@ -12324,6 +11600,7 @@ fn register_window_globals(
 
     // ── getComputedStyle(element) ──
     let gcs_dom = dom_snapshot.clone();
+    let gcs_render = render_doc_cell.clone();
     let get_computed_style_fn = unsafe {
         NativeFunction::from_closure(move |_this, args, ctx| {
             let element = args.first().cloned().unwrap_or(JsValue::null());
@@ -12337,8 +11614,12 @@ fn register_window_globals(
                 None => return Ok(JsValue::null()),
             };
 
+            let live = gcs_render
+                .borrow()
+                .as_ref()
+                .map(|doc| DomSnapshot::from_render_document(doc, "", ""));
             let dom = gcs_dom.read();
-            let snapshot = match dom.as_ref() {
+            let snapshot = match live.as_ref().or(dom.as_ref()) {
                 Some(s) => s,
                 None => return Ok(JsValue::null()),
             };
@@ -12540,26 +11821,6 @@ fn register_window_globals(
     let _ = ctx.register_global_property(
         js_string!("performance"),
         JsValue::from(perf_obj.clone()),
-        Attribute::all(),
-    );
-    // crypto global (for window.crypto)
-    let crypto_get_fn = unsafe {
-        NativeFunction::from_closure(move |_this, args, _ctx| {
-            // crypto.getRandomValues — fill ArrayBuffer/TypedArray with random bytes
-            // For now, just return the buffer as-is (full impl would copy random bytes)
-            if let Some(arg) = args.first() {
-                Ok(arg.clone())
-            } else {
-                Ok(JsValue::undefined())
-            }
-        })
-    };
-    let crypto_obj = boa_engine::object::ObjectInitializer::new(ctx)
-        .function(crypto_get_fn, js_string!("getRandomValues"), 1)
-        .build();
-    let _ = ctx.register_global_property(
-        js_string!("crypto"),
-        JsValue::from(crypto_obj),
         Attribute::all(),
     );
     // Stealth globals: real Chrome exposes `chrome`, `WebGLRenderingContext`,
@@ -12952,9 +12213,7 @@ fn register_window_globals(
         tracing::warn!(error = %e, "observer bootstrap failed");
     }
     // Telemetry (#15): install the counting `Proxy` AFTER the
-    // history/location bootstrap — it replaces the `window` global with a
-    // plain-object copy (`Object.assign({}, window, { location })`), which
-    // would discard an earlier wrap and break `window === self`. The same
+    // history/location bootstrap. The same
     // wrapped instance is registered as both `window` and `self`.
     if telemetry {
         if let Err(e) = ctx.eval(Source::from_bytes(TELEMETRY_WINDOW_PROXY)) {
@@ -13068,41 +12327,11 @@ fn register_window_globals(
     if let Err(e) = ctx.eval(Source::from_bytes(WEB_COMPONENTS_BOOTSTRAP)) {
         tracing::warn!(error = %e, "web components bootstrap failed");
     }
-    const FORMDATA_BLOB_BOOTSTRAP: &str = r#"
+    binary_streams::register(ctx).expect("failed to register binary streams");
+    xhr::mirror_window(ctx).expect("failed to mirror XMLHttpRequest");
+    const FORMDATA_BOOTSTRAP: &str = r#"
 (function () {
   function install(g) {
-    if (typeof g.Blob === 'undefined') {
-      function toBytes(parts) {
-        parts = parts || [];
-        var bytes = [];
-        for (var i = 0; i < parts.length; i++) {
-          var p = parts[i];
-          if (typeof p === 'string') {
-            for (var j = 0; j < p.length; j++) bytes.push(p.charCodeAt(j) & 0xff);
-          } else if (typeof p === 'number') {
-            bytes.push(p & 0xff);
-          } else if (p && typeof p.length === 'number') {
-            for (var j = 0; j < p.length; j++) bytes.push((p[j] || 0) & 0xff);
-          } else if (p && p.__bytes && typeof p.__bytes.length === 'number') {
-            for (var j = 0; j < p.__bytes.length; j++) bytes.push((p.__bytes[j] || 0) & 0xff);
-          }
-        }
-        return bytes;
-      }
-      function Blob(parts, opts) {
-        if (!(this instanceof Blob)) throw new TypeError("Failed to construct 'Blob'");
-        var b = toBytes(parts);
-        this.size = b.length;
-        this.type = (opts && opts.type) ? String(opts.type) : '';
-        this.__bytes = new Uint8Array(b);
-        this.__isBlob = true;
-        var src = b;
-        this.arrayBuffer = function () { return Promise.resolve(new Uint8Array(src)); };
-        this.text = function () { var s = ''; for (var i = 0; i < src.length; i++) s += String.fromCharCode(src[i]); return Promise.resolve(s); };
-        this.slice = function () { return new Blob([]); };
-      }
-      g.Blob = Blob;
-    }
     if (typeof g.FormData === 'undefined') {
       function FormData() {
         if (!(this instanceof FormData)) throw new TypeError("Failed to construct 'FormData'");
@@ -13188,7 +12417,7 @@ fn register_window_globals(
   }
 })();
 "#;
-    if let Err(e) = ctx.eval(Source::from_bytes(FORMDATA_BLOB_BOOTSTRAP)) {
+    if let Err(e) = ctx.eval(Source::from_bytes(FORMDATA_BOOTSTRAP)) {
         tracing::warn!(error = %e, "formdata/blob bootstrap failed");
     }
     const CANVAS_BOOTSTRAP: &str = r#"
@@ -13488,20 +12717,37 @@ fn register_window_globals(
     globalThis.Intl = IntlObj;
   }
   if (globalThis.window) globalThis.window.Intl = globalThis.Intl;
-  // Error.stack: boa leaves it undefined; give a V8-shaped trace so sandbox/
-  // headless detectors reading `new Error().stack` see a Chrome frame, not
-  // `undefined`. Exact line numbers are unknowable from JS — this passes the
-  // common "is .stack a non-empty string starting with the error name" check.
-  if (typeof Error.prototype.stack === 'undefined') {
+  // Reading Error.prototype.stack invokes its getter with a non-Error and
+  // returns undefined even when Boa supports native stacks. Preserve that
+  // getter; replacing it hid the source locations of module failures.
+  var nativeStack = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+  if ((!nativeStack || nativeStack.configurable) && !(nativeStack && nativeStack.get && nativeStack.get.__oxiPreservesNativeStack)) {
+    var stackGetter = function () {
+      var name = (this && this.constructor && this.constructor.name) ? this.constructor.name : 'Error';
+      var msg = (this && typeof this.message === 'string' && this.message.length) ? (': ' + this.message) : '';
+      var frames = nativeStack && nativeStack.get ? nativeStack.get.call(this) : undefined;
+      if (typeof frames === 'string' && frames.length) return frames.indexOf(name) === 0 ? frames : name + msg + '\n' + frames;
+      return name + msg + '\n    at Object.<anonymous> (<anonymous>:1:1)';
+    };
+    Object.defineProperty(stackGetter,'__oxiPreservesNativeStack',{value:true});
     Object.defineProperty(Error.prototype, 'stack', {
       configurable: true,
-      get: function () {
-        var name = (this && this.constructor && this.constructor.name) ? this.constructor.name : 'Error';
-        var msg = (this && typeof this.message === 'string' && this.message.length) ? (': ' + this.message) : '';
-        return name + msg + '\n    at Object.<anonymous> (<anonymous>:1:1)';
-      }
+      set: nativeStack && nativeStack.set,
+      get: stackGetter
     });
   }
+  if (typeof globalThis.DOMException === 'undefined') {
+    var domErrorNames=['IndexSizeError',null,'HierarchyRequestError','WrongDocumentError','InvalidCharacterError',null,'NoModificationAllowedError','NotFoundError','NotSupportedError','InUseAttributeError','InvalidStateError','SyntaxError','InvalidModificationError','NamespaceError','InvalidAccessError',null,'TypeMismatchError','SecurityError','NetworkError','AbortError','URLMismatchError','QuotaExceededError','TimeoutError','InvalidNodeTypeError','DataCloneError'];
+    globalThis.DOMException=class DOMException extends Error {
+      constructor(message, name) {
+        message=message===undefined?'':String(message);
+        name=name===undefined?'Error':String(name);
+        super(message);
+        Object.defineProperties(this,{name:{value:name,configurable:true},code:{value:domErrorNames.indexOf(name)+1,configurable:true}});
+      }
+    };
+  }
+  if (globalThis.window) globalThis.window.DOMException=globalThis.DOMException;
   // structuredClone: deep-clone plain objects, arrays, Date, RegExp, Map,
   // Set and primitives (cycle-safe via WeakMap). Functions are not
   // cloneable — throws with name 'DataCloneError', matching the spec.
@@ -13701,25 +12947,32 @@ fn register_window_globals(
   }
   // AbortController / AbortSignal (feature-detect + basic abort propagation).
   if (typeof globalThis.AbortController === 'undefined') {
+    var abortSignals = new WeakSet();
     function AbortSignal() {
+      abortSignals.add(this);
       this.aborted = false; this.reason = undefined; this.onabort = null;
       var listeners = [];
       this.addEventListener = function (t, cb) { if (t === 'abort' && typeof cb === 'function') listeners.push(cb); };
       this.removeEventListener = function (t, cb) { if (t === 'abort') listeners = listeners.filter(function (f) { return f !== cb; }); };
       this._abort = function (reason) {
         if (this.aborted) return;
-        this.aborted = true; this.reason = reason;
+        this.aborted = true;
+        this.reason = reason === undefined ? new DOMException('This operation was aborted', 'AbortError') : reason;
         var ev = { type: 'abort', target: this };
         if (typeof this.onabort === 'function') { try { this.onabort(ev); } catch (e) {} }
         for (var i = 0; i < listeners.length; i++) { try { listeners[i](ev); } catch (e) {} }
       };
     }
+    AbortSignal.prototype.throwIfAborted = function () {
+      if (!abortSignals.has(this)) throw new TypeError('Invalid AbortSignal receiver');
+      if (this.aborted) throw this.reason;
+    };
     function AbortController() { this.signal = new AbortSignal(); }
     AbortController.prototype.abort = function (reason) { this.signal._abort(reason); };
     globalThis.AbortSignal = AbortSignal;
     globalThis.AbortController = AbortController;
-    if (globalThis.window) { globalThis.window.AbortController = AbortController; globalThis.window.AbortSignal = AbortSignal; }
   }
+  if (globalThis.window) { window.AbortController = globalThis.AbortController; window.AbortSignal = globalThis.AbortSignal; }
 })();
 "#;
 
@@ -13937,7 +13190,7 @@ fn register_window_globals(
   // the standard `location.hash = '#x'` syntax working.
   try {
     var wloc = globalThis.window && globalThis.window.location;
-    if (wloc) globalThis.window = Object.assign({}, globalThis.window, { location: makeLocationProxy(wloc) });
+    if (wloc) globalThis.window.location = makeLocationProxy(wloc);
   } catch (e) {}
   try {
     if (globalThis.window) {
@@ -13996,6 +13249,18 @@ fn register_window_globals(
       return __oxiFetch.call(globalThis, input, init);
     };
     if (globalThis.window) { globalThis.window.fetch = globalThis.fetch; }
+  }
+  // Some host APIs are installed after window construction. Forward them
+  // lazily so window/defaultView and unqualified global calls stay in sync.
+  if (globalThis.window) {
+    ['requestAnimationFrame','cancelAnimationFrame','setTimeout','clearTimeout','setInterval','clearInterval','crypto','URL','URLSearchParams','XMLHttpRequest'].forEach(function(name) {
+      Object.defineProperty(window,name,{configurable:true,enumerable:true,
+        get:function(){return globalThis[name];},set:function(value){globalThis[name]=value;}});
+    });
+    ['innerWidth','innerHeight','outerWidth','outerHeight','devicePixelRatio'].forEach(function(name) {
+      Object.defineProperty(globalThis,name,{configurable:true,enumerable:true,
+        get:function(){return window[name];},set:function(value){window[name]=value;}});
+    });
   }
  })();
 "#;
@@ -14423,7 +13688,7 @@ mod tests {
             source: source.to_string(),
             src_url: None,
             kind: ScriptKind::Classic,
-            execute: ExecuteTiming::Defer,
+            execute: ExecuteTiming::Blocking,
         }
     }
 
@@ -15886,6 +15151,7 @@ mod tests {
     async fn test_js_runtime_config_custom() {
         // Verify custom config is applied
         let config = JsRuntimeConfig {
+            background_event_loop: false,
             timeout_ms: 1000,
             max_recursion: 10,
             max_loop_iterations: 50,
@@ -16271,6 +15537,7 @@ mod tests {
                     url: req.url,
                     headers: vec![],
                     body: String::new(),
+                    body_bytes: None,
                     error: None,
                 });
             }
@@ -16388,6 +15655,7 @@ mod tests {
                     url: req.url,
                     headers: vec![],
                     body: String::new(),
+                    body_bytes: None,
                     error: None,
                 });
             }
@@ -17225,6 +16493,7 @@ mod tests {
                         url: req.url,
                         headers: vec![("content-type".to_string(), "application/json".to_string())],
                         body,
+                        body_bytes: None,
                         error: None,
                     });
                 });

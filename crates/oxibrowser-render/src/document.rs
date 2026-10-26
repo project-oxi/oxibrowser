@@ -109,8 +109,7 @@ pub struct CaptureOpts {
     pub full_page: bool,
 }
 
-/// Build a `QualName` for an HTML-namespaced element/attribute from a runtime
-/// tag/name string (no macro-literal required).
+/// Build a `QualName` for an HTML-namespaced element from a runtime tag.
 fn html_name(local: &str) -> QualName {
     QualName::new(None, ns!(html), LocalName::from(local))
 }
@@ -121,6 +120,7 @@ fn html_name(local: &str) -> QualName {
 /// laid out. Not `Send` — must be used from a single thread (see crate docs).
 pub struct RenderDocument {
     doc: BaseDocument,
+    base_url: String,
     viewport: Viewport,
     tree_revision: u64,
     next_incarnation: u64,
@@ -168,6 +168,7 @@ impl RenderDocument {
 
         Ok(Self {
             doc,
+            base_url: base_url.unwrap_or("about:blank").to_owned(),
             viewport,
             tree_revision: 0,
             next_incarnation: 1,
@@ -211,6 +212,7 @@ impl RenderDocument {
         doc.resolve(0.0);
         Ok(Self {
             doc,
+            base_url: base_url.unwrap_or("about:blank").to_owned(),
             viewport,
             tree_revision: 0,
             next_incarnation: 1,
@@ -226,6 +228,11 @@ impl RenderDocument {
     /// The viewport this document was constructed (and laid out) against.
     pub fn viewport(&self) -> Viewport {
         self.viewport
+    }
+
+    /// Flush pending style/layout changes before synchronous DOM geometry reads.
+    pub fn flush_layout(&mut self) {
+        self.doc.resolve(0.0);
     }
 
     /// Borrow the inner [`BaseDocument`] mutably. Callers are responsible for
@@ -324,6 +331,62 @@ impl RenderDocument {
             .unwrap_or_default()
     }
 
+    /// Query descendants of a connected or detached element using Stylo.
+    pub fn query_selector_all_from(
+        &self,
+        node: NodeId,
+        selector: &str,
+    ) -> Result<Vec<NodeId>, String> {
+        use style::dom_apis::{MayUseInvalidation, QueryAll, query_selector};
+        let selectors = self
+            .doc
+            .try_parse_selector_list(selector)
+            .map_err(|_| "invalid selector".to_owned())?;
+        let Some(root) = self.doc.get_node(node) else {
+            return Ok(Vec::new());
+        };
+        let mut results = Default::default();
+        query_selector::<&blitz_dom::Node, QueryAll>(
+            root,
+            &selectors,
+            &mut results,
+            MayUseInvalidation::No,
+        );
+        Ok(results.iter().map(|node| node.id).collect())
+    }
+
+    pub fn element_matches(&self, node: NodeId, selector: &str) -> Result<bool, String> {
+        let selectors = self
+            .doc
+            .try_parse_selector_list(selector)
+            .map_err(|_| "invalid selector".to_owned())?;
+        Ok(self.doc.get_node(node).is_some_and(|node| {
+            style::dom_apis::element_matches(
+                &node,
+                &selectors,
+                style::context::QuirksMode::NoQuirks,
+            )
+        }))
+    }
+
+    pub fn element_closest(&self, node: NodeId, selector: &str) -> Result<Option<NodeId>, String> {
+        let selectors = self
+            .doc
+            .try_parse_selector_list(selector)
+            .map_err(|_| "invalid selector".to_owned())?;
+        Ok(self
+            .doc
+            .get_node(node)
+            .and_then(|node| {
+                style::dom_apis::element_closest(
+                    node,
+                    &selectors,
+                    style::context::QuirksMode::NoQuirks,
+                )
+            })
+            .map(|node| node.id))
+    }
+
     /// The tag name of `node` (lowercased), or `None` if not an element.
     pub fn tag_name(&self, node: NodeId) -> Option<String> {
         self.doc
@@ -401,6 +464,34 @@ impl RenderDocument {
         self.incarnations.remove(&id);
         self.node_incarnation(id);
         id
+    }
+
+    /// Clone DOM structure and attributes, preserving element namespaces.
+    /// Listeners and JS properties belong to the original wrapper only.
+    pub fn clone_node(&mut self, node: NodeId, deep: bool) -> Option<NodeId> {
+        let original = self.doc.get_node(node)?;
+        let children = original.children.clone();
+        let id = if let Some(element) = original.data.downcast_element() {
+            let name = element.name.clone();
+            let attrs = element.attrs().to_vec();
+            self.tree_revision += 1;
+            let id = self.doc.mutate().create_element(name, attrs);
+            self.incarnations.remove(&id);
+            self.node_incarnation(id);
+            id
+        } else {
+            let text = original.text_data()?;
+            let text = text.content.clone();
+            self.create_text_node(&text)
+        };
+        if deep {
+            for child in children {
+                if let Some(child) = self.clone_node(child, true) {
+                    self.append_child(id, child);
+                }
+            }
+        }
+        Some(id)
     }
 
     /// Append `child` to `parent`'s children.
@@ -486,19 +577,126 @@ impl RenderDocument {
 
     /// Set (or replace) an attribute on `node`.
     pub fn set_attribute(&mut self, node: NodeId, name: &str, value: &str) {
-        self.doc
-            .mutate()
-            .set_attribute(node, html_name(name), value);
+        // HTML attributes have no namespace. Using the element's HTML
+        // namespace creates a second attribute beside the parsed one, so
+        // getAttribute keeps returning the old value and deletion misses it.
+        self.doc.mutate().set_attribute(
+            node,
+            QualName::new(None, Default::default(), LocalName::from(name)),
+            value,
+        );
     }
 
     /// Remove an attribute from `node`.
     pub fn remove_attribute(&mut self, node: NodeId, name: &str) {
-        self.doc.mutate().clear_attribute(node, html_name(name));
+        self.doc.mutate().clear_attribute(
+            node,
+            QualName::new(None, Default::default(), LocalName::from(name)),
+        );
     }
 
     /// Set an inline style property on `node` (e.g. `color`, `background-color`).
     pub fn set_inline_style(&mut self, node: NodeId, property: &str, value: &str) {
         self.doc.set_style_property(node, property, value);
+    }
+
+    /// Read the actual parsed inline declaration, including priority.
+    pub fn inline_style(&self, node: NodeId, property: &str) -> (String, bool) {
+        let Some(block) = self
+            .doc
+            .get_node(node)
+            .and_then(|node| node.data.downcast_element())
+            .and_then(|element| element.style_attribute.as_ref())
+        else {
+            return (String::new(), false);
+        };
+        let Ok(property) = style::properties::PropertyId::parse_unchecked(property, None) else {
+            return (String::new(), false);
+        };
+        let guard = self.doc.guard().read();
+        let block = block.read_with(&guard);
+        let mut value = String::new();
+        let _ = block.property_value_to_css(&property, &mut value);
+        (value, block.property_priority(&property).important())
+    }
+
+    pub fn remove_inline_style(&mut self, node: NodeId, property: &str) -> String {
+        let previous = self.inline_style(node, property).0;
+        self.doc.remove_style_property(node, property);
+        self.sync_style_attribute(node);
+        previous
+    }
+
+    pub fn set_inline_style_with_priority(
+        &mut self,
+        node: NodeId,
+        property: &str,
+        value: &str,
+        important: bool,
+    ) {
+        use style::properties::{Importance, PropertyId, SourcePropertyDeclaration};
+        use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
+        let Ok(property_id) = PropertyId::parse_unchecked(property, None) else {
+            return;
+        };
+        if value.is_empty() {
+            self.remove_inline_style(node, property);
+            return;
+        }
+        let Ok(url) = self.base_url.parse() else {
+            return;
+        };
+        let url_data = UrlExtraData(style::servo_arc::Arc::new(url));
+        let mut declarations = SourcePropertyDeclaration::default();
+        if style::properties::declaration_block::parse_one_declaration_into(
+            &mut declarations,
+            property_id,
+            value,
+            Origin::Author,
+            &url_data,
+            None,
+            style_traits::ParsingMode::DEFAULT,
+            style::context::QuirksMode::NoQuirks,
+            CssRuleType::Style,
+        )
+        .is_err()
+        {
+            return;
+        }
+        self.doc.remove_style_property(node, property);
+        // Ensure a style block exists even on an element without style=.
+        self.doc.set_style_property(node, property, value);
+        if let Some(block) = self
+            .doc
+            .get_node(node)
+            .and_then(|node| node.data.downcast_element())
+            .and_then(|element| element.style_attribute.as_ref())
+        {
+            let mut guard = self.doc.guard().write();
+            block.write_with(&mut guard).extend(
+                declarations.drain(),
+                if important {
+                    Importance::Important
+                } else {
+                    Importance::Normal
+                },
+            );
+        }
+        self.sync_style_attribute(node);
+    }
+
+    fn sync_style_attribute(&mut self, node: NodeId) {
+        let mut css = String::new();
+        if let Some(block) = self
+            .doc
+            .get_node(node)
+            .and_then(|node| node.data.downcast_element())
+            .and_then(|element| element.style_attribute.as_ref())
+        {
+            let guard = self.doc.guard().read();
+            let _ = block.read_with(&guard).to_css(&mut css);
+        }
+        self.set_attribute(node, "style", &css);
     }
 
     /// Replace `node`'s children with a single text node containing `text`.

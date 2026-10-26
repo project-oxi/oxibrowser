@@ -465,6 +465,7 @@ async fn maybe_intercept(
                 url: url.to_string(),
                 headers: vec![],
                 body: String::new(),
+                body_bytes: None,
                 error: Some(error_reason),
             })
         }
@@ -480,6 +481,7 @@ async fn maybe_intercept(
             url: url.to_string(),
             headers,
             body: String::from_utf8_lossy(&body).into_owned(),
+            body_bytes: Some(body),
             error: None,
         }),
         Err(_) => {
@@ -626,6 +628,7 @@ fn handle_fetch_requests(
                                 url: url_str,
                                 headers: vec![],
                                 body: String::new(),
+                                body_bytes: None,
                                 error: Some("offline".to_string()),
                             });
                             in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -641,6 +644,7 @@ fn handle_fetch_requests(
                                 url: url_str,
                                 headers: vec![],
                                 body: String::new(),
+                                body_bytes: None,
                                 error: Some("invalid URL".to_string()),
                             });
                             in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -709,6 +713,7 @@ fn handle_fetch_requests(
                                                 url: resp_url,
                                                 headers,
                                                 body: String::new(),
+                                                body_bytes: None,
                                                 error: Some(format!("failed to read body: {}", e)),
                                             });
                                             in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -716,11 +721,21 @@ fn handle_fetch_requests(
                                         }
                                     };
                                 if truncated {
-                                    tracing::warn!(
-                                        url = %resp_url,
-                                        max_bytes = max_body_bytes,
-                                        "fetch body truncated"
-                                    );
+                                    fail_record(&network_log, Some(status));
+                                    let _ = response_tx.send(FetchResponseMsg {
+                                        id,
+                                        status,
+                                        status_text,
+                                        url: resp_url,
+                                        headers,
+                                        body: String::new(),
+                                        body_bytes: None,
+                                        error: Some(format!(
+                                            "response body exceeds limit of {max_body_bytes} bytes"
+                                        )),
+                                    });
+                                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    return;
                                 }
                                 let body_len = resp_body.len() as u64;
                                 let body = String::from_utf8_lossy(&resp_body).into_owned();
@@ -741,6 +756,7 @@ fn handle_fetch_requests(
                                     url: resp_url,
                                     headers,
                                     body,
+                                    body_bytes: Some(resp_body),
                                     error: None,
                                 });
                                 in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -754,6 +770,7 @@ fn handle_fetch_requests(
                                     url: url_str,
                                     headers: vec![],
                                     body: String::new(),
+                                    body_bytes: None,
                                     error: Some(e.to_string()),
                                 });
                                 in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -2025,6 +2042,11 @@ impl Session {
         if !scripts.is_empty() {
             let base = Url::parse(&url).ok();
             for s in scripts.iter_mut() {
+                if s.kind == crate::js::dom_snapshot::ScriptKind::Module {
+                    // The module loader fetches and caches entry scripts and
+                    // their dependency graphs, validating status and MIME.
+                    continue;
+                }
                 let Some(src) = s.src_url.clone() else {
                     continue;
                 };
@@ -2063,7 +2085,7 @@ impl Session {
                         source: source.clone(),
                         src_url: None,
                         kind: ScriptKind::Classic,
-                        execute: ExecuteTiming::Defer,
+                        execute: ExecuteTiming::Blocking,
                     }
                 })
                 .collect();
@@ -2288,6 +2310,9 @@ impl Session {
             if !scripts.is_empty() {
                 let base = Url::parse(&url_str).ok().or_else(|| base_url.join("").ok());
                 for s in scripts.iter_mut() {
+                    if s.kind == crate::js::dom_snapshot::ScriptKind::Module {
+                        continue;
+                    }
                     let Some(src) = s.src_url.clone() else {
                         continue;
                     };
