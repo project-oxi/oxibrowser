@@ -393,10 +393,10 @@ fn target_node(
         .and_then(Value::as_u64)
         .and_then(|id| usize::try_from(id).ok())
         .ok_or("Missing node id")?;
-    if !rd
+    if rd
         .borrow()
         .as_ref()
-        .is_some_and(|doc| doc.document().get_node(id).is_some())
+        .is_none_or(|doc| doc.document().get_node(id).is_none())
     {
         return Err("Node does not exist in this document".into());
     }
@@ -584,10 +584,10 @@ pub(super) fn handle(
                 .and_then(Value::as_u64)
                 .and_then(|id| usize::try_from(id).ok())
                 .ok_or("Missing node id")?;
-            if !rd
+            if rd
                 .borrow()
                 .as_ref()
-                .is_some_and(|document| document.document().get_node(node_id).is_some())
+                .is_none_or(|document| document.document().get_node(node_id).is_none())
             {
                 return Err(format!("Could not find node with given id: {node_id}"));
             }

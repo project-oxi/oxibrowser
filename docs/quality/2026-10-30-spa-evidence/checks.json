@@ -4,25 +4,26 @@
     {
       "command": "cargo build --release --features browser --bin oxibrowser",
       "status": "pass",
-      "logSha256": "3e49ed1785d513d5c12be353c7ce93016f3f51d6110d603f72c79808f86bd4e3"
+      "logSha256": "2d94d1e4882a980d08d9dc9614849fa1b4f93b8beeab47a3da82075913ae78ca"
     },
     {
       "command": "cargo clippy --workspace --all-targets --features oxibrowser/browser -- -D warnings",
       "status": "pass",
-      "logSha256": "70bc2a41edafab846f8c94829a2bbc17b1d9cadad361aa507566fd6225ee16b4"
+      "logSha256": "89c6a8b2584bb373fc8dc15243798eaa68a89d9eed25d993d7701013dae30e44"
     },
     {
       "command": "cargo fmt --all -- --check",
-      "status": "pass"
+      "status": "pass",
+      "logSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     },
     {
       "command": "cargo test --workspace --features oxibrowser/browser --no-fail-fast",
       "status": "pass",
-      "passed": 1314,
+      "passed": 1315,
       "failed": 0,
       "ignored": 35,
       "targets": 58,
-      "logSha256": "af3cc9c26c73b8c5f0726b09305121f0b9b41eb5a9557ac3f5efc40afb935ff0"
+      "logSha256": "9af1172085408fa062a3cee9493edd2283a4376f25ea8f71f799038ecd98c71b"
     },
     {
       "command": "cargo test -p oxibrowser-core --features webgl --test native_input --test keyboard_input --test image_loading --test image_webgl --test webgl_multi_context --test webgl_index_offsets --test webgl2_buffers_queries -- --test-threads=1",
@@ -30,7 +31,7 @@
       "passed": 35,
       "failed": 0,
       "ignored": 1,
-      "logSha256": "0711aaee286987234041e8933f918522756f3b68cc8a2045c348a0d688f55610"
+      "logSha256": "64f57d899241dafc24aa2155357bcd0b3442d3eb4928324f7f78be52d048e4e6"
     },
     {
       "command": "cargo test -p oxibrowser-cdp --test e2e -- --test-threads=1",
@@ -38,6 +39,16 @@
       "passed": 43,
       "failed": 0,
       "logSha256": "6785e4e750d887f1f78dad3c54212e7360aa900f635d95fb7f6925eb27136be9"
+    },
+    {
+      "command": "cargo +1.96 clippy --workspace --all-targets --features oxibrowser/browser -- -D warnings",
+      "status": "pass",
+      "logSha256": "e33c80f1f520a3baeedeedcb19cfbd1077fa469d5a99e9c695ece877df35e8de"
+    },
+    {
+      "command": "cargo deny check advisories licenses bans sources",
+      "status": "pass",
+      "logSha256": "5611d2d148a3e98452b877c927b39a4bf080b31af1811fa96dfd99be6832a24e"
     }
   ],
   "host": {
@@ -47,7 +58,8 @@
     "rustc": "1.99.1(58cf8f9c3 2026-10-13)",
     "node": "24.20.0",
     "python": "3.9.6",
-    "referenceChrome": "156.0.8078.49"
+    "referenceChrome": "156.0.8078.49",
+    "additionalClippyRustc": "1.96.1 (31fca3adb 2026-06-26)"
   },
   "profile": "release, browser enabled; webgl disabled for SPA acceptance",
   "notes": [
@@ -55,7 +67,7 @@
     "RSS samples cover spawned OxiBrowser process at2s intervals, not true peak; Chrome subprocess RSS was not measured.",
     "Vendoredblitz-dom0.3.0-beta.1 archiveSHA256 a9f438e914c626f4f56cd58cd88045e164e1ac32e12d7c24d09c25121328161e; six documented source differences, no archive files missing."
   ],
-  "binarySha256": "7aaaf0a23b2b98161d0203b105f6e4981dbdc30e51ff84c99bd30cb05d50cfba",
+  "binarySha256": "8cae01ba3a2679f43e28049e883527a08f6a062ba53813cc5e8790dcf6d8d638",
   "historicalFailures": [
     {
       "kind": "retired native realm root",
@@ -75,5 +87,34 @@
       "fix": "buffer nonmatching messages as send_command alreadydoes",
       "regression": "CDP43suite thenentire1314workspace passed"
     }
-  ]
+  ],
+  "securityRepair": {
+    "advisories": [
+      "RUSTSEC-2026-0391",
+      "RUSTSEC-2026-0398",
+      "RUSTSEC-2026-0403",
+      "RUSTSEC-2026-0410"
+    ],
+    "versions": {
+      "compression-codecs": "0.4.40",
+      "zstd": "0.14.3",
+      "zstd-safe": "8.2.0",
+      "zstd-sys": "2.1.2+zstd.1.5.7"
+    },
+    "wreqUtil": "exact published3.0.0-rc.13, manifest-only zstd version patch",
+    "archiveSha256": "9c1565487def020541fed7fe1d2564770e78b9abab56fea1412623f1071eadfd",
+    "archiveFiles": 55,
+    "modifiedArchiveFiles": [
+      "Cargo.toml",
+      "Cargo.toml.orig"
+    ],
+    "advisoryPolicyChanged": false,
+    "httpZstdAndTlsEmulationPreserved": true,
+    "freshIndependentReview": "no actionable findings",
+    "regressionTest": "fetch_http_decodes_zstd_binary_response"
+  },
+  "stabilityConditions": {
+    "stability.json": "after owned build/test processes exited;100cycles+2contexts PASS",
+    "stability-under-build-load.json": "concurrent Rust builds/checks;100cycles+2contexts PASS"
+  }
 }

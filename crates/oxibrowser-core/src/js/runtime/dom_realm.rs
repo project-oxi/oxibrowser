@@ -1012,10 +1012,10 @@ pub(super) fn tree_mutations(
                     .as_object()
                     .and_then(|o| node_id_in_document(ctx, &o, &rd))
                     .ok_or_else(|| JsNativeError::typ().with_message("argument is not a Node"))?;
-                if !rd
+                if rd
                     .borrow()
                     .as_ref()
-                    .is_some_and(|d| d.parent_id(old_id) == Some(parent))
+                    .is_none_or(|d| d.parent_id(old_id) != Some(parent))
                 {
                     return Err(JsNativeError::typ()
                         .with_message("NotFoundError: node is not a child of this parent")

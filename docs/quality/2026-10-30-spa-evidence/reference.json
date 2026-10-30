@@ -1,13 +1,13 @@
 {
-  "startedAt": "2026-10-30T02:11:40.538Z",
-  "baseUrl": "http://127.0.0.1:50487",
+  "startedAt": "2026-10-30T02:54:39.108Z",
+  "baseUrl": "http://127.0.0.1:56338",
   "argv": [
     "--chrome",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
     "--runs",
     "1",
     "--out",
-    "/private/tmp/oxi-spa-viewport-acceptance/reference"
+    "/private/tmp/oxi-spa-security-acceptance/reference"
   ],
   "node": "v24.20.0",
   "caseTimeoutMs": 30000,
@@ -53,7 +53,7 @@
             {
               "name": "vanilla-form",
               "file": "vanilla.html",
-              "url": "http://127.0.0.1:50487/vanilla.html",
+              "url": "http://127.0.0.1:56338/vanilla.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -78,8 +78,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--vanilla-form-run1.png",
-              "ms": 375,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--vanilla-form-run1.png",
+              "ms": 623,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -88,7 +88,7 @@
             {
               "name": "react-counter",
               "file": "react.html",
-              "url": "http://127.0.0.1:50487/react.html",
+              "url": "http://127.0.0.1:56338/react.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -105,8 +105,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--react-counter-run1.png",
-              "ms": 195,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--react-counter-run1.png",
+              "ms": 313,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -115,7 +115,7 @@
             {
               "name": "react-controlled-input",
               "file": "react.html",
-              "url": "http://127.0.0.1:50487/react.html",
+              "url": "http://127.0.0.1:56338/react.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -132,8 +132,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--react-controlled-input-run1.png",
-              "ms": 233,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--react-controlled-input-run1.png",
+              "ms": 445,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -142,7 +142,7 @@
             {
               "name": "react-list",
               "file": "react.html",
-              "url": "http://127.0.0.1:50487/react.html",
+              "url": "http://127.0.0.1:56338/react.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -165,8 +165,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--react-list-run1.png",
-              "ms": 345,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--react-list-run1.png",
+              "ms": 579,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -175,7 +175,7 @@
             {
               "name": "react-conditional",
               "file": "react.html",
-              "url": "http://127.0.0.1:50487/react.html",
+              "url": "http://127.0.0.1:56338/react.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -193,8 +193,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--react-conditional-run1.png",
-              "ms": 152,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--react-conditional-run1.png",
+              "ms": 359,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -203,7 +203,7 @@
             {
               "name": "vue-counter",
               "file": "vue.html",
-              "url": "http://127.0.0.1:50487/vue.html",
+              "url": "http://127.0.0.1:56338/vue.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -220,8 +220,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--vue-counter-run1.png",
-              "ms": 166,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--vue-counter-run1.png",
+              "ms": 412,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -230,7 +230,7 @@
             {
               "name": "vue-controlled-input",
               "file": "vue.html",
-              "url": "http://127.0.0.1:50487/vue.html",
+              "url": "http://127.0.0.1:56338/vue.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -247,8 +247,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--vue-controlled-input-run1.png",
-              "ms": 234,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--vue-controlled-input-run1.png",
+              "ms": 466,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -257,7 +257,7 @@
             {
               "name": "vue-list",
               "file": "vue.html",
-              "url": "http://127.0.0.1:50487/vue.html",
+              "url": "http://127.0.0.1:56338/vue.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -280,8 +280,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--vue-list-run1.png",
-              "ms": 319,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--vue-list-run1.png",
+              "ms": 480,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -290,7 +290,7 @@
             {
               "name": "vue-conditional",
               "file": "vue.html",
-              "url": "http://127.0.0.1:50487/vue.html",
+              "url": "http://127.0.0.1:56338/vue.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -308,8 +308,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--vue-conditional-run1.png",
-              "ms": 164,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--vue-conditional-run1.png",
+              "ms": 268,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -318,7 +318,7 @@
             {
               "name": "async-fetch",
               "file": "async.html",
-              "url": "http://127.0.0.1:50487/async.html",
+              "url": "http://127.0.0.1:56338/async.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -333,8 +333,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--async-fetch-run1.png",
-              "ms": 213,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--async-fetch-run1.png",
+              "ms": 262,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -343,7 +343,7 @@
             {
               "name": "async-router",
               "file": "async.html",
-              "url": "http://127.0.0.1:50487/async.html",
+              "url": "http://127.0.0.1:56338/async.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -369,8 +369,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--async-router-run1.png",
-              "ms": 433,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--async-router-run1.png",
+              "ms": 372,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -379,7 +379,7 @@
             {
               "name": "async-stylesheet",
               "file": "async.html",
-              "url": "http://127.0.0.1:50487/async.html",
+              "url": "http://127.0.0.1:56338/async.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -397,8 +397,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--async-stylesheet-run1.png",
-              "ms": 302,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--async-stylesheet-run1.png",
+              "ms": 326,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -407,7 +407,7 @@
             {
               "name": "storage-reload",
               "file": "storage.html",
-              "url": "http://127.0.0.1:50487/storage.html",
+              "url": "http://127.0.0.1:56338/storage.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -428,8 +428,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--storage-reload-run1.png",
-              "ms": 238,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--storage-reload-run1.png",
+              "ms": 470,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -438,7 +438,7 @@
             {
               "name": "frame-nested",
               "file": "frames.html",
-              "url": "http://127.0.0.1:50487/frames.html",
+              "url": "http://127.0.0.1:56338/frames.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -457,8 +457,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--frame-nested-run1.png",
-              "ms": 220,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--frame-nested-run1.png",
+              "ms": 459,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -467,7 +467,7 @@
             {
               "name": "geometry-rect",
               "file": "frames.html",
-              "url": "http://127.0.0.1:50487/frames.html",
+              "url": "http://127.0.0.1:56338/frames.html",
               "run": 1,
               "status": "pass",
               "errors": [],
@@ -487,8 +487,8 @@
                 "requestFailed": [],
                 "httpErrors": []
               },
-              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/reference/screenshots/chrome--geometry-rect-run1.png",
-              "ms": 119,
+              "screenshot": "/private/tmp/oxi-spa-security-acceptance/reference/screenshots/chrome--geometry-rect-run1.png",
+              "ms": 238,
               "screenshotSize": {
                 "width": 1280,
                 "height": 800
@@ -512,105 +512,105 @@
           "name": "vanilla-form",
           "pass": 1,
           "fail": 0,
-          "avgMs": 375,
+          "avgMs": 623,
           "firstError": null
         },
         {
           "name": "react-counter",
           "pass": 1,
           "fail": 0,
-          "avgMs": 195,
+          "avgMs": 313,
           "firstError": null
         },
         {
           "name": "react-controlled-input",
           "pass": 1,
           "fail": 0,
-          "avgMs": 233,
+          "avgMs": 445,
           "firstError": null
         },
         {
           "name": "react-list",
           "pass": 1,
           "fail": 0,
-          "avgMs": 345,
+          "avgMs": 579,
           "firstError": null
         },
         {
           "name": "react-conditional",
           "pass": 1,
           "fail": 0,
-          "avgMs": 152,
+          "avgMs": 359,
           "firstError": null
         },
         {
           "name": "vue-counter",
           "pass": 1,
           "fail": 0,
-          "avgMs": 166,
+          "avgMs": 412,
           "firstError": null
         },
         {
           "name": "vue-controlled-input",
           "pass": 1,
           "fail": 0,
-          "avgMs": 234,
+          "avgMs": 466,
           "firstError": null
         },
         {
           "name": "vue-list",
           "pass": 1,
           "fail": 0,
-          "avgMs": 319,
+          "avgMs": 480,
           "firstError": null
         },
         {
           "name": "vue-conditional",
           "pass": 1,
           "fail": 0,
-          "avgMs": 164,
+          "avgMs": 268,
           "firstError": null
         },
         {
           "name": "async-fetch",
           "pass": 1,
           "fail": 0,
-          "avgMs": 213,
+          "avgMs": 262,
           "firstError": null
         },
         {
           "name": "async-router",
           "pass": 1,
           "fail": 0,
-          "avgMs": 433,
+          "avgMs": 372,
           "firstError": null
         },
         {
           "name": "async-stylesheet",
           "pass": 1,
           "fail": 0,
-          "avgMs": 302,
+          "avgMs": 326,
           "firstError": null
         },
         {
           "name": "storage-reload",
           "pass": 1,
           "fail": 0,
-          "avgMs": 238,
+          "avgMs": 470,
           "firstError": null
         },
         {
           "name": "frame-nested",
           "pass": 1,
           "fail": 0,
-          "avgMs": 220,
+          "avgMs": 459,
           "firstError": null
         },
         {
           "name": "geometry-rect",
           "pass": 1,
           "fail": 0,
-          "avgMs": 119,
+          "avgMs": 238,
           "firstError": null
         }
       ]

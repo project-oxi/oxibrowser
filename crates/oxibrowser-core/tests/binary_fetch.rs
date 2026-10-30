@@ -131,6 +131,47 @@ async fn fetch_http_preserves_binary_and_decodes_utf8() {
     server.verify().await;
 }
 
+#[tokio::test]
+async fn fetch_http_decodes_zstd_binary_response() {
+    let server = MockServer::start().await;
+    // Precomputed zstd frame for [0, 128, 255, 65, 195, 169] repeated 16 times.
+    // Its compressed block and checksum exercise decoding, not just a raw block.
+    let frame = vec![
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x58, 0x6d, 0x00, 0x00, 0x30, 0x00, 0x80, 0xff, 0x41, 0xc3,
+        0xa9, 0x01, 0x00, 0x97, 0xa9, 0x14, 0x01, 0x66, 0xcf, 0x77, 0x0e,
+    ];
+    Mock::given(method("GET"))
+        .and(path("/zstd-binary"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Encoding", "zstd")
+                .set_body_raw(frame, "application/octet-stream"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut session = session().await;
+    let url = serde_json::to_string(&format!("{}/zstd-binary", server.uri())).unwrap();
+    let result = evaluate(
+        &mut session,
+        &format!(
+            r#"
+        fetch({url}).then(r => r.arrayBuffer()).then(buffer => JSON.stringify([
+            buffer instanceof ArrayBuffer, Array.from(new Uint8Array(buffer))
+        ]))
+    "#
+        ),
+    )
+    .await;
+    let expected: Vec<u8> = [0, 128, 255, 65, 195, 169].repeat(16);
+    assert_eq!(result, json!([true, expected]));
+    let requests = server.received_requests().await.unwrap();
+    let encodings = requests[0].headers["accept-encoding"].to_str().unwrap();
+    assert!(encodings.split(',').any(|coding| coding.trim() == "zstd"));
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
 struct ClearFetchPatterns;
 
 impl Drop for ClearFetchPatterns {

@@ -1,6 +1,6 @@
 # 일반 SPA 1차 구현과 검증 — 2026-10-30
 
-[목표·설계](2026-10-27-spa-goal-and-design.md)에 따라 고정 SPA 작업을 실제 입력으로 실행하도록 구현했다. 현재 로컬 배포용 `browser` 빌드는 **15개 작업 × 새 프로세스 10회 = 150/150**, 한 프로세스의 **100회 새로고침**, 동시에 열린 **독립 저장소 컨텍스트 2개**를 통과했다. 기준 Chrome도 같은 작업과 반복 검사를 통과했다. 최종 전체 워크스페이스 회귀 검사도 1,314 통과·0 실패로 완료했다.
+[목표·설계](2026-10-27-spa-goal-and-design.md)에 따라 고정 SPA 작업을 실제 입력으로 실행하도록 구현했다. 현재 로컬 배포용 `browser` 빌드는 **15개 작업 × 새 프로세스 10회 = 150/150**, 한 프로세스의 **100회 새로고침**, 동시에 열린 **독립 저장소 컨텍스트 2개**를 통과했다. 기준 Chrome도 같은 작업과 반복 검사를 통과했다. 최종 전체 워크스페이스 회귀 검사도 1,315 통과·0 실패로 완료했다.
 
 이 결과는 고정한 예제와 버전에 대한 검증이다. 임의의 SPA, 전체 React/Vue, 전체 CDP나 Web Platform 호환성을 뜻하지 않는다. 청계 실행은 별도 검증 대상이다.
 
@@ -24,25 +24,25 @@ React `18.2.0`, ReactDOM `18.2.0`, Vue `3.5.13`, Playwright `1.48.2`를 고정�
 
 | 작업 | 성공 | p50(ms) | p95(ms) |
 | --- | ---: | ---: | ---: |
-| vanilla-form | 10/10 | 431 | 440 |
-| react-counter | 10/10 | 378 | 387 |
-| react-controlled-input | 10/10 | 356 | 361 |
-| react-list | 10/10 | 482 | 507 |
-| react-conditional | 10/10 | 382 | 397 |
-| vue-counter | 10/10 | 385 | 410 |
-| vue-controlled-input | 10/10 | 354 | 375 |
-| vue-list | 10/10 | 478 | 491 |
-| vue-conditional | 10/10 | 388 | 403 |
-| async-fetch | 10/10 | 312 | 323 |
-| async-router | 10/10 | 434 | 452 |
-| async-stylesheet | 10/10 | 426 | 440 |
-| storage-reload | 10/10 | 492 | 527 |
-| frame-nested | 10/10 | 492 | 541 |
-| geometry-rect | 10/10 | 276 | 292 |
+| vanilla-form | 10/10 | 665 | 820 |
+| react-counter | 10/10 | 528 | 739 |
+| react-controlled-input | 10/10 | 511 | 855 |
+| react-list | 10/10 | 710 | 1093 |
+| react-conditional | 10/10 | 524 | 823 |
+| vue-counter | 10/10 | 561 | 747 |
+| vue-controlled-input | 10/10 | 556 | 764 |
+| vue-list | 10/10 | 713 | 1075 |
+| vue-conditional | 10/10 | 558 | 880 |
+| async-fetch | 10/10 | 433 | 543 |
+| async-router | 10/10 | 590 | 784 |
+| async-stylesheet | 10/10 | 598 | 734 |
+| storage-reload | 10/10 | 774 | 930 |
+| frame-nested | 10/10 | 690 | 1245 |
+| geometry-rect | 10/10 | 466 | 565 |
 
 p50/p95는 각 작업의 성공 표본 10개에서 계산했다. navigation·자동화 왕복·검증·캡처를 포함하는 전체 작업 시간이며 순수 입력 지연이 아니다. 작은 표본의 p95는 잠정치다. 기준 Chrome은 `156.0.8078.49`다. 실행기는 같은 fixture를 기준 Chrome에 먼저 적용하고 실패하면 후보를 실행하지 않는다.
 
-[전체 10회 결과](2026-10-30-spa-evidence/summary.json), [기준 Chrome](2026-10-30-spa-evidence/reference.json), [캡처](2026-10-30-spa-evidence/screenshots/)를 함께 보관했다. JSON은 원래 임시 산출물 경로도 기록한다. 버전 관리한 캡처는 후보 첫 실행 15개와 기준 Chrome의 대표 4개다. 원본 전체는 `/tmp/oxi-spa-viewport-acceptance`에 생성했다. 주요 결과 텍스트·컨트롤·child 화면을 직접 확인했으며 전체 픽셀 동일성 판정은 하지 않았다.
+[전체 10회 결과](2026-10-30-spa-evidence/summary.json), [기준 Chrome](2026-10-30-spa-evidence/reference.json), [캡처](2026-10-30-spa-evidence/screenshots/)를 함께 보관했다. JSON은 원래 임시 산출물 경로도 기록한다. 버전 관리한 캡처는 후보 첫 실행 15개와 기준 Chrome의 대표 4개다. 원본 전체는 `/tmp/oxi-spa-security-acceptance`에 생성했다. 주요 결과 텍스트·컨트롤·child 화면을 직접 확인했으며 전체 픽셀 동일성 판정은 하지 않았다.
 
 ## 문서 회수와 메모리
 
@@ -50,16 +50,19 @@ p50/p95는 각 작업의 성공 표본 10개에서 계산했다. navigation·자
 
 원인은 [stealth API](../../crates/oxibrowser-core/src/js/stealth.rs)의 네이티브 콜백 여섯 곳에서 GC 객체를 추적되지 않는 closure에 보관한 것이었다. 플러그인·MIME 배열, user-agent data, thenable의 객체 참조를 명시적 traced capture로 바꿨다. 분리된 bare Boa realm 실험은 수정 전 실패·수정 후 성공했고, 현재 문서와 utility world를 사용하는 10회 교체 회귀 검사에서는 GC 후 문서가 1개 남는다. 실제 입력 값·선택 영역·포커스·expando·listener와 utility 접근도 보존된다. 진단용 기능 제거·RSS 출력·ablation 스위치는 남기지 않았다.
 
-수정된 동일 배포 빌드의 100회 반복도 성공했다. reload → 카운터 초기화 → 실제 클릭 → 상태 반영의 p50은 290ms, p95는 310ms다. 샘플 RSS는 103.4 → 184.4 MiB, 샘플 최대 184.4 MiB였다. 메모리 증가가 모두 사라졌다는 주장은 하지 않는다. 장시간 RSS 증가·캐시·할당기 영향과 수치 예산은 후속 측정 대상이다.
+수정된 동일 배포 빌드의 100회 반복도 성공했다. 자체 빌드·회귀 프로세스가 종료된 뒤 다시 측정한 reload → 카운터 초기화 → 실제 클릭 → 상태 반영의 p50은 296ms, p95는 350ms다. 샘플 RSS는 106.1 → 131.3 MiB, 샘플 최대 140.2 MiB였다. 메모리 증가가 모두 사라졌다는 주장은 하지 않는다. 장시간 RSS 증가·캐시·할당기 영향과 수치 예산은 후속 측정 대상이다.
+
+동시 빌드 부하가 있던 앞선 100회도 실패 없이 통과했다(p50 464ms, p95 1013ms, 샘플 최대 158.7 MiB). 해당 결과도 [별도 보관](2026-10-30-spa-evidence/stability-under-build-load.json)하며 두 조건을 섞어 성능 향상·퇴보를 추론하지 않는다.
 
 [수정 전](2026-10-30-spa-evidence/memory-before.json), [수정 후](2026-10-30-spa-evidence/stability.json), [GC 회귀](2026-10-30-spa-evidence/reclamation-after.txt)를 보관했다. RSS는 OxiBrowser 프로세스만 2초 간격으로 샘플링했으며 실제 peak가 아니다. Chrome 하위 프로세스 RSS는 측정하지 않아 브라우저 간 메모리 비율을 비교하지 않는다.
 
 ## 빌드와 회귀 검사
 
-검증 환경은 Apple M4 Max, RAM 64GiB, macOS `27.0.1 (26A434)`, Rust `1.99.1`, Node `24.20.0`, Python `3.9.6`이다. SPA는 release + `browser`, WebGL 비활성 빌드로 실행했다. 바이너리는 61,185,680 bytes (58.4 MiB), SHA-256 `7aaaf0a23b2b98161d0203b105f6e4981dbdc30e51ff84c99bd30cb05d50cfba`다. 로컬 서버·고정 응답·기본 viewport 1280×800, 배율 1을 사용했다. 공유 호스트에서 다른 검증 프로세스도 실행됐으므로 시간 수치는 격리된 성능 벤치마크나 SLO가 아니다. 준비 완료 시간은 250ms polling 관측이며 정밀 시작 시간으로 해석하지 않는다.
+검증 환경은 Apple M4 Max, RAM 64GiB, macOS `27.0.1 (26A434)`, Rust `1.99.1`, Node `24.20.0`, Python `3.9.6`이다. SPA는 release + `browser`, WebGL 비활성 빌드로 실행했다. 바이너리는 61,185,792 bytes (58.4 MiB), SHA-256 `8cae01ba3a2679f43e28049e883527a08f6a062ba53813cc5e8790dcf6d8d638`다. 로컬 서버·고정 응답·기본 viewport 1280×800, 배율 1을 사용했다. 공유 호스트에서 다른 검증 프로세스도 실행됐으므로 시간 수치는 격리된 성능 벤치마크나 SLO가 아니다. 준비 완료 시간은 250ms polling 관측이며 정밀 시작 시간으로 해석하지 않는다.
 
-- release `browser` 빌드, 전체 target strict Clippy, rustfmt: 통과.
-- 전체 workspace 기본 병렬 실행: **1,314 통과, 0 실패, 35 제외**. 새로 발견한 응답 전 이벤트 수신 테스트 헬퍼 결함을 수정한 뒤 전체를 다시 실행했다.
+- release `browser` 빌드, 전체 target strict Clippy(Rust 1.99.1 및 CI의 1.96.1), rustfmt: 통과.
+- 최신 의존성 감사도 통과했다. 원격 CI에서 발견한 기존 zstd 권고와 최소 의존성 수리는 [CI 보완 기록](2026-10-30-spa-ci-followup.md)에 남겼다.
+- 전체 workspace 기본 병렬 실행: **1,315 통과, 0 실패, 35 제외**. 새로 발견한 응답 전 이벤트 수신 테스트 헬퍼 결함을 수정한 뒤 전체를 다시 실행했다.
 - 관련 WebGL·이미지·입력 회귀: 35 통과, 1 수동 자산 검사 제외.
 - 두 번의 독립 Codex 검토에서 확인한 수명·보안·이동·이벤트 문제를 회귀 검사로 보완했다. 이후 메모리 원인은 진단 패널·분리 실패 재현·네이티브 수명 계측으로 확인했다.
 - CI에 `browser` profile check/test/Clippy와 SPA 10회·100회·2컨텍스트 검사, 산출물 업로드 및 release 선행 gate를 추가했다. 원격 CI 결과는 아직 이 로컬 결과에 포함하지 않는다.
