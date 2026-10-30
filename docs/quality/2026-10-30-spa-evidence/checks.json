@@ -1,0 +1,79 @@
+{
+  "status": "pass",
+  "commands": [
+    {
+      "command": "cargo build --release --features browser --bin oxibrowser",
+      "status": "pass",
+      "logSha256": "3e49ed1785d513d5c12be353c7ce93016f3f51d6110d603f72c79808f86bd4e3"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets --features oxibrowser/browser -- -D warnings",
+      "status": "pass",
+      "logSha256": "70bc2a41edafab846f8c94829a2bbc17b1d9cadad361aa507566fd6225ee16b4"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "pass"
+    },
+    {
+      "command": "cargo test --workspace --features oxibrowser/browser --no-fail-fast",
+      "status": "pass",
+      "passed": 1314,
+      "failed": 0,
+      "ignored": 35,
+      "targets": 58,
+      "logSha256": "af3cc9c26c73b8c5f0726b09305121f0b9b41eb5a9557ac3f5efc40afb935ff0"
+    },
+    {
+      "command": "cargo test -p oxibrowser-core --features webgl --test native_input --test keyboard_input --test image_loading --test image_webgl --test webgl_multi_context --test webgl_index_offsets --test webgl2_buffers_queries -- --test-threads=1",
+      "status": "pass",
+      "passed": 35,
+      "failed": 0,
+      "ignored": 1,
+      "logSha256": "0711aaee286987234041e8933f918522756f3b68cc8a2045c348a0d688f55610"
+    },
+    {
+      "command": "cargo test -p oxibrowser-cdp --test e2e -- --test-threads=1",
+      "status": "pass",
+      "passed": 43,
+      "failed": 0,
+      "logSha256": "6785e4e750d887f1f78dad3c54212e7360aa900f635d95fb7f6925eb27136be9"
+    }
+  ],
+  "host": {
+    "os": "macOS27.0.1(26A434)",
+    "cpu": "Apple M4 Max",
+    "memoryGiB": 64,
+    "rustc": "1.99.1(58cf8f9c3 2026-10-13)",
+    "node": "24.20.0",
+    "python": "3.9.6",
+    "referenceChrome": "156.0.8078.49"
+  },
+  "profile": "release, browser enabled; webgl disabled for SPA acceptance",
+  "notes": [
+    "Shared host, other verification processes active; timings are observational, no performance SLO.",
+    "RSS samples cover spawned OxiBrowser process at2s intervals, not true peak; Chrome subprocess RSS was not measured.",
+    "Vendoredblitz-dom0.3.0-beta.1 archiveSHA256 a9f438e914c626f4f56cd58cd88045e164e1ac32e12d7c24d09c25121328161e; six documented source differences, no archive files missing."
+  ],
+  "binarySha256": "7aaaf0a23b2b98161d0203b105f6e4981dbdc30e51ff84c99bd30cb05d50cfba",
+  "historicalFailures": [
+    {
+      "kind": "retired native realm root",
+      "before": "10reloads left11physicaldocuments after2collections",
+      "fix": "6stealthnativeclosures nowexplicitlytraceGCcaptures",
+      "regression": "onephysicaldocumentafter10preparedreloads with utility realm; active DOM state preserved"
+    },
+    {
+      "kind": "defaultviewportcapture",
+      "before": "shortpage PNG1280x240 for configured1280x800 viewport",
+      "fix": "separate guarded native viewport path; explicit unsupportedparams/rendererrors",
+      "regression": "all150actualtaskcaptures validated1280x800 byPNGheaders; protocol4pixel/error tests"
+    },
+    {
+      "kind": "earlyconsoleevent testhelper",
+      "before": "read_command_response dropped events arriving before response; unchanged isolatedrepro failed",
+      "fix": "buffer nonmatching messages as send_command alreadydoes",
+      "regression": "CDP43suite thenentire1314workspace passed"
+    }
+  ]
+}

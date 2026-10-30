@@ -1,0 +1,619 @@
+{
+  "startedAt": "2026-10-30T02:12:34.190Z",
+  "baseUrl": "http://127.0.0.1:50718",
+  "argv": [
+    "--endpoint",
+    "http://127.0.0.1:50713",
+    "--runs",
+    "1",
+    "--out",
+    "/private/tmp/oxi-spa-viewport-acceptance/run-06"
+  ],
+  "node": "v24.20.0",
+  "caseTimeoutMs": 30000,
+  "assets": {
+    "vendor": {
+      "/vendor/react.js": {
+        "file": "node_modules/react/umd/react.production.min.js",
+        "sha256": "4b4969fa4ef3594324da2c6d78ce8766fbbc2fd121fff395aedf997db0a99a06"
+      },
+      "/vendor/react-dom.js": {
+        "file": "node_modules/react-dom/umd/react-dom.production.min.js",
+        "sha256": "21758ed084cd0e37e735722ee4f3957ea960628a29dfa6c3ce1a1d47a2d6e4f7"
+      },
+      "/vendor/vue.js": {
+        "file": "node_modules/vue/dist/vue.global.prod.js",
+        "sha256": "c459ba7cc8db65c982589fa5d64c7ff478877e8e5b0fd75683207cec6a4e89e8"
+      }
+    },
+    "fixtures": {
+      "vanilla.html": "7ae29bb2f421a09b043b8b574cc8855de50bef6c738dcbca53512a19907e76b8",
+      "react.html": "dd0259215051b2a5b92cde1bb3cc4319c26958d9561378111116464da40af946",
+      "vue.html": "728d55ff2177614f27580dd2af6653b2ae537380e67b549cb5eb67251b27914e",
+      "async.html": "dae306019924fb52d9c86338e2fbc1e6cd3c36ce4af28fd6a73400df76ccbdd5",
+      "storage.html": "7eb202fa64d58f6694351b78bf7c0968122b2b05ed030b7b70730d727f1cee0f",
+      "frames.html": "3ad78edcdd5f12ec0b52149a998224ef2e675911f4e75f20991a5103caaf7b46",
+      "child.html": "57f944ad490b883381d822719a50a80d22ecfb83589687936d39d4ade784ebe9",
+      "css/dynamic.css": "9ae32f1ee2e62ae99028602068b1a686a44f780687f34c9e286bc4261b147dac",
+      "api/data.json": "13bb89772ce93509624aeb78f45ae74eba33312b4fa8f88fb33ab7836d1e21d9"
+    },
+    "playwright": "1.48.2"
+  },
+  "targets": [
+    {
+      "kind": "endpoint",
+      "label": "endpoint:http://127.0.0.1:50713",
+      "launched": false,
+      "browserVersion": "0.28.0",
+      "runsRequested": 1,
+      "runs": [
+        {
+          "run": 1,
+          "cases": [
+            {
+              "name": "vanilla-form",
+              "file": "vanilla.html",
+              "url": "http://127.0.0.1:50718/vanilla.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "click #submit",
+                "waitFor #validation-status==\"invalid\" ok",
+                "eq invalid form was not submitted ok",
+                "click #name",
+                "eq focus after click #name ok",
+                "type \"oxi user\"",
+                "press Tab",
+                "eq focus after Tab ok",
+                "click #agree",
+                "eq checkbox checked ok",
+                "click #submit",
+                "waitFor #status==\"submitted:oxi user\" ok",
+                "waitFor #out li:last-child==\"oxi user|checked\" ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--vanilla-form-run1.png",
+              "ms": 432,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "react-counter",
+              "file": "react.html",
+              "url": "http://127.0.0.1:50718/react.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "click #inc",
+                "click #inc",
+                "click #inc",
+                "waitFor #count==\"count=3\" ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--react-counter-run1.png",
+              "ms": 379,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "react-controlled-input",
+              "file": "react.html",
+              "url": "http://127.0.0.1:50718/react.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "click #ctl",
+                "type \"hello oxi\"",
+                "waitFor #mirror==\"hello oxi\" ok",
+                "eq controlled input.value ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--react-controlled-input-run1.png",
+              "ms": 356,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "react-list",
+              "file": "react.html",
+              "url": "http://127.0.0.1:50718/react.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "click #item",
+                "type #item \"alpha\"",
+                "click #add",
+                "click #item",
+                "type #item \"beta\"",
+                "click #add",
+                "waitFor #list li:nth-child(1)==\"alpha\" ok",
+                "waitFor #list li:nth-child(2)==\"beta\" ok",
+                "eq list length ok",
+                "waitFor item input reset ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--react-list-run1.png",
+              "ms": 482,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "react-conditional",
+              "file": "react.html",
+              "url": "http://127.0.0.1:50718/react.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "eq cond initially absent ok",
+                "click #toggle",
+                "waitFor #cond==\"visible\" ok",
+                "click #toggle",
+                "waitFor cond removed ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--react-conditional-run1.png",
+              "ms": 378,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "vue-counter",
+              "file": "vue.html",
+              "url": "http://127.0.0.1:50718/vue.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "click #inc",
+                "click #inc",
+                "click #inc",
+                "waitFor #count==\"count=3\" ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--vue-counter-run1.png",
+              "ms": 382,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "vue-controlled-input",
+              "file": "vue.html",
+              "url": "http://127.0.0.1:50718/vue.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "click #ctl",
+                "type \"hello vue\"",
+                "waitFor #mirror==\"hello vue\" ok",
+                "eq v-model input.value ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--vue-controlled-input-run1.png",
+              "ms": 355,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "vue-list",
+              "file": "vue.html",
+              "url": "http://127.0.0.1:50718/vue.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "click #item",
+                "type #item \"alpha\"",
+                "click #add",
+                "click #item",
+                "type #item \"beta\"",
+                "click #add",
+                "waitFor #list li:nth-child(1)==\"alpha\" ok",
+                "waitFor #list li:nth-child(2)==\"beta\" ok",
+                "eq list length ok",
+                "waitFor item input reset ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--vue-list-run1.png",
+              "ms": 485,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "vue-conditional",
+              "file": "vue.html",
+              "url": "http://127.0.0.1:50718/vue.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #count==\"count=0\" ok",
+                "eq cond initially absent ok",
+                "click #toggle",
+                "waitFor #cond==\"visible\" ok",
+                "click #toggle",
+                "waitFor cond removed ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--vue-conditional-run1.png",
+              "ms": 397,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "async-fetch",
+              "file": "async.html",
+              "url": "http://127.0.0.1:50718/async.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #fetch-status==\"loaded:3:rev1\" ok",
+                "eq fetched item text ok",
+                "eq fetched item count ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--async-fetch-run1.png",
+              "ms": 315,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "async-router",
+              "file": "async.html",
+              "url": "http://127.0.0.1:50718/async.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #fetch-status==\"loaded:3:rev1\" ok",
+                "waitFor #view==\"view:#/home\" ok",
+                "click #nav-a",
+                "waitFor #view==\"view:#/a\" ok",
+                "eq hash after click A ok",
+                "click #nav-b",
+                "waitFor #view==\"view:#/b\" ok",
+                "eq hash after click B ok",
+                "goBack",
+                "waitFor #view==\"view:#/a\" ok",
+                "eq hash after goBack ok",
+                "goForward",
+                "waitFor #view==\"view:#/b\" ok",
+                "eq hash after goForward ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--async-router-run1.png",
+              "ms": 433,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "async-stylesheet",
+              "file": "async.html",
+              "url": "http://127.0.0.1:50718/async.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor #fetch-status==\"loaded:3:rev1\" ok",
+                "eq color before dynamic css ok",
+                "click #loadcss",
+                "waitFor #css-status==\"css:rgb(1, 2, 3)\" ok",
+                "eq color after dynamic css ok",
+                "eq dynamic link element present ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--async-stylesheet-run1.png",
+              "ms": 424,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "storage-reload",
+              "file": "storage.html",
+              "url": "http://127.0.0.1:50718/storage.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "reload",
+                "eq value cleared ok",
+                "click #persist",
+                "type \"keep-1\"",
+                "waitFor #mirror==\"keep-1\" ok",
+                "eq localStorage after input ok",
+                "reload",
+                "eq value restored after reload ok",
+                "waitFor #mirror==\"keep-1\" ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--storage-reload-run1.png",
+              "ms": 465,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "frame-nested",
+              "file": "frames.html",
+              "url": "http://127.0.0.1:50718/frames.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor child frame attached ok",
+                "click child #inc x2",
+                "waitFor child counter ok",
+                "type \"hi\"",
+                "waitFor child input mirror ok",
+                "click #read",
+                "waitFor #parent-read==\"clicks:2\" ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--frame-nested-run1.png",
+              "ms": 477,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            },
+            {
+              "name": "geometry-rect",
+              "file": "frames.html",
+              "url": "http://127.0.0.1:50718/frames.html",
+              "run": 1,
+              "status": "pass",
+              "errors": [],
+              "steps": [
+                "waitFor initial marker rect ok",
+                "eq marker x before move ok",
+                "click #move",
+                "waitFor #moved-status==\"moved\" ok",
+                "waitFor marker rect after move ok",
+                "eq marker dx ok",
+                "eq elementFromPoint hits marker ok",
+                "eq computed width ok"
+              ],
+              "issues": {
+                "pageErrors": [],
+                "consoleErrors": [],
+                "requestFailed": [],
+                "httpErrors": []
+              },
+              "screenshot": "/private/tmp/oxi-spa-viewport-acceptance/run-06/screenshots/endpoint--geometry-rect-run1.png",
+              "ms": 262,
+              "screenshotSize": {
+                "width": 1280,
+                "height": 800
+              }
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "cases": 15,
+        "runs": 1,
+        "caseRuns": 15,
+        "caseRunsPassed": 15,
+        "caseRunsFailed": 0,
+        "casesFullyPassing": 15,
+        "casesWithFailures": 0,
+        "verdict": "PASS"
+      },
+      "perCase": [
+        {
+          "name": "vanilla-form",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 432,
+          "firstError": null
+        },
+        {
+          "name": "react-counter",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 379,
+          "firstError": null
+        },
+        {
+          "name": "react-controlled-input",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 356,
+          "firstError": null
+        },
+        {
+          "name": "react-list",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 482,
+          "firstError": null
+        },
+        {
+          "name": "react-conditional",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 378,
+          "firstError": null
+        },
+        {
+          "name": "vue-counter",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 382,
+          "firstError": null
+        },
+        {
+          "name": "vue-controlled-input",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 355,
+          "firstError": null
+        },
+        {
+          "name": "vue-list",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 485,
+          "firstError": null
+        },
+        {
+          "name": "vue-conditional",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 397,
+          "firstError": null
+        },
+        {
+          "name": "async-fetch",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 315,
+          "firstError": null
+        },
+        {
+          "name": "async-router",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 433,
+          "firstError": null
+        },
+        {
+          "name": "async-stylesheet",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 424,
+          "firstError": null
+        },
+        {
+          "name": "storage-reload",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 465,
+          "firstError": null
+        },
+        {
+          "name": "frame-nested",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 477,
+          "firstError": null
+        },
+        {
+          "name": "geometry-rect",
+          "pass": 1,
+          "fail": 0,
+          "avgMs": 262,
+          "firstError": null
+        }
+      ]
+    }
+  ]
+}

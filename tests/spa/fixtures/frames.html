@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>frames-spa</title>
+  <link rel="icon" href="data:,">
+  <style>
+    #marker { position: absolute; left: 10px; top: 120px; width: 50px; height: 20px; background: #dddddd; }
+    #marker.moved { left: 160px; }
+  </style>
+</head>
+<body>
+  <h1>Frames</h1>
+  <iframe id="frame" src="/child.html" width="300" height="100"></iframe>
+  <div id="marker">marker</div>
+  <button id="move">Move</button>
+  <button id="read">Read child</button>
+  <div id="parent-read">none</div>
+  <div id="moved-status">idle</div>
+  <script>
+    (function () {
+      'use strict';
+      document.getElementById('move').addEventListener('click', function () {
+        document.getElementById('marker').classList.add('moved');
+        document.getElementById('moved-status').textContent = 'moved';
+      });
+      document.getElementById('read').addEventListener('click', function () {
+        try {
+          var doc = document.getElementById('frame').contentDocument;
+          document.getElementById('parent-read').textContent =
+            doc ? doc.getElementById('ccount').textContent : 'no-doc';
+        } catch (err) {
+          document.getElementById('parent-read').textContent = 'error:' + err.message;
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

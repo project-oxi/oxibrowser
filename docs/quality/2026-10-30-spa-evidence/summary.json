@@ -1,0 +1,1158 @@
+{
+  "generatedAt": "2026-10-30T02:13:15+00:00",
+  "verdict": "PASS",
+  "binaryUnchanged": true,
+  "runsRequested": 10,
+  "runsPassed": 10,
+  "statuses": {
+    "pass": 10
+  },
+  "perCase": [
+    {
+      "name": "vanilla-form",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 431,
+      "p95Ms": 440
+    },
+    {
+      "name": "react-counter",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 378,
+      "p95Ms": 387
+    },
+    {
+      "name": "react-controlled-input",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 356,
+      "p95Ms": 361
+    },
+    {
+      "name": "react-list",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 482,
+      "p95Ms": 507
+    },
+    {
+      "name": "react-conditional",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 382,
+      "p95Ms": 397
+    },
+    {
+      "name": "vue-counter",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 385,
+      "p95Ms": 410
+    },
+    {
+      "name": "vue-controlled-input",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 354,
+      "p95Ms": 375
+    },
+    {
+      "name": "vue-list",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 478,
+      "p95Ms": 491
+    },
+    {
+      "name": "vue-conditional",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 388,
+      "p95Ms": 403
+    },
+    {
+      "name": "async-fetch",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 312,
+      "p95Ms": 323
+    },
+    {
+      "name": "async-router",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 434,
+      "p95Ms": 452
+    },
+    {
+      "name": "async-stylesheet",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 426,
+      "p95Ms": 440
+    },
+    {
+      "name": "storage-reload",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 492,
+      "p95Ms": 527
+    },
+    {
+      "name": "frame-nested",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 492,
+      "p95Ms": 541
+    },
+    {
+      "name": "geometry-rect",
+      "pass": 10,
+      "fail": 0,
+      "samples": 10,
+      "medianMs": 276,
+      "p95Ms": 292
+    }
+  ],
+  "reference": {
+    "target": "chrome-reference",
+    "dir": "reference",
+    "exitCode": 0,
+    "status": "pass",
+    "verdict": "PASS",
+    "caseRunsPassed": 15,
+    "caseRunsFailed": 0,
+    "cases": [
+      {
+        "name": "vanilla-form",
+        "status": "pass",
+        "ms": 375
+      },
+      {
+        "name": "react-counter",
+        "status": "pass",
+        "ms": 195
+      },
+      {
+        "name": "react-controlled-input",
+        "status": "pass",
+        "ms": 233
+      },
+      {
+        "name": "react-list",
+        "status": "pass",
+        "ms": 345
+      },
+      {
+        "name": "react-conditional",
+        "status": "pass",
+        "ms": 152
+      },
+      {
+        "name": "vue-counter",
+        "status": "pass",
+        "ms": 166
+      },
+      {
+        "name": "vue-controlled-input",
+        "status": "pass",
+        "ms": 234
+      },
+      {
+        "name": "vue-list",
+        "status": "pass",
+        "ms": 319
+      },
+      {
+        "name": "vue-conditional",
+        "status": "pass",
+        "ms": 164
+      },
+      {
+        "name": "async-fetch",
+        "status": "pass",
+        "ms": 213
+      },
+      {
+        "name": "async-router",
+        "status": "pass",
+        "ms": 433
+      },
+      {
+        "name": "async-stylesheet",
+        "status": "pass",
+        "ms": 302
+      },
+      {
+        "name": "storage-reload",
+        "status": "pass",
+        "ms": 238
+      },
+      {
+        "name": "frame-nested",
+        "status": "pass",
+        "ms": 220
+      },
+      {
+        "name": "geometry-rect",
+        "status": "pass",
+        "ms": 119
+      }
+    ]
+  },
+  "runs": [
+    {
+      "run": 1,
+      "port": 50550,
+      "dir": "run-01",
+      "startedAt": "2026-10-30T02:11:50+00:00",
+      "observedReadyMs": 266,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 441
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 380
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 361
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 488
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 384
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 389
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 358
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 479
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 399
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 312
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 435
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 441
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 503
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 493
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 282
+        }
+      ],
+      "suiteS": 8.4,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:11:59+00:00"
+    },
+    {
+      "run": 2,
+      "port": 50572,
+      "dir": "run-02",
+      "startedAt": "2026-10-30T02:11:59+00:00",
+      "observedReadyMs": 259,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 438
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 388
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 360
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 495
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 397
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 415
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 379
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 491
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 402
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 323
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 455
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 436
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 515
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 505
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 288
+        }
+      ],
+      "suiteS": 8.5,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:07+00:00"
+    },
+    {
+      "run": 3,
+      "port": 50608,
+      "dir": "run-03",
+      "startedAt": "2026-10-30T02:12:07+00:00",
+      "observedReadyMs": 262,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 438
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 378
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 358
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 486
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 396
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 394
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 366
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 490
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 403
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 322
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 445
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 436
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 488
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 571
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 276
+        }
+      ],
+      "suiteS": 8.6,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:16+00:00"
+    },
+    {
+      "run": 4,
+      "port": 50645,
+      "dir": "run-04",
+      "startedAt": "2026-10-30T02:12:16+00:00",
+      "observedReadyMs": 263,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 420
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 383
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 356
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 483
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 391
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 388
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 349
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 478
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 381
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 300
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 423
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 419
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 470
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 477
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 296
+        }
+      ],
+      "suiteS": 8.2,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:25+00:00"
+    },
+    {
+      "run": 5,
+      "port": 50661,
+      "dir": "run-05",
+      "startedAt": "2026-10-30T02:12:25+00:00",
+      "observedReadyMs": 263,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 436
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 386
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 359
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 517
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 393
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 403
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 371
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 471
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 389
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 313
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 437
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 429
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 496
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 497
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 277
+        }
+      ],
+      "suiteS": 8.4,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:33+00:00"
+    },
+    {
+      "run": 6,
+      "port": 50713,
+      "dir": "run-06",
+      "startedAt": "2026-10-30T02:12:33+00:00",
+      "observedReadyMs": 259,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 432
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 379
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 356
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 482
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 378
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 382
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 355
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 485
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 397
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 315
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 433
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 424
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 465
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 477
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 262
+        }
+      ],
+      "suiteS": 8.2,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:42+00:00"
+    },
+    {
+      "run": 7,
+      "port": 50733,
+      "dir": "run-07",
+      "startedAt": "2026-10-30T02:12:42+00:00",
+      "observedReadyMs": 263,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 420
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 373
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 334
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 474
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 373
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 379
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 345
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 472
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 381
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 296
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 428
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 421
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 469
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 464
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 260
+        }
+      ],
+      "suiteS": 7.9,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:50+00:00"
+    },
+    {
+      "run": 8,
+      "port": 50752,
+      "dir": "run-08",
+      "startedAt": "2026-10-30T02:12:50+00:00",
+      "observedReadyMs": 263,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 422
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 368
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 340
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 465
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 373
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 378
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 352
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 476
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 384
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 317
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 448
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 438
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 536
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 504
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 280
+        }
+      ],
+      "suiteS": 8.1,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:12:58+00:00"
+    },
+    {
+      "run": 9,
+      "port": 50768,
+      "dir": "run-09",
+      "startedAt": "2026-10-30T02:12:58+00:00",
+      "observedReadyMs": 262,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 430
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 376
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 344
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 475
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 379
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 375
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 352
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 477
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 388
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 296
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 419
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 419
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 465
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 475
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 272
+        }
+      ],
+      "suiteS": 7.9,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:13:06+00:00"
+    },
+    {
+      "run": 10,
+      "port": 50788,
+      "dir": "run-10",
+      "startedAt": "2026-10-30T02:13:06+00:00",
+      "observedReadyMs": 256,
+      "readinessPollMs": 250,
+      "exitCode": 0,
+      "status": "pass",
+      "verdict": "PASS",
+      "caseRunsPassed": 15,
+      "caseRunsFailed": 0,
+      "cases": [
+        {
+          "name": "vanilla-form",
+          "status": "pass",
+          "ms": 424
+        },
+        {
+          "name": "react-counter",
+          "status": "pass",
+          "ms": 373
+        },
+        {
+          "name": "react-controlled-input",
+          "status": "pass",
+          "ms": 340
+        },
+        {
+          "name": "react-list",
+          "status": "pass",
+          "ms": 473
+        },
+        {
+          "name": "react-conditional",
+          "status": "pass",
+          "ms": 377
+        },
+        {
+          "name": "vue-counter",
+          "status": "pass",
+          "ms": 374
+        },
+        {
+          "name": "vue-controlled-input",
+          "status": "pass",
+          "ms": 349
+        },
+        {
+          "name": "vue-list",
+          "status": "pass",
+          "ms": 475
+        },
+        {
+          "name": "vue-conditional",
+          "status": "pass",
+          "ms": 384
+        },
+        {
+          "name": "async-fetch",
+          "status": "pass",
+          "ms": 300
+        },
+        {
+          "name": "async-router",
+          "status": "pass",
+          "ms": 434
+        },
+        {
+          "name": "async-stylesheet",
+          "status": "pass",
+          "ms": 420
+        },
+        {
+          "name": "storage-reload",
+          "status": "pass",
+          "ms": 497
+        },
+        {
+          "name": "frame-nested",
+          "status": "pass",
+          "ms": 492
+        },
+        {
+          "name": "geometry-rect",
+          "status": "pass",
+          "ms": 273
+        }
+      ],
+      "suiteS": 8.0,
+      "serverExitCode": -15,
+      "endedAt": "2026-10-30T02:13:15+00:00"
+    }
+  ],
+  "environment": {
+    "binary": "/Users/garden/Workspace/Projects/oxibrowser/target/release/oxibrowser",
+    "binarySha256": "7aaaf0a23b2b98161d0203b105f6e4981dbdc30e51ff84c99bd30cb05d50cfba",
+    "os": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "python": "3.9.6",
+    "node": "v24.20.0"
+  }
+}

@@ -31,7 +31,7 @@ pub fn js_dispatch_mouse_event(
         r#"(function() {{
             var el = document.elementFromPoint({x}, {y});
             if (el) {{
-                el.dispatchEvent(new MouseEvent({event_type_json}, {{
+                var allowed = el.dispatchEvent(new MouseEvent({event_type_json}, {{
                     bubbles: true,
                     cancelable: true,
                     clientX: {x},
@@ -40,6 +40,11 @@ pub fn js_dispatch_mouse_event(
                     buttons: {button_code},
                     detail: {click_count}
                 }}));
+                if (allowed && {event_type_json} === 'mousedown' && {button_code} === 0) {{
+                    var focusable = el;
+                    while (focusable && !/^(INPUT|TEXTAREA|SELECT|BUTTON|A)$/.test(focusable.tagName || '') && !focusable.hasAttribute('tabindex')) focusable = focusable.parentElement;
+                    if (focusable && !focusable.disabled && typeof focusable.focus === 'function') focusable.focus();
+                }}
             }}
             return el ? el.tagName : null;
         }})()"#

@@ -67,7 +67,10 @@ pub(super) fn clear_context(context_id: u32, queue: &Rc<TokioJobQueue>) {
     });
     super::super::idb::clear_context(context_id);
     LISTENER_REGISTRY.with(|r| r.borrow_mut().retain(|(owner, _), _| *owner != context_id));
-    NATIVE_LISTENERS.with(|r| r.borrow_mut().retain(|(owner, _), _| *owner != context_id));
+    NATIVE_LISTENERS.with(|r| {
+        r.borrow_mut()
+            .retain(|(owner, _, _), _| *owner != context_id)
+    });
 }
 
 pub(super) fn tick(ctx: &mut Context, queue: &Rc<TokioJobQueue>, config: &JsRuntimeConfig) {

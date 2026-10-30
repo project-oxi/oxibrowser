@@ -141,6 +141,9 @@ impl CdpSession {
             Some(ctx) => browser.new_session_in(ctx).await?,
             None => browser.new_session().await?,
         };
+        // Every attached page target starts with a real initial document, so
+        // native focus and input have a DOM before the first navigation.
+        session.write().await.navigate("about:blank").await?;
         let session_context = match conn.context.as_ref() {
             Some(ctx) => Arc::clone(ctx),
             None => browser.default_context(),
@@ -286,11 +289,23 @@ impl CdpSession {
                 }
                 // Command responses from spawned dispatch tasks
                 response = response_rx.recv() => {
-                    if let Some(response) = response
-                        && let Err(e) = self.send_response(response).await
-                    {
-                        warn!(error = %e, "failed to send CDP response");
-                        break;
+                    if let Some(response) = response {
+                        // Handlers enqueue lifecycle events before replying.
+                        // Preserve that order across the two queues: clients
+                        // need attachedToTarget before createTarget's result.
+                        let mut event_failed = false;
+                        for event in event_rx.drain() {
+                            if let Err(e) = self.send_event(event).await {
+                                warn!(error = %e, "failed to send queued CDP event");
+                                event_failed = true;
+                                break;
+                            }
+                        }
+                        if event_failed { break; }
+                        if let Err(e) = self.send_response(response).await {
+                            warn!(error = %e, "failed to send CDP response");
+                            break;
+                        }
                     }
                 }
                 // Outgoing CDP events (independent of dispatch — decoupled so
@@ -491,7 +506,7 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
                         .unwrap_or_else(|| ctx.browser.default_context());
                     DispatchContext {
                         session: entry.session,
-                        events: ctx.events.clone(),
+                        events: ctx.events.for_target_session(sid, &entry.target_id),
                         fetch_registry: ctx.fetch_registry.clone(),
                         dialog_gate: ctx.dialog_gate.clone(),
                         browser: ctx.browser.clone(),
@@ -519,7 +534,7 @@ async fn dispatch_command(text: String, ctx: &DispatchContext) -> CdpResponse {
                     // Unknown sessionId — fall back to the default session.
                     DispatchContext {
                         session: ctx.session.clone(),
-                        events: ctx.events.clone(),
+                        events: ctx.events.for_session(sid),
                         fetch_registry: ctx.fetch_registry.clone(),
                         dialog_gate: ctx.dialog_gate.clone(),
                         browser: ctx.browser.clone(),

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>async-spa</title>
+  <link rel="icon" href="data:,">
+  <style>#box { border: 1px solid #999; display: inline-block; padding: 4px; }</style>
+</head>
+<body>
+  <h1>Async</h1>
+  <ul id="fetch-out"></ul>
+  <div id="fetch-status">loading</div>
+  <nav><a id="nav-a" href="#/a">A</a> <a id="nav-b" href="#/b">B</a></nav>
+  <div id="view">view:#/home</div>
+  <div id="box">box</div>
+  <button id="loadcss">Load CSS</button>
+  <div id="css-status">css:none</div>
+  <script>
+    (function () {
+      'use strict';
+      (async function () {
+        try {
+          var r = await fetch('/api/data.json');
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          var j = await r.json();
+          document.getElementById('fetch-out').innerHTML = j.items
+            .map(function (s) { return '<li class="fitem">' + s + '</li>'; })
+            .join('');
+          document.getElementById('fetch-status').textContent = 'loaded:' + j.items.length + ':rev' + j.rev;
+        } catch (err) {
+          document.getElementById('fetch-status').textContent = 'error:' + err.message;
+        }
+      })();
+      function syncView() {
+        document.getElementById('view').textContent = 'view:' + (location.hash || '#/home');
+      }
+      window.addEventListener('hashchange', syncView);
+      syncView();
+      document.getElementById('loadcss').addEventListener('click', function () {
+        var link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = '/css/dynamic.css';
+        link.id = 'dyn';
+        link.onload = function () {
+          document.getElementById('css-status').textContent =
+            'css:' + getComputedStyle(document.getElementById('box')).color;
+        };
+        link.onerror = function () {
+          document.getElementById('css-status').textContent = 'css:error';
+        };
+        document.head.appendChild(link);
+      });
+    })();
+  </script>
+</body>
+</html>

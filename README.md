@@ -441,11 +441,19 @@ errors and piping; BYOB, tee, stream strategies and incremental decompression
 are unsupported. Network fetch responses still use the existing response
 wrapper rather than these constructed Response streams.
 
-Interactive pages can opt into continuous timer, fetch/WebSocket callback and
-animation progress with `serve --background-event-loop`. It defaults off and
-cannot be used with `--mcp`. The loop uses cooperative task budgets and Boa VM
-limits; synchronous native calls and module network waits can exceed the
-16 ms scheduling target, so this is not a real-time frame guarantee.
+CDP `serve` and stdio `serve --mcp` progress timers, fetch/WebSocket callbacks
+and animation callbacks between commands by default. CDP clients can select
+command-driven execution with `serve --no-background-event-loop`;
+`--background-event-loop` remains accepted for compatibility. The loop uses
+cooperative task budgets and Boa VM limits; synchronous native calls and module
+network waits can exceed the 16 ms scheduling target, so this is not a real-time
+frame guarantee.
+
+The [local SPA acceptance suite](tests/spa/README.md) checks pinned React and Vue
+applications through actual Playwright input, screenshots, fresh processes and
+repeated navigation. It runs against the `browser` build profile.
+The [implementation report](docs/quality/2026-10-30-spa-implementation.md)
+records measured results and the remaining compatibility limits.
 
 The WebGL2 API is partial. Applications that require a consistent WebGL1
 fallback can use `serve --disable-webgl2`: WebGL2 context requests return null,

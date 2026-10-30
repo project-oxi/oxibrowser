@@ -7,6 +7,7 @@
 use crate::domains::fetch::FetchPattern;
 use crate::protocol::CdpEvent;
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError, RwLock};
@@ -16,6 +17,8 @@ use tracing::{debug, warn};
 /// Maximum number of lifecycle events buffered for `Page.getLifecycleEvents`.
 /// Once full, the oldest entry is dropped to make room.
 const LIFECYCLE_BUFFER_CAP: usize = 20;
+
+type WorldScripts = HashMap<String, Vec<(String, String)>>;
 
 /// Sender half of the event broadcaster.
 #[derive(Clone)]
@@ -34,6 +37,9 @@ pub struct EventSender {
     /// Session ID stamped onto every CDP event once a target is attached
     /// (flat / auto-attach protocol). `None` for root-level events.
     attached_session_id: Arc<RwLock<Option<String>>>,
+    main_frame_id: Arc<String>,
+    world_scripts: Arc<RwLock<WorldScripts>>,
+    reported_worlds: Arc<RwLock<HashSet<(String, u32)>>>,
 }
 
 /// Receiver half of the event broadcaster.
@@ -54,12 +60,62 @@ pub fn event_channel() -> (EventSender, EventReceiver) {
         fetch_patterns: Arc::new(RwLock::new(Vec::new())),
         lifecycle_buffer: Arc::new(Mutex::new(Vec::new())),
         attached_session_id: Arc::new(RwLock::new(None)),
+        main_frame_id: Arc::new("default".to_owned()),
+        world_scripts: Arc::new(RwLock::new(HashMap::new())),
+        reported_worlds: Arc::new(RwLock::new(HashSet::new())),
     };
     let receiver = EventReceiver { rx };
     (sender, receiver)
 }
 
 impl EventSender {
+    pub(crate) fn add_world_script(&self, session: String, world: String) -> String {
+        let id = format!("world-init-{}", uuid::Uuid::new_v4());
+        self.world_scripts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(session)
+            .or_default()
+            .push((id.clone(), world));
+        id
+    }
+
+    pub(crate) fn world_scripts(&self, session: &str) -> Vec<(String, String)> {
+        self.world_scripts
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(session)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn remove_world_script(&self, session: &str, id: &str) -> bool {
+        let mut scripts = self
+            .world_scripts
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(scripts) = scripts.get_mut(session) else {
+            return false;
+        };
+        let before = scripts.len();
+        scripts.retain(|(script, _)| script != id);
+        before != scripts.len()
+    }
+
+    pub(crate) fn report_world_once(&self, session: &str, context: u32) -> bool {
+        self.reported_worlds
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((session.to_owned(), context))
+    }
+
+    pub(crate) fn clear_reported_worlds(&self, session: &str) {
+        self.reported_worlds
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(owner, _)| owner != session);
+    }
+
     /// Whether the event channel's receiver is gone (e.g. the client's
     /// WebSocket dispatch loop ended) — further `send`s will fail. Cheap
     /// disconnect probe for background emitters such as the screencast pump.
@@ -102,6 +158,23 @@ impl EventSender {
         if let Ok(mut guard) = self.attached_session_id.write() {
             *guard = Some(session_id);
         }
+    }
+
+    /// Route a command's events to its target without changing other targets.
+    pub(crate) fn for_session(&self, session: &str) -> Self {
+        let mut sender = self.clone();
+        sender.attached_session_id = Arc::new(RwLock::new(Some(session.to_owned())));
+        sender
+    }
+
+    pub(crate) fn for_target_session(&self, session: &str, target: &str) -> Self {
+        let mut sender = self.for_session(session);
+        sender.main_frame_id = Arc::new(target.to_owned());
+        sender
+    }
+
+    pub(crate) fn main_frame_id(&self) -> &str {
+        self.main_frame_id.as_str()
     }
 
     /// The currently-attached session ID, if any.
@@ -231,7 +304,7 @@ impl EventSender {
     /// `sessionId` stamping) — downloads initiated by an attached child
     /// target surface on the root session too.
     pub fn send_browser_event(&self, method: &str, params: Value) {
-        self.send_event(method, params);
+        self.send(CdpEvent::new(method, params));
     }
 
     /// Enable Log domain events.
@@ -397,6 +470,7 @@ mod tests {
         // progress) must flow with every domain flag disabled.
         let (sender, mut receiver) = event_channel();
 
+        sender.set_session_id("page-session".to_owned());
         sender.send_browser_event(
             "Browser.downloadWillBegin",
             json!({
@@ -409,6 +483,7 @@ mod tests {
         let events = receiver.drain();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].method, "Browser.downloadWillBegin");
+        assert!(events[0].session_id.is_none());
         assert_eq!(events[0].params.as_ref().unwrap()["guid"], "g1");
     }
 
@@ -440,6 +515,9 @@ mod tests {
             fetch_patterns: Arc::new(RwLock::new(Vec::new())),
             lifecycle_buffer: Arc::new(Mutex::new(Vec::new())),
             attached_session_id: Arc::new(RwLock::new(None)),
+            main_frame_id: Arc::new("default".to_owned()),
+            world_scripts: Arc::new(RwLock::new(HashMap::new())),
+            reported_worlds: Arc::new(RwLock::new(HashSet::new())),
         };
 
         assert!(!sender.is_page_enabled());

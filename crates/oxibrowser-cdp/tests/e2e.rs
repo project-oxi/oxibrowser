@@ -240,6 +240,8 @@ async fn read_command_response(
                 if response.get("id").and_then(|v| v.as_u64()) == Some(id) {
                     return response;
                 }
+                // Events may precede the response, just as in send_command.
+                SIDECAR_EVENTS.with(|buffer| buffer.borrow_mut().push(response));
             }
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(e))) => panic!("WebSocket error: {e}"),

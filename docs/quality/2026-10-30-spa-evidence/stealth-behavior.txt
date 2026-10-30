@@ -1,0 +1,14 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.31s
+     Running unittests src/lib.rs (target/debug/deps/oxibrowser_core-2f6ac8c2ff369abc)
+
+running 7 tests
+test js::stealth::tests::chrome_major_missing_returns_none ... ok
+test js::stealth::tests::profile_major_singlesource ... ok
+test js::stealth::tests::chrome_major_parses_standard_ua ... ok
+test js::stealth::tests::profile_linux ... ok
+test js::stealth::tests::profile_macos_is_opengl_never_direct3d ... ok
+test js::stealth::tests::profile_windows_is_direct3d ... ok
+test js::stealth::tests::retired_stealth_realm_releases_its_traced_host_marker ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 716 filtered out; finished in 0.01s

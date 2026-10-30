@@ -125,6 +125,7 @@ impl ChromeProfile {
     /// `getParameter(UNMASKED_*_WEBGL)` for a UA. Single source of truth with
     /// `build_webgl_constructor` so live contexts and the stealth surface
     /// never disagree.
+    #[cfg(feature = "webgl")]
     pub fn webgl_identity_for(user_agent: &str) -> (&'static str, &'static str) {
         let p = Self::from_ua(user_agent);
         (p.webgl_vendor, p.webgl_renderer)
@@ -420,19 +421,23 @@ fn build_plugin_and_mime_arrays(ctx: &mut Context) -> (JsObject, JsObject) {
     let _ = plugins_arr.set(
         js_string!("item"),
         JsValue::from(
-            FunctionObjectBuilder::new(ctx.realm(), unsafe {
-                NativeFunction::from_closure(move |_this, args, _ctx| {
-                    let idx = args
-                        .first()
-                        .and_then(|v| v.as_number())
-                        .map(|n| n as usize)
-                        .unwrap_or(0);
-                    Ok(plugin_objs
-                        .get(idx)
-                        .map(|p| JsValue::from(p.clone()))
-                        .unwrap_or(JsValue::null()))
-                })
-            })
+            FunctionObjectBuilder::new(
+                ctx.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, plugin_objs, _ctx| {
+                        let idx = args
+                            .first()
+                            .and_then(|v| v.as_number())
+                            .map(|n| n as usize)
+                            .unwrap_or(0);
+                        Ok(plugin_objs
+                            .get(idx)
+                            .map(|p| JsValue::from(p.clone()))
+                            .unwrap_or(JsValue::null()))
+                    },
+                    plugin_objs,
+                ),
+            )
             .name(js_string!("item"))
             .build(),
         ),
@@ -491,19 +496,23 @@ fn build_plugin_and_mime_arrays(ctx: &mut Context) -> (JsObject, JsObject) {
     let _ = mimes_arr.set(
         js_string!("item"),
         JsValue::from(
-            FunctionObjectBuilder::new(ctx.realm(), unsafe {
-                NativeFunction::from_closure(move |_this, args, _ctx| {
-                    let idx = args
-                        .first()
-                        .and_then(|v| v.as_number())
-                        .map(|n| n as usize)
-                        .unwrap_or(0);
-                    Ok(mime_objs_for_item
-                        .get(idx)
-                        .map(|m| JsValue::from(m.clone()))
-                        .unwrap_or(JsValue::null()))
-                })
-            })
+            FunctionObjectBuilder::new(
+                ctx.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, mime_objs_for_item, _ctx| {
+                        let idx = args
+                            .first()
+                            .and_then(|v| v.as_number())
+                            .map(|n| n as usize)
+                            .unwrap_or(0);
+                        Ok(mime_objs_for_item
+                            .get(idx)
+                            .map(|m| JsValue::from(m.clone()))
+                            .unwrap_or(JsValue::null()))
+                    },
+                    mime_objs_for_item,
+                ),
+            )
             .name(js_string!("item"))
             .build(),
         ),
@@ -513,21 +522,25 @@ fn build_plugin_and_mime_arrays(ctx: &mut Context) -> (JsObject, JsObject) {
     let _ = mimes_clone.set(
         js_string!("namedItem"),
         JsValue::from(
-            FunctionObjectBuilder::new(ctx.realm(), unsafe {
-                NativeFunction::from_closure(move |_this, args, _ctx| {
-                    let name = args
-                        .first()
-                        .and_then(|v| v.as_string())
-                        .map(|s| s.to_std_string_escaped())
-                        .unwrap_or_default();
-                    Ok(MIME_TYPES
-                        .iter()
-                        .position(|(t, _)| *t == name)
-                        .and_then(|i| mime_objs.get(i).cloned())
-                        .map(JsValue::from)
-                        .unwrap_or(JsValue::null()))
-                })
-            })
+            FunctionObjectBuilder::new(
+                ctx.realm(),
+                NativeFunction::from_copy_closure_with_captures(
+                    |_this, args, mime_objs, _ctx| {
+                        let name = args
+                            .first()
+                            .and_then(|v| v.as_string())
+                            .map(|s| s.to_std_string_escaped())
+                            .unwrap_or_default();
+                        Ok(MIME_TYPES
+                            .iter()
+                            .position(|(t, _)| *t == name)
+                            .and_then(|i| mime_objs.get(i).cloned())
+                            .map(JsValue::from)
+                            .unwrap_or(JsValue::null()))
+                    },
+                    mime_objs,
+                ),
+            )
             .name(js_string!("namedItem"))
             .build(),
         ),
@@ -561,8 +574,8 @@ fn build_user_agent_data(ctx: &mut Context, p: &ChromeProfile) -> JsValue {
 
     // toJSON() → { brands, mobile, platform }
     let uad_for_tojson = uad.clone();
-    let to_json_fn = unsafe {
-        NativeFunction::from_closure(move |_this, _args, ctx| {
+    let to_json_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, uad_for_tojson, ctx| {
             let b = uad_for_tojson
                 .get(js_string!("brands"), ctx)
                 .unwrap_or(JsValue::undefined());
@@ -578,8 +591,9 @@ fn build_user_agent_data(ctx: &mut Context, p: &ChromeProfile) -> JsValue {
                 .property(js_string!("platform"), plat, Attribute::all())
                 .build();
             Ok(JsValue::from(o))
-        })
-    };
+        },
+        uad_for_tojson,
+    );
     let _ = uad.set(
         js_string!("toJSON"),
         JsValue::from(
@@ -599,21 +613,39 @@ fn build_user_agent_data(ctx: &mut Context, p: &ChromeProfile) -> JsValue {
     let bit_owned = p.bitness.to_string();
     let pver_owned = p.platform_version.to_string();
     let uad_for_hev = uad.clone();
-    let hev_fn = unsafe {
-        NativeFunction::from_closure(move |_this, _args, ctx| {
+    let hev_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, _args, captures, ctx| {
+            let (
+                uad_for_hev,
+                major_owned,
+                full_owned,
+                plat_owned,
+                arch_owned,
+                bit_owned,
+                pver_owned,
+            ) = captures;
             let inner = build_high_entropy_payload(
                 ctx,
-                &uad_for_hev,
-                &major_owned,
-                &full_owned,
-                &plat_owned,
-                &arch_owned,
-                &bit_owned,
-                &pver_owned,
+                uad_for_hev,
+                major_owned,
+                full_owned,
+                plat_owned,
+                arch_owned,
+                bit_owned,
+                pver_owned,
             );
             Ok(make_thenable(ctx, inner))
-        })
-    };
+        },
+        (
+            uad_for_hev,
+            major_owned,
+            full_owned,
+            plat_owned,
+            arch_owned,
+            bit_owned,
+            pver_owned,
+        ),
+    );
     let _ = uad.set(
         js_string!("getHighEntropyValues"),
         JsValue::from(
@@ -1037,8 +1069,8 @@ fn build_webgl_constructor(ctx: &mut Context, p: &ChromeProfile, is_webgl2: bool
 /// (async) consumers without requiring a full Promise implementation.
 fn make_thenable(ctx: &mut Context, target: JsObject) -> JsValue {
     let target_for_then = target.clone();
-    let then_fn = unsafe {
-        NativeFunction::from_closure(move |_this, args, ctx| {
+    let then_fn = NativeFunction::from_copy_closure_with_captures(
+        |_this, args, target_for_then, ctx| {
             if let Some(resolve) = args.first().and_then(|v| v.as_object()) {
                 let _ = resolve.call(
                     &JsValue::null(),
@@ -1047,8 +1079,9 @@ fn make_thenable(ctx: &mut Context, target: JsObject) -> JsValue {
                 );
             }
             Ok(JsValue::undefined())
-        })
-    };
+        },
+        target_for_then,
+    );
     let _ = target.set(
         js_string!("then"),
         JsValue::from(
@@ -1065,6 +1098,40 @@ fn make_thenable(ctx: &mut Context, target: JsObject) -> JsValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_stealth_realm_releases_its_traced_host_marker() {
+        #[derive(boa_gc::Trace, boa_gc::Finalize, boa_engine::JsData)]
+        struct Marker(boa_gc::Gc<()>);
+        for with_stealth in [false, true] {
+            let weak = {
+                let mut ctx = Context::default();
+                let marker = boa_gc::Gc::new(());
+                let weak = boa_gc::WeakGc::new(&marker);
+                ctx.realm().host_defined_mut().insert(Marker(marker));
+                if with_stealth {
+                    let surface = build(&mut ctx, "Chrome/131.0.6778.139");
+                    let navigator = ObjectInitializer::new(&mut ctx).build();
+                    attach_to_navigator(&mut ctx, &navigator, &surface).unwrap();
+                    ctx.register_global_property(
+                        js_string!("navigator"),
+                        navigator,
+                        Attribute::all(),
+                    )
+                    .unwrap();
+                    ctx.eval(boa_engine::Source::from_bytes("navigator.permissions.query({name:'notifications'});navigator.userAgentData.getHighEntropyValues([]);undefined")).unwrap();
+                }
+                ctx.clear_kept_objects();
+                weak
+            };
+            boa_gc::force_collect();
+            boa_gc::force_collect();
+            assert!(
+                !weak.is_upgradable(),
+                "retired realm must not remain rooted by native captures"
+            );
+        }
+    }
 
     #[test]
     fn chrome_major_parses_standard_ua() {

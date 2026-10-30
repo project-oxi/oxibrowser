@@ -291,7 +291,7 @@ pub async fn dispatch(method: &str, params: Option<Value>, ctx: &DispatchContext
 
     let (domain, method_name) = (parts[0], parts[1]);
     match domain {
-        "Browser" => browser::handle(method_name, params),
+        "Browser" => browser::handle(method_name, params, ctx),
         "DOM" => dom::handle(method_name, params, ctx).await,
         "Emulation" => emulation::handle(method_name, params, ctx).await,
         "Fetch" => fetch::handle(method_name, params, ctx).await,

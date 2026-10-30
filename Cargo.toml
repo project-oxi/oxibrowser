@@ -78,3 +78,6 @@ strip = true
 # Published boa_string 0.22.0, with the single Windows::nth performance fix.
 # Archive checksum and upstream commit are retained in vendor/boa_string/PROVENANCE.md.
 boa_string = { path = "vendor/boa_string", version = "=0.22.0" }
+# Published Blitz with document-order stylesheet cascade and safe lifecycle updates.
+# Source checksum, licenses and patch scope: vendor/blitz-dom/PROVENANCE.md.
+blitz-dom = { path = "vendor/blitz-dom", version = "=0.3.0-beta.1" }

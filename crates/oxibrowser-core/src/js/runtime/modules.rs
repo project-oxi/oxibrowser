@@ -17,6 +17,7 @@ pub(super) struct WebModuleLoader {
     document_url: RefCell<String>,
     modules: RefCell<HashMap<String, JsResult<Module>>>,
     deadline: Cell<Option<Instant>>,
+    origin_override: RefCell<Option<Option<String>>>,
 }
 
 pub(super) struct DeadlineGuard {
@@ -40,6 +41,7 @@ impl WebModuleLoader {
             document_url: RefCell::new(document_url.to_owned()),
             modules: RefCell::new(HashMap::new()),
             deadline: Cell::new(None),
+            origin_override: RefCell::new(None),
         }
     }
 
@@ -47,6 +49,10 @@ impl WebModuleLoader {
         *self.document_url.borrow_mut() = url.to_owned();
     }
 
+    /// An opaque frame cannot use the current module network subset.
+    pub(super) fn set_origin_override(&self, origin: Option<String>) {
+        *self.origin_override.borrow_mut() = Some(origin);
+    }
     pub(super) fn script_url(&self, src: &str) -> String {
         Url::parse(&self.document_url.borrow())
             .and_then(|base| base.join(src))
@@ -131,6 +137,11 @@ impl WebModuleLoader {
     }
 
     fn fetch(&self, url: &Url) -> JsResult<FetchResponseMsg> {
+        if matches!(*self.origin_override.borrow(), Some(None)) {
+            return Err(module_error(
+                "SecurityError: module networking is unavailable in opaque-origin frames",
+            ));
+        }
         let tx = self
             .fetch_tx
             .read()
@@ -146,9 +157,11 @@ impl WebModuleLoader {
         }
         let id = next_fetch_id();
         // Use this realm's document origin, never the last-pumped frame's.
-        let origin = Url::parse(&self.document_url.borrow())
-            .ok()
-            .map(|url| url.origin().ascii_serialization());
+        let origin = self.origin_override.borrow().clone().unwrap_or_else(|| {
+            Url::parse(&self.document_url.borrow())
+                .ok()
+                .map(|url| url.origin().ascii_serialization())
+        });
         let headers = vec![(
             "accept".to_owned(),
             "text/javascript, application/javascript".to_owned(),

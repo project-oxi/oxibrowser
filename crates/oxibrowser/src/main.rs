@@ -245,9 +245,12 @@ enum Commands {
         /// Increase for large assets. Applies to CDP mode only.
         #[arg(long, conflicts_with = "mcp")]
         max_response_body_bytes: Option<std::num::NonZeroUsize>,
-        /// Progress timers, network callbacks and animation between CDP commands.
-        #[arg(long, conflicts_with = "mcp")]
+        /// Kept for compatibility; serve progresses application tasks by default.
+        #[arg(long, conflicts_with = "no_background_event_loop")]
         background_event_loop: bool,
+        /// Progress application tasks only while handling browser commands (CDP).
+        #[arg(long, conflicts_with = "mcp")]
+        no_background_event_loop: bool,
         /// Decline WebGL2 contexts so applications select a real WebGL1 context.
         #[arg(long, conflicts_with = "mcp")]
         disable_webgl2: bool,
@@ -529,6 +532,7 @@ async fn main() {
             cookie_file,
             max_response_body_bytes,
             background_event_loop,
+            no_background_event_loop,
             disable_webgl2,
             allow_private_ips,
             proxy,
@@ -568,7 +572,7 @@ async fn main() {
                     proxy,
                     auth_token,
                     max_response_body_bytes.map(std::num::NonZeroUsize::get),
-                    background_event_loop,
+                    background_event_loop || !no_background_event_loop,
                     disable_webgl2,
                     account.as_deref(),
                     ref_tag.as_deref(),

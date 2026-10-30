@@ -40,13 +40,16 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         "navigate" => navigate(params, ctx).await,
         "reload" => reload(params, ctx).await,
         "getFrameTree" => get_frame_tree(ctx).await,
-        "getFrameMetrics" => get_frame_metrics(),
+        "createIsolatedWorld" => create_isolated_world(params, ctx).await,
+        "getFrameMetrics" | "getLayoutMetrics" => {
+            super::runtime::remote("getLayoutMetrics", params, ctx).await
+        }
         "captureScreenshot" => capture_screenshot(params, ctx).await,
         "printToPDF" => print_to_pdf(params, ctx).await,
         "startScreencast" => start_screencast(params, ctx).await,
         "stopScreencast" => stop_screencast(ctx),
         "screencastFrameAck" => screencast_frame_ack(params),
-        "setDownloadBehavior" => set_download_behavior(params),
+        "setDownloadBehavior" => set_download_behavior(params, ctx),
         "getLifecycleEvents" => get_lifecycle_events(ctx),
         "setLifecycleEventsEnabled" => set_lifecycle_events_enabled(params, ctx),
         // Dialog handling: alert/confirm/prompt default to non-blocking
@@ -64,6 +67,7 @@ pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) 
         // they don't 404 the client. Real implementations land per phase.
         "bringToFront" => bring_to_front(),
         "getNavigationHistory" => get_navigation_history(ctx).await,
+        "navigateToHistoryEntry" => navigate_to_history_entry(params, ctx).await,
         "setBypassCSP" => set_bypass_csp(),
         _ => Err(CdpError {
             code: -32601,
@@ -102,49 +106,53 @@ fn set_lifecycle_events_enabled(params: Option<Value>, ctx: &DispatchContext) ->
 /// empty title. Every entry uses the `link` transition type since redirect
 /// chains are not recorded.
 async fn get_navigation_history(ctx: &DispatchContext) -> DomainResult {
-    let guard = ctx.session.read().await;
-    let current_index = guard.history_index();
-    let current_title = guard.page().and_then(|p| p.title()).unwrap_or("");
-    let entries: Vec<Value> = guard
-        .history()
-        .iter()
-        .enumerate()
-        .map(|(i, url)| {
-            json!({
-                "id": i + 1,
-                "url": url.as_str(),
-                "userTypedURL": url.as_str(),
-                "title": if i == current_index { current_title } else { "" },
-                "transitionType": "link",
-            })
-        })
-        .collect();
-    Ok(Some(json!({
-        "currentIndex": current_index,
-        "entries": entries,
-    })))
+    let mut session = ctx.session.write().await;
+    let snapshot = session.navigation_history_snapshot().await?;
+    let index = snapshot["index"].as_u64().unwrap_or(0) as usize;
+    let title = session.page().and_then(|page| page.title()).unwrap_or("");
+    let entries=snapshot["entries"].as_array().map(|entries|entries.iter().enumerate().map(|(position,entry)|json!({
+        "id":entry["id"],"url":entry["url"],"userTypedURL":entry["url"],"title":if position==index {title} else {""},"transitionType":"other"
+    })).collect::<Vec<_>>()).unwrap_or_default();
+    Ok(Some(json!({"currentIndex":index,"entries":entries})))
 }
 
-/// Page.getLifecycleEvents — returns the buffered lifecycle events.
-///
-/// While the lifecycle flag is enabled (`Page.enable` or
-/// `Page.setLifecycleEventsEnabled(true)`), the three navigation lifecycle
-/// events are buffered, keeping the most recent 20. Each entry reports the
-/// synthetic `main` frame and the event name without its `Page.` prefix.
+async fn navigate_to_history_entry(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_else(|| json!({}));
+    let id = params
+        .get("entryId")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "Missing history entryId".into(),
+        })?;
+    let mut session = ctx.session.write().await;
+    let same_document = session.navigate_history_entry(id).await?;
+    if !same_document {
+        let url = session
+            .current_url()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let loader = format!("LID-{}", uuid::Uuid::new_v4());
+        let frame = ctx.events.main_frame_id();
+        ctx.events.clear_reported_worlds(&session.id().to_string());
+        ctx.events
+            .send_runtime_event("Runtime.executionContextsCleared", json!({}));
+        ctx.events.send_page_event("Page.frameNavigated",json!({"frame":{"id":frame,"url":url,"loaderId":loader,"mimeType":"text/html"},"type":"Navigation"}));
+        announce_child_frames(ctx, &session, frame, &loader);
+        announce_document_contexts(ctx, &mut session, &url).await?;
+        for name in ["DOMContentLoaded", "load"] {
+            ctx.events.send_page_event("Page.lifecycleEvent",json!({"frameId":frame,"loaderId":loader,"name":name,"timestamp":EventSender::timestamp_ms()/1000.0}));
+        }
+    }
+    Ok(Some(json!({})))
+}
+
+/// Return the lifecycle events buffered for this target.
 fn get_lifecycle_events(ctx: &DispatchContext) -> DomainResult {
-    let events: Vec<Value> = ctx
-        .events
-        .lifecycle_events()
-        .into_iter()
-        .map(|(method, _params, timestamp)| {
-            json!({
-                "frameId": "main",
-                "name": method.strip_prefix("Page.").unwrap_or(method.as_str()),
-                "timestamp": timestamp,
-            })
-        })
-        .collect();
-    Ok(Some(json!({ "events": events })))
+    let events=ctx.events.lifecycle_events().into_iter().map(|(method,_,timestamp)|json!({
+        "frameId":ctx.events.main_frame_id(),"name":method.strip_prefix("Page.").unwrap_or(&method),"timestamp":timestamp
+    })).collect::<Vec<_>>();
+    Ok(Some(json!({"events":events})))
 }
 
 /// Page.setBypassCSP — accepted as a no-op.
@@ -208,7 +216,7 @@ async fn navigate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
             "wallTime": pre_timestamp / 1000.0,
             "initiator": { "type": "other" },
             "type": "Document",
-            "frameId": "main",
+            "frameId": ctx.events.main_frame_id(),
             "hasUserGesture": false,
         }),
     );
@@ -234,7 +242,7 @@ async fn navigate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
         match decision {
             Ok(InterceptAction::Fail { error_reason }) => {
                 return Ok(Some(json!({
-                    "frameId": "main",
+                    "frameId": ctx.events.main_frame_id(),
                     "loaderId": loader_id,
                     "errorText": error_reason
                 })));
@@ -253,12 +261,12 @@ async fn navigate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
     let mut guard = ctx.session.write().await;
     match guard.navigate(&effective_url).await {
         Ok(()) => {
+            ctx.events.clear_reported_worlds(&guard.id().to_string());
+            ctx.events
+                .send_runtime_event("Runtime.executionContextsCleared", json!({}));
             // Capture timestamp after navigation completes
             let timestamp = EventSender::timestamp_ms();
-            let frame_id = guard
-                .page()
-                .map(|p| p.root_frame().id().to_string())
-                .unwrap_or_else(|| "main".to_string());
+            let frame_id = ctx.events.main_frame_id().to_owned();
 
             let final_url = guard
                 .current_url()
@@ -284,51 +292,9 @@ async fn navigate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
                 }),
             );
 
-            // 3b. Emit Page.frameNavigated + executionContextCreated for each
-            // child iframe (Phase 8).
-            if let Some(page) = guard.page() {
-                let frame_map = guard.frame_context_map().read().clone();
-                for child in page.root_frame().children() {
-                    let child_url = child.url();
-                    let child_frame_id = child.id().to_string();
-                    ctx.events.send_page_event(
-                        "Page.frameNavigated",
-                        json!({
-                            "frame": {
-                                "id": child_frame_id,
-                                "parentId": frame_id,
-                                "loaderId": loader_id,
-                                "url": child_url.to_string(),
-                                "domainAndRegistry": "",
-                                "securityOrigin": child_url.origin().unicode_serialization(),
-                                "mimeType": "text/html",
-                                "secureContextType": "Secure",
-                                "crossOriginIsolatedContextType": "NotIsolated",
-                            },
-                            "type": "Navigation"
-                        }),
-                    );
-                    // Emit the matching execution context.
-                    if let Some(&context_id) = frame_map.get(&child_frame_id) {
-                        ctx.events.send_runtime_event(
-                            "Runtime.executionContextCreated",
-                            json!({
-                                "context": {
-                                    "id": context_id,
-                                    "origin": child_url.origin().unicode_serialization(),
-                                    "name": format!("iframe:{child_frame_id}"),
-                                    "uniqueId": format!("context-{}", uuid::Uuid::new_v4()),
-                                    "auxData": {
-                                        "isDefault": true,
-                                        "type": "default",
-                                        "frameId": child_frame_id
-                                    }
-                                }
-                            }),
-                        );
-                    }
-                }
-            }
+            announce_child_frames(ctx, &guard, &frame_id, &loader_id);
+
+            announce_document_contexts(ctx, &mut guard, &final_url).await?;
 
             // 4-5. Emit Network.responseReceived and Network.loadingFinished
             network::emit_response_events(
@@ -349,6 +315,11 @@ async fn navigate(params: Option<Value>, ctx: &DispatchContext) -> DomainResult 
             // 7. Emit Page.loadEventFired
             ctx.events
                 .send_page_event("Page.loadEventFired", json!({ "timestamp": timestamp }));
+            for name in ["DOMContentLoaded", "load"] {
+                ctx.events.send_page_event("Page.lifecycleEvent", json!({
+                    "frameId":frame_id, "loaderId":loader_id, "name":name, "timestamp":timestamp / 1000.0
+                }));
+            }
 
             // Fetch.requestPaused will be emitted from Session::navigate
             // once Fetch interception is fully integrated with the HTTP client
@@ -413,7 +384,7 @@ async fn reload(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
             "wallTime": pre_timestamp / 1000.0,
             "initiator": { "type": "other" },
             "type": "Document",
-            "frameId": "main",
+            "frameId": ctx.events.main_frame_id(),
             "hasUserGesture": false,
         }),
     );
@@ -422,12 +393,12 @@ async fn reload(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let mut guard = ctx.session.write().await;
     match guard.reload().await {
         Ok(()) => {
+            ctx.events.clear_reported_worlds(&guard.id().to_string());
+            ctx.events
+                .send_runtime_event("Runtime.executionContextsCleared", json!({}));
             // Capture timestamp after reload completes
             let timestamp = EventSender::timestamp_ms();
-            let frame_id = guard
-                .page()
-                .map(|p| p.root_frame().id().to_string())
-                .unwrap_or_else(|| "main".to_string());
+            let frame_id = ctx.events.main_frame_id().to_owned();
 
             let final_url = guard
                 .current_url()
@@ -448,6 +419,10 @@ async fn reload(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
                 }),
             );
 
+            announce_child_frames(ctx, &guard, &frame_id, &loader_id);
+
+            announce_document_contexts(ctx, &mut guard, &final_url).await?;
+
             // 4-5. Emit Network.responseReceived and Network.loadingFinished
             network::emit_response_events(
                 &ctx.events,
@@ -467,6 +442,11 @@ async fn reload(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
             // 7. Emit Page.loadEventFired
             ctx.events
                 .send_page_event("Page.loadEventFired", json!({ "timestamp": timestamp }));
+            for name in ["DOMContentLoaded", "load"] {
+                ctx.events.send_page_event("Page.lifecycleEvent", json!({
+                    "frameId":frame_id, "loaderId":loader_id, "name":name, "timestamp":timestamp / 1000.0
+                }));
+            }
 
             Ok(Some(json!({
                 "frameId": frame_id,
@@ -480,6 +460,135 @@ async fn reload(_params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     }
 }
 
+fn announce_child_frames(
+    ctx: &DispatchContext,
+    session: &oxibrowser_core::session::Session,
+    root_id: &str,
+    loader: &str,
+) {
+    fn walk(
+        ctx: &DispatchContext,
+        frame: &oxibrowser_core::frame::Frame,
+        parent: &str,
+        loader: &str,
+        contexts: &HashMap<String, u32>,
+    ) {
+        for child in frame.children() {
+            let id = child.id().to_string();
+            let url = child.url();
+            ctx.events.send_page_event(
+                "Page.frameAttached",
+                json!({"frameId":id,"parentFrameId":parent}),
+            );
+            ctx.events.send_page_event("Page.frameNavigated", json!({"frame":{
+                "id":id,"parentId":parent,"loaderId":loader,"url":url.to_string(),"securityOrigin":url.origin().unicode_serialization(),"mimeType":"text/html"
+            },"type":"Navigation"}));
+            if let Some(context) = contexts.get(&id) {
+                ctx.events.send_runtime_event("Runtime.executionContextCreated", json!({"context":{
+                    "id":context,"origin":url.origin().unicode_serialization(),"name":format!("iframe:{id}"),"uniqueId":format!("context-{}",uuid::Uuid::new_v4()),
+                    "auxData":{"isDefault":true,"type":"default","frameId":id}
+                }}));
+            }
+            for name in ["DOMContentLoaded", "load"] {
+                ctx.events.send_page_event("Page.lifecycleEvent",json!({"frameId":id,"loaderId":loader,"name":name,"timestamp":EventSender::timestamp_ms()/1000.0}));
+            }
+            walk(ctx, child, &id, loader, contexts);
+        }
+    }
+    if let Some(page) = session.page() {
+        walk(
+            ctx,
+            page.root_frame(),
+            root_id,
+            loader,
+            &session.frame_context_map().read(),
+        );
+    }
+}
+
+fn announce_isolated_context(
+    ctx: &DispatchContext,
+    owner: &str,
+    frame: &str,
+    world: &str,
+    id: u32,
+    origin: &str,
+) {
+    if !ctx.events.report_world_once(owner, id) {
+        return;
+    }
+    ctx.events.send_runtime_event("Runtime.executionContextCreated", json!({"context":{
+        "id":id, "origin":origin, "name":world, "uniqueId":format!("context-{}",uuid::Uuid::new_v4()),
+        "auxData":{"isDefault":false,"type":"isolated","frameId":frame}
+    }}));
+}
+
+async fn create_isolated_world(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_else(|| json!({}));
+    let frame = params
+        .get("frameId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "Missing frameId".into(),
+        })?;
+    let world = params
+        .get("worldName")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut session = ctx.session.write().await;
+    let owner = session.id().to_string();
+    let internal_frame = if frame == ctx.events.main_frame_id() {
+        "main"
+    } else {
+        frame
+    };
+    let id = session.create_isolated_world(internal_frame, world).await?;
+    let origin = session
+        .current_url()
+        .map(|url| url.origin().unicode_serialization())
+        .unwrap_or_default();
+    announce_isolated_context(ctx, &owner, frame, world, id, &origin);
+    Ok(Some(json!({"executionContextId":id})))
+}
+
+async fn announce_document_contexts(
+    ctx: &DispatchContext,
+    session: &mut oxibrowser_core::session::Session,
+    url: &str,
+) -> Result<(), CdpError> {
+    let owner = session.id().to_string();
+    let origin = url::Url::parse(url)
+        .ok()
+        .map(|url| url.origin().unicode_serialization())
+        .unwrap_or_default();
+    ctx.events.send_runtime_event("Runtime.executionContextCreated", json!({"context":{
+        "id":1, "origin":origin, "name":"main", "uniqueId":format!("context-{}",uuid::Uuid::new_v4()),
+        "auxData":{"isDefault":true,"type":"default","frameId":ctx.events.main_frame_id()}
+    }}));
+    let frames: Vec<String> = std::iter::once("main".to_owned())
+        .chain(session.frame_context_map().read().keys().cloned())
+        .collect();
+    for (_, world) in ctx.events.world_scripts(&owner) {
+        for frame in &frames {
+            let id = session.create_isolated_world(frame, &world).await?;
+            announce_isolated_context(
+                ctx,
+                &owner,
+                if frame == "main" {
+                    ctx.events.main_frame_id()
+                } else {
+                    frame.as_str()
+                },
+                &world,
+                id,
+                &origin,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Page.getFrameTree — returns the actual frame tree from the session,
 /// including child iframe frames (Phase 8).
 async fn get_frame_tree(ctx: &DispatchContext) -> DomainResult {
@@ -487,14 +596,14 @@ async fn get_frame_tree(ctx: &DispatchContext) -> DomainResult {
     match guard.page() {
         Some(page) => {
             let frame = page.root_frame();
-            Ok(Some(json!({
-                "frameTree": frame_tree_node(frame)
-            })))
+            let mut node = frame_tree_node(frame, None, ctx.events.main_frame_id());
+            node["frame"]["id"] = json!(ctx.events.main_frame_id());
+            Ok(Some(json!({ "frameTree": node })))
         }
         None => Ok(Some(json!({
             "frameTree": {
                 "frame": {
-                    "id": "main",
+                    "id": ctx.events.main_frame_id(),
                     "url": "about:blank",
                     "securityOrigin": "",
                     "mimeType": "text/html"
@@ -506,88 +615,125 @@ async fn get_frame_tree(ctx: &DispatchContext) -> DomainResult {
 }
 
 /// Build a recursive frame-tree JSON node for `Page.getFrameTree`.
-fn frame_tree_node(frame: &oxibrowser_core::frame::Frame) -> Value {
+fn frame_tree_node(
+    frame: &oxibrowser_core::frame::Frame,
+    parent: Option<&str>,
+    root: &str,
+) -> Value {
     let url = frame.url();
-    let child_frames: Vec<Value> = frame.children().iter().map(frame_tree_node).collect();
-    json!({
-        "frame": {
-            "id": frame.id().to_string(),
-            "url": url.to_string(),
-            "securityOrigin": url.origin().unicode_serialization(),
-            "mimeType": "text/html"
-        },
-        "childFrames": child_frames
-    })
+    let id = if parent.is_none() {
+        root.to_owned()
+    } else {
+        frame.id().to_string()
+    };
+    let child_frames: Vec<Value> = frame
+        .children()
+        .iter()
+        .map(|child| frame_tree_node(child, Some(&id), root))
+        .collect();
+    let mut node = json!({"frame":{"id":id,"url":url.to_string(),"securityOrigin":url.origin().unicode_serialization(),"mimeType":"text/html"},"childFrames":child_frames});
+    if let Some(parent) = parent {
+        node["frame"]["parentId"] = json!(parent);
+    }
+    node
 }
 
-/// Page.getFrameMetrics — returns frame layout metrics.
-fn get_frame_metrics() -> DomainResult {
-    Ok(Some(json!({
-        "layoutViewport": {
-            "pageX": 0,
-            "pageY": 0,
-            "clientWidth": 1280,
-            "clientHeight": 720
-        },
-        "visualViewport": {
-            "offsetX": 0,
-            "offsetY": 0,
-            "pageX": 0,
-            "pageY": 0,
-            "clientWidth": 1280,
-            "clientHeight": 720,
-            "scale": 1,
-            "zoom": 1
-        },
-        "contentSize": {
-            "width": 1280,
-            "height": 720
-        }
-    })))
-}
-
-/// Page.captureScreenshot — captures a screenshot of the page.
-///
-/// Renders the live `RenderDocument` (Blitz + Stylo layout, vello_cpu raster,
-/// real fonts) via `Session::capture_screenshot_png` — full page.
+/// Page.captureScreenshot supports viewport PNGs and integral clips within it.
 async fn capture_screenshot(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     let params = params.unwrap_or_default();
-    let _format = params
-        .get("format")
-        .and_then(|v| v.as_str())
-        .unwrap_or("png");
-    let viewport_width = params
-        .get("clip")
-        .and_then(|v| v.get("width"))
-        .and_then(|v| v.as_f64())
-        .unwrap_or(1280.0) as u32;
-
-    // Render the live (post-JS) RenderDocument via the JS thread. Falls back to
-    // a blank PNG if no document is loaded — except the password-focus capture
-    // guard, whose refusal must reach the client instead of a blank frame.
-    let mut guard = ctx.session.write().await;
-    let png_bytes: Vec<u8> = match guard.capture_screenshot_png(viewport_width.max(64)).await {
-        Ok(png) => png,
-        Err(e)
-            if e.to_string()
-                .contains(oxibrowser_core::session::CAPTURE_BLOCKED_MSG) =>
-        {
-            return Err(e.into());
-        }
-        Err(_) => oxibrowser_core::blank_png(viewport_width.max(64), 800),
+    let invalid = |message: &str| CdpError {
+        code: -32602,
+        message: message.into(),
     };
-
-    use base64::Engine;
-    let data = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-
-    Ok(Some(json!({
-        "data": data,
-        "metadata": {
-            "pageScaleFactor": 1,
-            "deviceWidth": viewport_width,
-            "deviceHeight": 720
+    if params
+        .get("format")
+        .is_some_and(|format| format.as_str() != Some("png"))
+    {
+        return Err(invalid("Only PNG viewport screenshots are supported"));
+    }
+    for (name, supported) in [
+        ("captureBeyondViewport", false),
+        ("fromSurface", true),
+        ("optimizeForSpeed", false),
+    ] {
+        if params
+            .get(name)
+            .is_some_and(|value| value.as_bool() != Some(supported))
+        {
+            return Err(invalid(&format!("Unsupported screenshot parameter {name}")));
         }
-    })))
+    }
+    if params.get("quality").is_some() {
+        return Err(invalid("Screenshot quality is unsupported for PNG"));
+    }
+    let mut guard = ctx.session.write().await;
+    let clip = if let Some(clip) = params.get("clip") {
+        let metrics = guard
+            .remote_command(1, json!({"method":"getLayoutMetrics","params":{}}))
+            .await?;
+        let viewport = &metrics["cssLayoutViewport"];
+        let number = |name: &str| {
+            clip.get(name)
+                .and_then(Value::as_f64)
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| invalid("Screenshot clip requires finite x, y, width and height"))
+        };
+        if clip
+            .get("scale")
+            .is_some_and(|scale| scale.as_f64() != Some(1.0))
+        {
+            return Err(invalid("Screenshot clip scale must be 1"));
+        }
+        let x = number("x")? - viewport["pageX"].as_f64().unwrap_or(0.0);
+        let y = number("y")? - viewport["pageY"].as_f64().unwrap_or(0.0);
+        let width = number("width")?;
+        let height = number("height")?;
+        if [x, y, width, height]
+            .iter()
+            .any(|v| v.fract().abs() > 1e-7 || *v < 0.0 || *v > u32::MAX as f64)
+            || width == 0.0
+            || height == 0.0
+            || x + width > viewport["clientWidth"].as_f64().unwrap_or(0.0)
+            || y + height > viewport["clientHeight"].as_f64().unwrap_or(0.0)
+        {
+            return Err(invalid(
+                "Screenshot clip must be an integral rectangle inside the current viewport",
+            ));
+        }
+        Some((
+            x.round() as u32,
+            y.round() as u32,
+            width as u32,
+            height as u32,
+        ))
+    } else {
+        None
+    };
+    let mut png = guard.capture_viewport_screenshot_png().await?;
+    drop(guard);
+    if let Some((x, y, width, height)) = clip {
+        let dimensions =
+            image::ImageReader::with_format(Cursor::new(&png), image::ImageFormat::Png)
+                .into_dimensions()
+                .map_err(|error| invalid(&format!("Invalid rendered PNG: {error}")))?;
+        if x + width > dimensions.0 || y + height > dimensions.1 {
+            return Err(invalid("Screenshot clip exceeds the rendered viewport"));
+        }
+        if (x, y, width, height) != (0, 0, dimensions.0, dimensions.1) {
+            let image = image::load_from_memory(&png)
+                .map_err(|error| invalid(&format!("PNG decoding failed: {error}")))?;
+            let mut output = Cursor::new(Vec::new());
+            image
+                .crop_imm(x, y, width, height)
+                .write_to(&mut output, image::ImageFormat::Png)
+                .map_err(|error| invalid(&format!("PNG encoding failed: {error}")))?;
+            png = output.into_inner();
+        }
+    }
+    use base64::Engine;
+    Ok(Some(
+        json!({"data":base64::engine::general_purpose::STANDARD.encode(png)}),
+    ))
 }
 
 /// Resolve `Page.printToPDF` margins (inches) into one millimetre margin.
@@ -666,19 +812,22 @@ async fn print_to_pdf(params: Option<Value>, ctx: &DispatchContext) -> DomainRes
 }
 
 /// `Page.setDownloadBehavior` — configure the directory downloads are saved to.
-fn set_download_behavior(params: Option<Value>) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let path = params.get("downloadPath").and_then(|v| v.as_str());
+fn set_download_behavior(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_else(|| json!({}));
     let behavior = params
         .get("behavior")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .unwrap_or("allow");
-    let dir = if behavior == "deny" {
-        None
-    } else {
-        path.map(std::path::PathBuf::from)
-    };
-    oxibrowser_core::session::set_download_behavior(dir);
+    let path = params
+        .get("downloadPath")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    ctx.browser_context
+        .set_cdp_download_behavior(behavior, path, true)
+        .map_err(|error| CdpError {
+            code: -32602,
+            message: error.to_string(),
+        })?;
     Ok(Some(json!({})))
 }
 
@@ -704,6 +853,24 @@ async fn add_script_to_evaluate_on_new_document(
             code: -32602,
             message: "source required".to_string(),
         })?;
+    if let Some(world) = params
+        .get("worldName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        if !source.is_empty() {
+            return Err(CdpError {
+                code: -32000,
+                message: "Nonempty isolated-world document-start scripts are not supported".into(),
+            });
+        }
+        let mut session = ctx.session.write().await;
+        let owner = session.id().to_string();
+        let identifier = ctx.events.add_world_script(owner.clone(), world.to_owned());
+        let id = session.create_isolated_world("main", world).await?;
+        announce_isolated_context(ctx, &owner, ctx.events.main_frame_id(), world, id, "");
+        return Ok(Some(json!({"identifier":identifier})));
+    }
     let identifier = ctx
         .session
         .write()
@@ -733,7 +900,11 @@ async fn remove_script_to_evaluate_on_new_document(
             code: -32602,
             message: "identifier required".to_string(),
         })?;
-    let removed = ctx.session.write().await.remove_init_script(identifier);
+    let mut session = ctx.session.write().await;
+    let removed = ctx
+        .events
+        .remove_world_script(&session.id().to_string(), identifier)
+        || session.remove_init_script(identifier);
     tracing::debug!(identifier = %identifier, removed, "Page.removeScriptToEvaluateOnNewDocument");
     Ok(Some(json!({})))
 }
