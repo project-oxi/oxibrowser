@@ -22,6 +22,34 @@ const HTML: &str = r#"<html>
 const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
 #[test]
+fn parsed_attributes_are_replaced_and_removed_without_namespace_duplicates() {
+    let mut doc = RenderDocument::from_html(
+        "<p id='label' data-label='old' aria-busy='true'>Loading</p>",
+        None,
+        Viewport {
+            width: 320,
+            height: 240,
+            scale: 1.0,
+        },
+    )
+    .unwrap();
+    let node = doc.query_selector("#label").unwrap();
+    doc.set_attribute(node, "data-label", "new");
+    doc.set_attribute(node, "aria-busy", "false");
+    assert_eq!(doc.node_attr(node, "data-label").as_deref(), Some("new"));
+    assert_eq!(doc.node_attr(node, "aria-busy").as_deref(), Some("false"));
+    assert_eq!(
+        doc.node_attributes(node)
+            .iter()
+            .filter(|(name, _)| name == "data-label")
+            .count(),
+        1
+    );
+    doc.remove_attribute(node, "data-label");
+    assert_eq!(doc.node_attr(node, "data-label"), None);
+}
+
+#[test]
 fn renders_basic_html_to_valid_png() {
     let mut doc = RenderDocument::from_html(
         HTML,

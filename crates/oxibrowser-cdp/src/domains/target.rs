@@ -45,7 +45,7 @@ fn set_discover_targets(params: Option<Value>, ctx: &DispatchContext) -> DomainR
     if discover {
         // Emit targetCreated for the default page target
         let context_id = ctx.browser.default_context().id().to_string();
-        ctx.events.send_event(
+        ctx.events.send_browser_event(
             "Target.targetCreated",
             json!({
                 "targetInfo": {
@@ -79,13 +79,13 @@ fn set_auto_attach(params: Option<Value>, ctx: &DispatchContext) -> DomainResult
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
 
-    if auto_attach {
+    if auto_attach && ctx.events.session_id().is_none() {
         let session_id = format!("session-{}", uuid::Uuid::new_v4().as_simple());
         let attached_session_id = session_id.clone();
         let context_id = ctx.browser.default_context().id().to_string();
 
         // Emit attachedToTarget for the default target
-        ctx.events.send_event(
+        ctx.events.send_browser_event(
             "Target.attachedToTarget",
             json!({
                 "sessionId": session_id,
@@ -162,6 +162,15 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
             code: -32000,
             message: format!("failed to create new session: {e}"),
         })?;
+    new_session
+        .write()
+        .await
+        .navigate("about:blank")
+        .await
+        .map_err(|e| CdpError {
+            code: -32000,
+            message: format!("failed to initialize target document: {e}"),
+        })?;
 
     let target_id = format!("TID-{}", uuid::Uuid::new_v4().as_simple());
     let session_id = format!("session-{}", uuid::Uuid::new_v4().as_simple());
@@ -174,7 +183,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
         let mut s = new_session.write().await;
         s.set_event_sink(core_tx);
     }
-    let child_events = ctx.events.clone();
+    let child_events = ctx.events.for_target_session(&session_id, &target_id);
     let child_sid = session_id.clone();
     let drain_handle = tokio::spawn(async move {
         loop {
@@ -203,7 +212,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
         )
         .await;
 
-    ctx.events.send_event(
+    ctx.events.send_browser_event(
         "Target.targetCreated",
         json!({
             "targetInfo": {
@@ -217,7 +226,7 @@ async fn create_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRe
             }
         }),
     );
-    ctx.events.send_event(
+    ctx.events.send_browser_event(
         "Target.attachedToTarget",
         json!({
             "sessionId": session_id,
@@ -274,12 +283,13 @@ async fn close_target(params: Option<Value>, ctx: &DispatchContext) -> DomainRes
             message: format!("failed to close target: {e}"),
         })?;
 
-    ctx.events.send_event(
+    ctx.browser.cleanup_closed_sessions();
+    ctx.events.send_browser_event(
         "Target.detachedFromTarget",
-        json!({ "sessionId": session_id }),
+        json!({ "sessionId": session_id, "targetId":target_id }),
     );
     ctx.events
-        .send_event("Target.targetDestroyed", json!({ "targetId": target_id }));
+        .send_browser_event("Target.targetDestroyed", json!({ "targetId": target_id }));
 
     Ok(Some(json!({ "targetId": target_id, "success": true })))
 }
@@ -690,6 +700,202 @@ mod tests {
             logins: None,
         };
         (ctx, rx)
+    }
+
+    #[tokio::test]
+    async fn repeated_auto_attach_does_not_attach_page_to_itself() {
+        let (ctx, mut rx) = make_ctx().await;
+        handle(
+            "setAutoAttach",
+            Some(json!({"autoAttach":true,"flatten":true})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.method, "Target.attachedToTarget");
+        let session = ctx.events.session_id().unwrap();
+        handle(
+            "setAutoAttach",
+            Some(json!({"autoAttach":true,"flatten":true})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.events.session_id().as_deref(), Some(session.as_str()));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cdp_isolated_world_is_separate_and_shares_native_document() {
+        let (ctx, mut events) = make_ctx().await;
+        ctx.session
+            .write()
+            .await
+            .navigate("data:text/html,<html><body><div id='shared'></div></body></html>")
+            .await
+            .unwrap();
+        ctx.events.set_runtime_enabled(true);
+        let result = crate::domains::page::handle(
+            "createIsolatedWorld",
+            Some(json!({"frameId":"default","worldName":"utility"})),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let context_id = result["executionContextId"].as_u64().unwrap() as u32;
+        assert_ne!(context_id, 1);
+        let event = events.recv().await.unwrap();
+        let params = event.params.unwrap();
+        assert_eq!(params["context"]["auxData"]["isDefault"], false);
+        assert_eq!(params["context"]["auxData"]["frameId"], "default");
+        crate::domains::runtime::handle("evaluate", Some(json!({"contextId":context_id,"expression":"globalThis.utilityOnly = true; document.querySelector('#shared').setAttribute('data-world','yes');"})), &ctx).await.unwrap();
+        let result = crate::domains::runtime::handle("evaluate", Some(json!({"contextId":1,"expression":"globalThis.utilityOnly === undefined && document.querySelector('#shared').getAttribute('data-world') === 'yes'"})), &ctx).await.unwrap().unwrap();
+        assert_eq!(result["result"]["value"], true);
+        assert!(
+            crate::domains::page::handle(
+                "addScriptToEvaluateOnNewDocument",
+                Some(json!({"worldName":"utility","source":"globalThis.late = 1"})),
+                &ctx
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cdp_same_document_history_keeps_dom_realms_and_live_handles() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body><div id='kept'>kept</div></body></html>"),
+            )
+            .mount(&server)
+            .await;
+        let (ctx, _events) = make_ctx().await;
+        ctx.session
+            .write()
+            .await
+            .navigate(&format!("{}/page", server.uri()))
+            .await
+            .unwrap();
+        let before = ctx.session.read().await.page().unwrap().id();
+        let world = crate::domains::page::handle(
+            "createIsolatedWorld",
+            Some(json!({"frameId":"default","worldName":"utility"})),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()["executionContextId"]
+            .as_u64()
+            .unwrap();
+        let handle = crate::domains::runtime::handle(
+            "evaluate",
+            Some(json!({"expression":"globalThis.kept=7; document.querySelector('#kept')"})),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()["result"]["objectId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        crate::domains::runtime::handle("evaluate",Some(json!({"expression":"history.pushState({step:1},'', '#a'); history.pushState({step:2},'', '#b');"})),&ctx).await.unwrap();
+        let history = crate::domains::page::handle("getNavigationHistory", None, &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let entry = history["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["url"].as_str().unwrap().ends_with("#a"))
+            .unwrap()["id"]
+            .clone();
+        crate::domains::page::handle(
+            "navigateToHistoryEntry",
+            Some(json!({"entryId":entry})),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ctx.session.read().await.page().unwrap().id(), before);
+        assert!(
+            ctx.session
+                .read()
+                .await
+                .current_url()
+                .unwrap()
+                .as_str()
+                .ends_with("#a")
+        );
+        let state=crate::domains::runtime::handle("evaluate",Some(json!({"expression":"[kept,location.hash,history.state.step]","returnByValue":true})),&ctx).await.unwrap().unwrap();
+        assert_eq!(state["result"]["value"][0], 7);
+        assert_eq!(state["result"]["value"][1], "#a");
+        assert_eq!(state["result"]["value"][2].as_f64(), Some(1.0));
+        let live=crate::domains::runtime::handle("callFunctionOn",Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.textContent}"})),&ctx).await.unwrap().unwrap();
+        assert_eq!(live["result"]["value"], "kept");
+        let utility = crate::domains::runtime::handle(
+            "evaluate",
+            Some(json!({"contextId":world,"expression":"location.hash"})),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(utility["result"]["value"], "#a");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "same-document history must not refetch"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_history_preserves_physical_back_forward_and_refetches() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<html><body>history</body></html>"),
+            )
+            .mount(&server)
+            .await;
+        let (ctx, _) = make_ctx().await;
+        let mut session = ctx.session.write().await;
+        for path in ["one", "two", "three"] {
+            session
+                .navigate(&format!("{}/{path}", server.uri()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(session.history().len(), 3);
+        assert_eq!(session.history_index(), 2);
+        let before = session.page().unwrap().id();
+        session.go_back().await.unwrap();
+        assert_ne!(session.page().unwrap().id(), before);
+        assert_eq!(session.current_url().unwrap().path(), "/two");
+        assert_eq!(session.history().len(), 3);
+        assert_eq!(session.history_index(), 1);
+        let before = session.page().unwrap().id();
+        session.go_forward().await.unwrap();
+        assert_ne!(
+            session.page().unwrap().id(),
+            before,
+            "a distinct physical document must not be treated as same-document"
+        );
+        assert_eq!(session.current_url().unwrap().path(), "/three");
+        assert_eq!(session.history().len(), 3);
+        assert_eq!(session.history_index(), 2);
+        assert_eq!(server.received_requests().await.unwrap().len(), 5);
     }
 
     /// DispatchContext variant whose `session` is a child target's session,

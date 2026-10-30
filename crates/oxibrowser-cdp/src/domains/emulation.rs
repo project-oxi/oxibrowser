@@ -39,6 +39,9 @@ pub fn current_device_metrics() -> Option<DeviceMetrics> {
 pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     match method {
         "setDeviceMetricsOverride" => set_device_metrics_override(params),
+        "setFocusEmulationEnabled" => {
+            super::runtime::remote("setFocusEmulationEnabled", params, ctx).await
+        }
         "clearDeviceMetricsOverride" => clear_device_metrics_override(),
         // Deprecated/non-standard CDP (`Emulation.setVisibleSize` was never in
         // the spec and modern Chrome rejects it) — fall through to -32601 like

@@ -2,14 +2,15 @@
 //!
 //! Handles Browser.getVersion, Browser.close, Browser.getWindowForTarget.
 
-use crate::domains::DomainResult;
+use crate::domains::{DispatchContext, DomainResult};
 use crate::protocol::CdpError;
 use serde_json::{Value, json};
 
 /// Dispatch Browser domain methods.
-pub fn handle(method: &str, params: Option<Value>) -> DomainResult {
+pub fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     match method {
         "getVersion" => get_version(),
+        "setDownloadBehavior" => set_download_behavior(params, ctx),
         "close" => close(),
         "getWindowForTarget" => get_window_for_target(),
         "setWindowBounds" => set_window_bounds(params),
@@ -64,6 +65,7 @@ fn set_window_bounds(params: Option<Value>) -> DomainResult {
     if let (Some(w), Some(h)) = (width, height)
         && w > 0.0
         && h > 0.0
+        && super::emulation::current_device_metrics().is_none()
     {
         oxibrowser_core::session::set_viewport_override(w as u32, h as u32);
     }
@@ -82,4 +84,41 @@ fn get_window_for_target() -> DomainResult {
             "windowState": "normal"
         }
     })))
+}
+
+/// Apply download policy to the selected real browser context.
+pub(super) fn set_download_behavior(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_else(|| json!({}));
+    let behavior = params
+        .get("behavior")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "Missing download behavior".into(),
+        })?;
+    let context = if let Some(id) = params.get("browserContextId").and_then(Value::as_str) {
+        ctx.browser
+            .context(&oxibrowser_core::ContextId::from_string(id))
+            .ok_or_else(|| CdpError {
+                code: -32000,
+                message: "Invalid browserContextId".into(),
+            })?
+    } else {
+        ctx.browser.default_context()
+    };
+    let path = params
+        .get("downloadPath")
+        .and_then(Value::as_str)
+        .map(std::path::PathBuf::from);
+    let events = params
+        .get("eventsEnabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    context
+        .set_cdp_download_behavior(behavior, path, events)
+        .map_err(|error| CdpError {
+            code: -32602,
+            message: error.to_string(),
+        })?;
+    Ok(Some(json!({})))
 }

@@ -100,6 +100,7 @@ pub const EGL_SURFACE_ORIENTATION_INVERT_Y_ANGLE: EGLint = 0x0002;
 
 unsafe extern "C" {
     pub fn eglGetError() -> EGLint;
+    pub fn eglGetCurrentContext() -> EGLContext;
     pub fn eglGetDisplay(native_display: *mut c_void) -> EGLDisplay;
     pub fn eglBindAPI(api: EGLenum) -> EGLBoolean;
     pub fn eglQueryAPI() -> EGLenum;

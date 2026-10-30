@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>vanilla-spa</title>
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <h1>Vanilla</h1>
+  <form id="form">
+    <input id="name" type="text" placeholder="name" autocomplete="off" required>
+    <label><input id="agree" type="checkbox"> agree</label>
+    <button id="submit" type="submit">Submit</button>
+  </form>
+  <ul id="out"></ul>
+  <div id="status">idle</div>
+  <div id="validation-status"></div>
+  <script>
+    (function () {
+      'use strict';
+      document.getElementById('name').addEventListener('invalid', function () {
+        document.getElementById('validation-status').textContent = 'invalid';
+      });
+      document.getElementById('form').addEventListener('submit', function (e) {
+        e.preventDefault();
+        var name = document.getElementById('name').value;
+        var agree = document.getElementById('agree').checked;
+        var li = document.createElement('li');
+        li.className = 'item';
+        li.textContent = name + '|' + (agree ? 'checked' : 'unchecked');
+        document.getElementById('out').appendChild(li);
+        document.getElementById('status').textContent = 'submitted:' + name;
+      });
+    })();
+  </script>
+</body>
+</html>

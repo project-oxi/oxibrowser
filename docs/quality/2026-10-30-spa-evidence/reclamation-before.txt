@@ -1,0 +1,21 @@
+   Compiling oxibrowser-core v0.28.0 (/Users/garden/Workspace/Projects/oxibrowser/crates/oxibrowser-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.56s
+     Running unittests src/lib.rs (target/debug/deps/oxibrowser_core-2f6ac8c2ff369abc)
+
+running 1 test
+test js::stealth::tests::retired_stealth_realm_releases_its_traced_host_marker ... STEALTH_REALM_PROBE withStealth=false markerAlive=false
+STEALTH_REALM_PROBE withStealth=true markerAlive=true
+
+thread 'js::stealth::tests::retired_stealth_realm_releases_its_traced_host_marker' (145055316) panicked at crates/oxibrowser-core/src/js/stealth.rs:1100:13:
+retired realm must not remain rooted by native captures
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    js::stealth::tests::retired_stealth_realm_releases_its_traced_host_marker
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 722 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p oxibrowser-core --lib`

@@ -468,10 +468,12 @@ async fn cancelling_pending_handoff_is_uncertain_and_closes_owned_child_once() {
     assert_eq!(ack["result"]["hostState"]["state"], "closed");
     assert_eq!(ack["result"]["data"]["mayHaveActed"], true);
     let _ = release.send(());
+    // The child emits the agent result before the pending host reply. Drain
+    // stdout first so a full pipe cannot block that later socket response.
+    let result = c.agent_recv().await;
     let aborted = c.host_recv().await;
     assert_eq!(aborted["id"], "take");
     assert_eq!(aborted["error"]["message"], "HANDOFF_ABORTED_UNCERTAIN");
-    let result = c.agent_recv().await;
     assert_eq!(result["result"]["structuredContent"]["error"], "CANCELLED");
     assert_eq!(
         result["result"]["structuredContent"]["restartRequired"],

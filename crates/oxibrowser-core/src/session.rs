@@ -8,7 +8,6 @@ use crate::config::BrowserConfig;
 use crate::context::{BrowserContext, storage_origin_of};
 use crate::error::{CoreError, Result};
 use crate::frame::Frame;
-use crate::frame::FrameId;
 use crate::js::JsRuntime;
 use crate::js::dom_snapshot::{DomMutation, ExecuteTiming, ScriptKind, ScriptSource};
 use crate::js::runtime::JsRuntimeConfig;
@@ -291,6 +290,9 @@ pub struct Session {
     init_scripts: Vec<(String, String)>,
     /// Monotonic counter backing init-script ids (`"init-N"`, per session).
     init_script_counter: u64,
+    isolated_worlds: HashMap<(String, String), u32>,
+    /// Last trusted realm-native navigation snapshot; never populated from page globals.
+    native_navigation: Option<serde_json::Value>,
 }
 
 /// Configurable download directory for `Content-Disposition: attachment`
@@ -465,6 +467,7 @@ async fn maybe_intercept(
                 url: url.to_string(),
                 headers: vec![],
                 body: String::new(),
+                body_bytes: None,
                 error: Some(error_reason),
             })
         }
@@ -480,6 +483,7 @@ async fn maybe_intercept(
             url: url.to_string(),
             headers,
             body: String::from_utf8_lossy(&body).into_owned(),
+            body_bytes: Some(body),
             error: None,
         }),
         Err(_) => {
@@ -617,7 +621,8 @@ fn handle_fetch_requests(
 
                         // Offline emulation: reject JS-issued requests before
                         // any network I/O (mirrors the document path check).
-                        if offline.load(Ordering::Relaxed) {
+                        let opaque_origin = origin.as_deref() == Some("null");
+                        if offline.load(Ordering::Relaxed) || opaque_origin {
                             fail_record(&network_log, None);
                             let _ = response_tx.send(FetchResponseMsg {
                                 id,
@@ -626,7 +631,13 @@ fn handle_fetch_requests(
                                 url: url_str,
                                 headers: vec![],
                                 body: String::new(),
-                                error: Some("offline".to_string()),
+                                body_bytes: None,
+                                error: Some(if opaque_origin {
+                                    "SecurityError: opaque-origin network requests are unsupported"
+                                        .to_string()
+                                } else {
+                                    "offline".to_string()
+                                }),
                             });
                             in_flight.fetch_sub(1, Ordering::Relaxed);
                             return;
@@ -641,6 +652,7 @@ fn handle_fetch_requests(
                                 url: url_str,
                                 headers: vec![],
                                 body: String::new(),
+                                body_bytes: None,
                                 error: Some("invalid URL".to_string()),
                             });
                             in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -709,6 +721,7 @@ fn handle_fetch_requests(
                                                 url: resp_url,
                                                 headers,
                                                 body: String::new(),
+                                                body_bytes: None,
                                                 error: Some(format!("failed to read body: {}", e)),
                                             });
                                             in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -716,11 +729,21 @@ fn handle_fetch_requests(
                                         }
                                     };
                                 if truncated {
-                                    tracing::warn!(
-                                        url = %resp_url,
-                                        max_bytes = max_body_bytes,
-                                        "fetch body truncated"
-                                    );
+                                    fail_record(&network_log, Some(status));
+                                    let _ = response_tx.send(FetchResponseMsg {
+                                        id,
+                                        status,
+                                        status_text,
+                                        url: resp_url,
+                                        headers,
+                                        body: String::new(),
+                                        body_bytes: None,
+                                        error: Some(format!(
+                                            "response body exceeds limit of {max_body_bytes} bytes"
+                                        )),
+                                    });
+                                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    return;
                                 }
                                 let body_len = resp_body.len() as u64;
                                 let body = String::from_utf8_lossy(&resp_body).into_owned();
@@ -741,6 +764,7 @@ fn handle_fetch_requests(
                                     url: resp_url,
                                     headers,
                                     body,
+                                    body_bytes: Some(resp_body),
                                     error: None,
                                 });
                                 in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -754,6 +778,7 @@ fn handle_fetch_requests(
                                     url: url_str,
                                     headers: vec![],
                                     body: String::new(),
+                                    body_bytes: None,
                                     error: Some(e.to_string()),
                                 });
                                 in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -1066,6 +1091,8 @@ impl Session {
             offline,
             init_scripts: Vec::new(),
             init_script_counter: 0,
+            isolated_worlds: HashMap::new(),
+            native_navigation: None,
         })
     }
 
@@ -1110,7 +1137,17 @@ impl Session {
             .fetch_with_overrides(&parsed, Some(&ov))
             .await?;
         let status = response.status().as_u16();
-        let final_url = Url::parse(&response.uri().to_string()).unwrap_or_else(|_| parsed.clone());
+        let mut final_url =
+            Url::parse(&response.uri().to_string()).unwrap_or_else(|_| parsed.clone());
+        // HTTP request URIs omit fragments. Preserve a direct navigation's
+        // fragment when the response still belongs to the requested resource.
+        if final_url.fragment().is_none() && parsed.fragment().is_some() {
+            let mut requested_resource = parsed.clone();
+            requested_resource.set_fragment(None);
+            if final_url == requested_resource {
+                final_url.set_fragment(parsed.fragment());
+            }
+        }
 
         // Check for HTTP errors
         if status >= 400 {
@@ -1184,23 +1221,10 @@ impl Session {
 
         tracing::debug!(html_bytes = html.len(), "response decoded");
 
-        // Resolve external <link rel=stylesheet> into a single inline <style>
-        // block so Blitz parses the document once with the rules in place
-        // (and never tries to join hrefs against a `data:`-scheme base URL,
-        // which would panic). The fetch step happens here, before
-        // `Page::from_html` is called, so the post-injection html is what
-        // `page.content()` returns — important because `inject_dom_snapshot`
-        // re-pushes that same html into the JS thread's RenderDocument.
-        let html = self
-            .inline_external_stylesheets(&html, final_url.as_str())
-            .await;
-
+        // Keep original link elements in the transient page DOM. The live
+        // document receives vetted stylesheet bytes during injection below.
         // Create a new page for this navigation (use final URL after redirects)
-        let mut page = Page::from_html(final_url.clone(), &html, status, ct_header).await?;
-
-        // Phase 8: populate child <iframe> frames by fetching each
-        // src (resolved against the page URL) and parsing it into a child Frame.
-        self.populate_iframes(&mut page, &final_url).await;
+        let page = Page::from_html(final_url.clone(), &html, status, ct_header).await?;
 
         // Update history
         if self.history.is_empty() {
@@ -1212,16 +1236,8 @@ impl Session {
         self.history_index = self.history.len() - 1;
 
         self.active_page = Some(page);
-        self.js_runtime.clear_child_contexts();
-        self.frame_contexts.write().clear();
-        self.next_context_id
-            .store(2, std::sync::atomic::Ordering::Relaxed);
-
         // Inject DOM snapshot into JS runtime
         self.inject_dom_snapshot().await;
-
-        // Phase 8: build per-frame execution contexts for child iframes.
-        self.inject_child_frames().await;
 
         // Drain page-script effects (location navigations, form submits,
         // window.open tab spawns): a load-time popup must fire without
@@ -1243,17 +1259,30 @@ impl Session {
     /// emitted and `Err` is returned so the caller falls back to rendering
     /// the body.
     fn handle_download(&self, url: &Url, disposition: &str, bytes: &[u8]) -> Result<()> {
-        let dir = DOWNLOAD_DIR
-            .read()
-            .clone()
+        let policy = self.browser_context.download_policy();
+        let events_enabled = policy.as_ref().is_none_or(|p| p.events_enabled);
+        let guid = format!("dl-{}", uuid::Uuid::new_v4().as_simple());
+        if policy.as_ref().is_some_and(|p| p.behavior == "deny") {
+            if events_enabled {
+                self.emit_core_event(crate::js::CoreEvent::DownloadFailed {
+                    guid,
+                    url: url.to_string(),
+                    error: "Download denied by browser context policy".into(),
+                });
+            }
+            return Ok(());
+        }
+        let dir = policy
+            .as_ref()
+            .and_then(|p| p.path.clone())
+            .or_else(|| DOWNLOAD_DIR.read().clone())
             .unwrap_or_else(|| self.config.download_dir_or_default());
         // The GUID is allocated up front so the failure event can reference
         // the same download id the CDP layer would have seen on success.
-        let guid = format!("dl-{}", uuid::Uuid::new_v4().as_simple());
         if let Err(e) = std::fs::create_dir_all(&dir) {
             let error = e.to_string();
             tracing::warn!(dir = %dir.display(), error = %error, "download directory creation failed");
-            if let Some(tx) = self.event_tx.read().as_ref() {
+            if events_enabled && let Some(tx) = self.event_tx.read().as_ref() {
                 let _ = tx.send(crate::js::CoreEvent::DownloadFailed {
                     guid,
                     url: url.to_string(),
@@ -1278,12 +1307,20 @@ impl Session {
             .file_name()
             .map(|f| f.to_string_lossy().into_owned())
             .unwrap_or_else(|| "download.bin".to_string());
-        let save_path = dir.join(&safe);
+        let disk_name = if policy
+            .as_ref()
+            .is_some_and(|p| p.behavior == "allowAndName")
+        {
+            &guid
+        } else {
+            &safe
+        };
+        let save_path = dir.join(disk_name);
 
         if let Err(e) = std::fs::write(&save_path, bytes) {
             let error = e.to_string();
             tracing::warn!(url = %url, save_path = %save_path.display(), error = %error, "download save failed");
-            if let Some(tx) = self.event_tx.read().as_ref() {
+            if events_enabled && let Some(tx) = self.event_tx.read().as_ref() {
                 let _ = tx.send(crate::js::CoreEvent::DownloadFailed {
                     guid,
                     url: url.to_string(),
@@ -1295,7 +1332,7 @@ impl Session {
             )));
         }
 
-        if let Some(tx) = self.event_tx.read().as_ref() {
+        if events_enabled && let Some(tx) = self.event_tx.read().as_ref() {
             let _ = tx.send(crate::js::CoreEvent::Download {
                 guid: guid.clone(),
                 url: url.to_string(),
@@ -1306,106 +1343,6 @@ impl Session {
         }
         tracing::info!(url = %url, filename = %safe, bytes = bytes.len(), "download saved");
         Ok(())
-    }
-
-    /// Fetch each `<iframe>` in **every** frame (root and descendants) and
-    /// attach the fetched document as a child [`Frame`] (Phase 8 population
-    /// step, extended in W3b for nested iframes).
-    ///
-    /// Operates level-by-level: at each level every frame's `<iframe>` elements
-    /// are collected, fetched asynchronously, and the produced [`Frame`]s are
-    /// then attached to the correct parent via `Frame::find_mut_by_id`. Mixing
-    /// the fetch await with a `&mut Frame` borrow would collide, so the
-    /// framework here is
-    ///   1. collect (immutable references),
-    ///   2. fetch + parse (produces new `Frame` values, no page borrows),
-    ///   3. attach (mutates `page`'s root frame tree).
-    ///
-    /// Failures (bad URL, network error) are logged and skipped so a single
-    /// broken iframe can't abort navigation.
-    async fn populate_iframes(&self, page: &mut Page, base_url: &Url) {
-        let mut worklist: Vec<FrameId> = vec![page.root_frame().id()];
-        // `pages` mutated while we hold root_frame_mut; we never hold it across
-        // an await — the fetch phase runs without a page borrow.
-        while let Some(parent_id) = worklist.pop() {
-            // Phase 1: collect this parent's iframe list without holding the
-            // mutable borrow past a single synchronous walk.
-            let iframes: Vec<crate::js::dom_snapshot::IframeElement> = {
-                let Some(parent) = page.root_frame_mut().find_mut_by_id(parent_id) else {
-                    continue;
-                };
-                parent.document().extract_iframes()
-                // `parent` borrow ends here.
-            };
-            if iframes.is_empty() {
-                continue;
-            }
-            // Phase 2: fetch + parse (no page borrow).
-            let parent_url_for_join: Option<Url> = {
-                let Some(parent_ref) = page.root_frame().find_by_id(parent_id) else {
-                    continue;
-                };
-                Some(parent_ref.url().clone())
-            };
-            let mut new_frames: Vec<Frame> = Vec::with_capacity(iframes.len());
-            for iframe in iframes {
-                // 1. srcdoc → inline content, no fetch (W3a).
-                if let Some(srcdoc) = iframe.srcdoc {
-                    let child_url = Url::parse("about:srcdoc").unwrap_or_else(|_| base_url.clone());
-                    match Frame::from_html(child_url, &srcdoc).await {
-                        Ok(child) => new_frames.push(child),
-                        Err(e) => tracing::warn!(error = %e, "failed to parse srcdoc iframe"),
-                    }
-                    continue;
-                }
-                let Some(src) = iframe.src else { continue };
-                let join_base = parent_url_for_join.as_ref().unwrap_or(base_url);
-                let Ok(full) = join_base.join(&src) else {
-                    continue;
-                };
-                // 2a. non-http(s) (about:blank, javascript:, etc.) → empty
-                // child (W3a).
-                if full.scheme() != "http" && full.scheme() != "https" {
-                    let child_url = Url::parse("about:blank").unwrap_or_else(|_| base_url.clone());
-                    let empty = "<!DOCTYPE html><html><head></head><body></body></html>";
-                    match Frame::from_html(child_url, empty).await {
-                        Ok(child) => new_frames.push(child),
-                        Err(e) => tracing::warn!(
-                            src = %src,
-                            error = %e,
-                            "failed to parse about:blank iframe"
-                        ),
-                    }
-                    continue;
-                }
-                // 2b. http(s) → fetch + parse (original behavior).
-                match self
-                    .http_client
-                    .fetch_text_with_overrides(&full, Some(&self.snapshot_overrides()))
-                    .await
-                {
-                    Ok(child_html) => match Frame::from_html(full.clone(), &child_html).await {
-                        Ok(child) => new_frames.push(child),
-                        Err(e) => tracing::warn!(
-                            src = %src,
-                            error = %e,
-                            "failed to parse iframe document"
-                        ),
-                    },
-                    Err(e) => tracing::warn!(src = %src, error = %e, "failed to fetch iframe"),
-                }
-            }
-            // Phase 3: attach each freshly-built frame to its parent, then
-            // schedule the new frame for population on the next iteration.
-            for frame in new_frames {
-                let new_id = frame.id();
-                let parent = page.root_frame_mut().find_mut_by_id(parent_id);
-                if let Some(parent) = parent {
-                    parent.add_child(frame);
-                    worklist.push(new_id);
-                }
-            }
-        }
     }
 
     /// Navigate to a URL with automatic retries on transient failures.
@@ -1494,101 +1431,27 @@ impl Session {
             .unwrap_or_else(|| CoreError::NavigationFailed("no retry attempts were made".into())))
     }
     pub async fn go_back(&mut self) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(CoreError::SessionClosed);
-        }
-        if self.history_index > 0 {
-            self.ensure_online()?;
-            self.history_index -= 1;
-            let url = self.history[self.history_index].clone();
-
-            let ov = self.overrides.read().clone();
-            let started_at_ms = unix_ms();
-
-            // Re-fetch without adding to history
-            let _in_flight = InFlightGuard::new(self.in_flight.clone());
-            let response = self
-                .http_client
-                .fetch_with_overrides(&url, Some(&ov))
-                .await?;
-            let status = response.status().as_u16();
-            let response_headers = HttpClient::response_headers(&response);
-            let ct_header = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("text/html")
-                .to_string();
-            let max = self.config.max_response_body_bytes;
-            let (bytes, truncated) = HttpClient::read_body_limited(response, max).await?;
-            if truncated {
-                tracing::warn!(url = %url, max_bytes = max, "history body truncated");
-            }
-            let html = crate::encoding::decode_html(&bytes, Some(&ct_header));
-            self.record_document_fetch(
-                &url,
-                status,
-                &ct_header,
-                response_headers,
-                bytes.len(),
-                &ov,
-                started_at_ms,
-            );
-            self.active_page = Some(Page::from_html(url, &html, 200, ct_header).await?);
-            self.inject_dom_snapshot().await;
-            Ok(())
-        } else {
-            Err(CoreError::NavigationFailed("no previous page".into()))
-        }
+        let snapshot = self.navigation_history_snapshot().await?;
+        let index = snapshot["index"].as_u64().unwrap_or(0) as usize;
+        let id = index
+            .checked_sub(1)
+            .and_then(|index| snapshot["entries"].get(index))
+            .and_then(|entry| entry["id"].as_u64())
+            .ok_or_else(|| CoreError::NavigationFailed("no previous page".into()))?;
+        self.navigate_history_entry(id).await?;
+        Ok(())
     }
 
-    /// Navigate forward in history.
+    /// Traverse the canonical native history forward without reloading a same-document entry.
     pub async fn go_forward(&mut self) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(CoreError::SessionClosed);
-        }
-        if self.history_index < self.history.len() - 1 {
-            self.ensure_online()?;
-            self.history_index += 1;
-            let url = self.history[self.history_index].clone();
-
-            let ov = self.overrides.read().clone();
-            let started_at_ms = unix_ms();
-
-            let _in_flight = InFlightGuard::new(self.in_flight.clone());
-            let response = self
-                .http_client
-                .fetch_with_overrides(&url, Some(&ov))
-                .await?;
-            let status = response.status().as_u16();
-            let response_headers = HttpClient::response_headers(&response);
-            let ct_header = response
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("text/html")
-                .to_string();
-            let max = self.config.max_response_body_bytes;
-            let (bytes, truncated) = HttpClient::read_body_limited(response, max).await?;
-            if truncated {
-                tracing::warn!(url = %url, max_bytes = max, "history body truncated");
-            }
-            let html = crate::encoding::decode_html(&bytes, Some(&ct_header));
-            self.record_document_fetch(
-                &url,
-                status,
-                &ct_header,
-                response_headers,
-                bytes.len(),
-                &ov,
-                started_at_ms,
-            );
-            self.active_page = Some(Page::from_html(url, &html, 200, ct_header).await?);
-            self.inject_dom_snapshot().await;
-            Ok(())
-        } else {
-            Err(CoreError::NavigationFailed("no next page".into()))
-        }
+        let snapshot = self.navigation_history_snapshot().await?;
+        let index = snapshot["index"].as_u64().unwrap_or(0) as usize;
+        let id = snapshot["entries"]
+            .get(index + 1)
+            .and_then(|entry| entry["id"].as_u64())
+            .ok_or_else(|| CoreError::NavigationFailed("no next page".into()))?;
+        self.navigate_history_entry(id).await?;
+        Ok(())
     }
 
     /// Reload the current page.
@@ -1765,9 +1628,58 @@ impl Session {
         self.evaluate_js_with_await(expression, false).await
     }
 
+    /// Execute a CDP runtime operation while retaining live values on the JS thread.
+    /// References belong to their execution context and are invalidated on navigation.
+    pub async fn remote_command(
+        &mut self,
+        context_id: u32,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::SessionClosed);
+        }
+        if matches!(
+            request.get("method").and_then(serde_json::Value::as_str),
+            Some("releaseObjectGroup")
+        ) || (matches!(
+            request.get("method").and_then(serde_json::Value::as_str),
+            Some("addBinding" | "removeBinding")
+        ) && request["params"].get("executionContextId").is_none()
+            && request["params"].get("executionContextName").is_none())
+        {
+            let contexts: Vec<u32> = self
+                .frame_contexts
+                .read()
+                .values()
+                .copied()
+                .chain(self.isolated_worlds.values().copied())
+                .filter(|id| *id != context_id)
+                .collect();
+            for child in contexts {
+                self.js_runtime
+                    .remote_command(child, request.clone())
+                    .await?;
+            }
+        }
+        let result = self.js_runtime.remote_command(context_id, request).await?;
+        self.reconcile_native_mutations(true).await?;
+        Ok(result)
+    }
+
     /// The session's parent [`BrowserContext`].
     pub fn browser_context(&self) -> &Arc<BrowserContext> {
         &self.browser_context
+    }
+
+    /// Configure downloads in this session's isolated browser context.
+    pub fn set_cdp_download_behavior(
+        &self,
+        behavior: &str,
+        path: Option<std::path::PathBuf>,
+        events_enabled: bool,
+    ) -> Result<()> {
+        self.browser_context
+            .set_cdp_download_behavior(behavior, path, events_enabled)
     }
 
     /// Probe whether `selector` matches an `input[type=password]` control —
@@ -1883,6 +1795,7 @@ impl Session {
             page.bump_generation();
         }
 
+        self.sync_native_navigation().await?;
         Ok(())
     }
 
@@ -1961,7 +1874,20 @@ impl Session {
     /// plaintext password can never land in a PNG. The guard error must
     /// propagate — CDP callers must not fall back to a blank PNG.
     pub async fn capture_screenshot_png(&mut self, _viewport_width: u32) -> Result<Vec<u8>> {
-        if self.password_field_focused().await? {
+        self.capture_live_document_png(true).await
+    }
+
+    /// Capture the configured viewport, including its area below short content.
+    /// Uses the same native password-focus guard as full-page capture.
+    pub async fn capture_viewport_screenshot_png(&mut self) -> Result<Vec<u8>> {
+        self.capture_live_document_png(false).await
+    }
+
+    async fn capture_live_document_png(&mut self, full_page: bool) -> Result<Vec<u8>> {
+        // Native focus follows the actual frame/utility document, so a child
+        // password cannot bypass the main-document guard during compositing.
+        let (_, native_password) = self.js_runtime.input_focus().await?;
+        if native_password || self.password_field_focused().await? {
             crate::security::audit::record(crate::security::audit::event(
                 crate::security::audit::AuditEventKind::PolicyViolation,
                 crate::security::audit::AuditDecision::Deny,
@@ -1973,7 +1899,7 @@ impl Session {
         }
         let opts = oxibrowser_render::CaptureOpts {
             viewport: None,
-            full_page: true,
+            full_page,
         };
         self.js_runtime.capture_png(opts).await
     }
@@ -1998,6 +1924,12 @@ impl Session {
     /// `DomSnapshot` (still used by `document.title`/`document.cookie`/window
     /// globals until the webapi DOM is retired) and the page URL.
     async fn inject_dom_snapshot(&mut self) {
+        // Every document replacement invalidates its frame/world metadata,
+        // including reload, history traversal, POST and about/data navigation.
+        self.js_runtime.clear_child_contexts();
+        self.isolated_worlds.clear();
+        self.frame_contexts.write().clear();
+        self.next_context_id.store(2, Ordering::Relaxed);
         let (html, url, mut scripts) = match &self.active_page {
             Some(page) => {
                 let html = page.content().to_string();
@@ -2011,20 +1943,20 @@ impl Session {
             None => return,
         };
 
-        // External <link rel=stylesheet> resolution (W2-pre / §5.2):
-        // Blitz's parser panics when a `<link>` href is joined against a
-        // `data:` base URL (cannot_be_a_base = true → unwrap in blitz-dom).
-        // To avoid that path entirely, we fetch each stylesheet, fold its
-        // rules into an inline `<style>` block, and strip the `<link>` from
-        // the HTML before handing it to `set_document_with_scripts`. The
-        // inline path is already exercised by @font-face rules.
-        let html = self.inline_external_stylesheets(&html, &url).await;
+        // Fetch through core's HTTP policy once, preserving each original
+        // stylesheet link and its place in the cascade for the live renderer.
+        let stylesheets = self.preload_external_stylesheets(&html, &url).await;
 
         // Fetch external (<script src>) bodies in document order, filling each
         // sequential + in-order for Phase 1 (parallel fetch is Phase 3).
         if !scripts.is_empty() {
             let base = Url::parse(&url).ok();
             for s in scripts.iter_mut() {
+                if s.kind == crate::js::dom_snapshot::ScriptKind::Module {
+                    // The module loader fetches and caches entry scripts and
+                    // their dependency graphs, validating status and MIME.
+                    continue;
+                }
                 let Some(src) = s.src_url.clone() else {
                     continue;
                 };
@@ -2063,7 +1995,7 @@ impl Session {
                         source: source.clone(),
                         src_url: None,
                         kind: ScriptKind::Classic,
-                        execute: ExecuteTiming::Defer,
+                        execute: ExecuteTiming::Blocking,
                     }
                 })
                 .collect();
@@ -2133,7 +2065,7 @@ impl Session {
                 .cloned()
                 .unwrap_or_default(),
         );
-        self.js_runtime.set_page_url_with_storage_seed_idb(
+        self.js_runtime.prepare_document_url_with_storage_seed_idb(
             &url,
             seed,
             seed_idb.map(|m| m.into_iter().collect()),
@@ -2144,14 +2076,26 @@ impl Session {
             .unwrap_or((self.config.viewport_width, self.config.viewport_height));
         // Load @font-face webfonts declared in inline <style> and stage them for
         // the document build (public-API path via DocumentConfig.font_ctx; no fork).
-        let font_urls = crate::fonts::extract_font_face_urls(&html);
+        let base = Url::parse(&url).ok();
+        let mut font_urls: Vec<Url> = crate::fonts::extract_font_face_urls(&html)
+            .into_iter()
+            .filter_map(|font| base.as_ref()?.join(&font).ok())
+            .collect();
+        for sheet in stylesheets.iter() {
+            let Ok(base) = Url::parse(&sheet.response_url) else {
+                continue;
+            };
+            font_urls.extend(
+                crate::fonts::extract_font_face_urls(&String::from_utf8_lossy(&sheet.body))
+                    .into_iter()
+                    .filter_map(|font| base.join(&font).ok()),
+            );
+        }
+        font_urls.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        font_urls.dedup();
         if !font_urls.is_empty() {
-            let base = Url::parse(&url).ok();
             let mut fonts = Vec::new();
-            for furl in font_urls {
-                let Some(full) = base.as_ref().and_then(|b| b.join(&furl).ok()) else {
-                    continue;
-                };
+            for full in font_urls {
                 if full.scheme() != "http" && full.scheme() != "https" {
                     continue;
                 }
@@ -2168,6 +2112,7 @@ impl Session {
                 self.js_runtime.set_pending_fonts(fonts);
             }
         }
+        self.js_runtime.set_pending_stylesheets(stylesheets);
         if let Err(e) = self
             .js_runtime
             .set_document_with_scripts(&html, Some(&url), viewport, scripts)
@@ -2190,59 +2135,63 @@ impl Session {
             "DOM snapshot injected"
         );
         self.js_runtime.set_dom_snapshot(snapshot);
+        self.inject_child_frames().await;
     }
 
-    /// Fetch each `<link rel=stylesheet href=…>`, fold the rules into a single
-    /// inline `<style>` block, and strip the `<link>` tags from `html`. Used by
-    /// [`Self::inject_dom_snapshot`] before handing HTML to Blitz, since Blitz
-    /// cannot resolve `<link>` hrefs against `data:` URLs (panics) and does
-    /// not otherwise fetch external stylesheets on its own.
-    ///
-    /// Failures (bad URL, network error) are logged and skipped — a single
-    async fn inline_external_stylesheets(&self, html: &str, base_url: &str) -> String {
-        use std::sync::atomic::Ordering;
-        let links = external_stylesheet_links(html);
-        tracing::debug!(
-            count = links.len(),
-            base_url,
-            "inline_external_stylesheets: scanning"
-        );
-        let base = match Url::parse(base_url) {
-            Ok(u) => u,
-            Err(_) => return html.to_string(),
+    /// Fetch initial stylesheets through the existing HTTP client (SSRF,
+    /// cookies, request overrides, redirects and response limits included).
+    /// The document owns these bytes; the renderer cannot initiate networking.
+    /// Failed/unsupported links retain their DOM attributes but do not acquire
+    /// fake CSS responses or synthetic load events. Dynamic CSS loading and
+    /// recursive @import fetching remain unsupported.
+    async fn preload_external_stylesheets(
+        &self,
+        html: &str,
+        base_url: &str,
+    ) -> oxibrowser_render::PreloadedStylesheets {
+        let mut loaded = oxibrowser_render::PreloadedStylesheets::default();
+        if self.offline.load(Ordering::Relaxed) {
+            return loaded;
+        }
+        let Ok(base) = Url::parse(base_url) else {
+            return loaded;
         };
-        let mut combined_css = String::new();
-        for href in links {
+        let mut attempted = std::collections::HashSet::new();
+        let overrides = self.snapshot_overrides();
+        for href in external_stylesheet_links_for_document(html, base_url) {
             let Ok(full) = base.join(&href) else { continue };
-            if full.scheme() != "http" && full.scheme() != "https" {
+            if !matches!(full.scheme(), "http" | "https") || !attempted.insert(full.to_string()) {
                 continue;
             }
-            self.in_flight.fetch_add(1, Ordering::Relaxed);
-            let _g = InFlightGuard::new(self.in_flight.clone());
-            tracing::debug!(%full, "fetching external stylesheet");
+            let _in_flight = InFlightGuard::new(self.in_flight.clone());
             match self
                 .http_client
-                .fetch_text_with_overrides(&full, Some(&self.snapshot_overrides()))
+                .fetch_response_with_overrides(&full, Some(&overrides))
                 .await
             {
-                Ok(css) => {
-                    tracing::debug!(bytes = css.len(), %full, "fetched external stylesheet");
-                    if !combined_css.is_empty() {
-                        combined_css.push('\n');
-                    }
-                    combined_css.push_str(&css);
+                Ok(response) if (200..300).contains(&response.status) => {
+                    let content_type = response
+                        .headers
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+                        .map(|(_, value)| value.as_str());
+                    // Match the former fetch_text path: decode authoritative
+                    // HTTP charset metadata before Blitz's UTF-8 CSS boundary.
+                    let body =
+                        crate::encoding::decode_html(&response.body, content_type).into_bytes();
+                    loaded.insert(oxibrowser_render::PreloadedStylesheet {
+                        request_url: full.to_string(),
+                        response_url: response.final_url,
+                        body,
+                    });
                 }
-                Err(e) => {
-                    tracing::warn!(url = %full, error = %e, "failed to fetch external stylesheet")
+                Ok(response) => {
+                    tracing::warn!(url = %full, status = response.status, "stylesheet HTTP failure")
                 }
+                Err(error) => tracing::warn!(url = %full, %error, "stylesheet fetch failed"),
             }
         }
-        let stripped = strip_stylesheet_links(html);
-        if combined_css.is_empty() {
-            return stripped;
-        }
-        tracing::debug!(bytes = combined_css.len(), "injecting inline <style> block");
-        inject_inline_style(&stripped, &combined_css)
+        loaded
     }
 
     /// Build per-frame execution contexts for each **descendant** iframe
@@ -2259,86 +2208,171 @@ impl Session {
         let Some(page) = &self.active_page else {
             return;
         };
-        let base_url = match self.current_url() {
-            Some(u) => u.clone(),
-            None => return,
-        };
         let viewport = current_viewport_override()
             .unwrap_or((self.config.viewport_width, self.config.viewport_height));
-
-        // Phase 1: collect every (frame_id_str, url, scripts) tuple without
-        // holding a page borrow. `page.root_frame()` is immutable so this is
-        // a single walk over the full tree.
-        let mut stack: Vec<&Frame> = vec![page.root_frame()];
-        let mut children: Vec<(String, String, Vec<crate::js::dom_snapshot::ScriptSource>)> =
-            Vec::new();
-        while let Some(frame) = stack.pop() {
-            for child in frame.children().iter() {
-                children.push((
-                    child.id().to_string(),
-                    child.url().to_string(),
-                    child.extract_scripts(),
-                ));
-                stack.push(child);
+        // Only live JS-thread owner tokens identify iframes. Fetch failures and
+        // identical URLs cannot shift a later frame onto the wrong element.
+        let mut worklist = vec![(page.root_frame().id(), 1u32, 0usize, true)];
+        while let Some((parent_frame_id, parent_context_id, depth, inherited_scripts)) =
+            worklist.pop()
+        {
+            if depth >= 16 {
+                tracing::warn!("iframe nesting limit reached");
+                continue;
             }
-        }
-
-        for (frame_id_str, url_str, mut scripts) in children {
-            // Fetch external <script src> bodies for this child frame.
-            if !scripts.is_empty() {
-                let base = Url::parse(&url_str).ok().or_else(|| base_url.join("").ok());
-                for s in scripts.iter_mut() {
-                    let Some(src) = s.src_url.clone() else {
+            let owners = match self.js_runtime.frame_owners(parent_context_id).await {
+                Ok(owners) => owners,
+                Err(error) => {
+                    tracing::warn!(%error,"failed to discover live iframe owners");
+                    continue;
+                }
+            };
+            let Some(parent_url) = self
+                .active_page
+                .as_ref()
+                .and_then(|page| page.root_frame().find_by_id(parent_frame_id))
+                .map(|frame| frame.url().clone())
+            else {
+                continue;
+            };
+            for owner in owners {
+                let result: Result<(Url, String)> = if let Some(srcdoc) = &owner.srcdoc {
+                    Ok((
+                        Url::parse("about:srcdoc").expect("constant URL"),
+                        srcdoc.clone(),
+                    ))
+                } else {
+                    let source = owner.src.as_deref().unwrap_or("about:blank");
+                    match parent_url.join(source) {
+                        Ok(url) if url.scheme() == "http" || url.scheme() == "https" => {
+                            // Origin checks must see the final response URL,
+                            // including redirects to another origin.
+                            match self
+                                .http_client
+                                .fetch_with_overrides(&url, Some(&self.snapshot_overrides()))
+                                .await
+                            {
+                                Ok(response) => {
+                                    let final_url = Url::parse(&response.uri().to_string());
+                                    let content_type = response
+                                        .headers()
+                                        .get("content-type")
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(str::to_owned);
+                                    match (
+                                        final_url,
+                                        crate::network::client::HttpClient::read_body_limited(
+                                            response,
+                                            self.config.max_response_body_bytes,
+                                        )
+                                        .await,
+                                    ) {
+                                        (Ok(final_url), Ok((bytes, false))) => Ok((
+                                            final_url,
+                                            crate::encoding::decode_html(
+                                                &bytes,
+                                                content_type.as_deref(),
+                                            ),
+                                        )),
+                                        (_, Ok((_, true))) => Err(CoreError::NetworkError(
+                                            "iframe response exceeds body limit".into(),
+                                        )),
+                                        (_, Err(error)) => Err(error),
+                                        (Err(error), _) => {
+                                            Err(CoreError::NetworkError(error.to_string()))
+                                        }
+                                    }
+                                }
+                                Err(error) => Err(error),
+                            }
+                        }
+                        Ok(url) if url.as_str() == "about:blank" => Ok((
+                            url,
+                            "<!doctype html><html><head></head><body></body></html>".into(),
+                        )),
+                        Ok(_) => Err(CoreError::PageError("unsupported iframe URL scheme".into())),
+                        Err(error) => Err(CoreError::PageError(error.to_string())),
+                    }
+                };
+                let (url, html) = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        tracing::warn!(%error,"failed to load iframe");
+                        continue;
+                    }
+                };
+                let mut frame = match Frame::from_html(url.clone(), &html).await {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        tracing::warn!(%error,"failed to parse iframe");
+                        continue;
+                    }
+                };
+                let mut scripts = frame.extract_scripts();
+                // A sandbox without allow-scripts must not execute or even
+                // prefetch its script resources. Automation may still inspect
+                // the document through its dedicated execution context.
+                let scripts_allowed = inherited_scripts
+                    && owner.sandbox.as_ref().is_none_or(|sandbox| {
+                        sandbox
+                            .split_ascii_whitespace()
+                            .any(|token| token.eq_ignore_ascii_case("allow-scripts"))
+                    });
+                if !scripts_allowed {
+                    scripts.clear();
+                }
+                for script in &mut scripts {
+                    if script.kind == crate::js::dom_snapshot::ScriptKind::Module {
+                        continue;
+                    }
+                    let Some(source) = script.src_url.as_ref() else {
                         continue;
                     };
-                    let Some(full_url) = base.as_ref().and_then(|b| b.join(&src).ok()) else {
+                    let Ok(script_url) = url.join(source) else {
                         continue;
                     };
                     let _in_flight = InFlightGuard::new(self.in_flight.clone());
                     match self
                         .http_client
-                        .fetch_text_with_overrides(&full_url, Some(&self.snapshot_overrides()))
+                        .fetch_text_with_overrides(&script_url, Some(&self.snapshot_overrides()))
                         .await
                     {
-                        Ok(body) => s.source = body,
-                        Err(e) => {
-                            tracing::warn!(src = %src, error = %e, "failed to fetch child frame script")
-                        }
+                        Ok(body) => script.source = body,
+                        Err(error) => tracing::warn!(%error,"failed to load iframe script"),
                     }
                 }
+                let context_id = self
+                    .next_context_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Err(error) = self
+                    .js_runtime
+                    .set_owned_frame_document(
+                        context_id,
+                        owner.clone(),
+                        &html,
+                        url.as_str(),
+                        viewport,
+                        scripts,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error,"iframe owner changed before context installation");
+                    continue;
+                }
+                let frame_id = frame.id();
+                frame.set_owner(owner);
+                if let Some(parent) = self
+                    .active_page
+                    .as_mut()
+                    .and_then(|page| page.root_frame_mut().find_mut_by_id(parent_frame_id))
+                {
+                    parent.add_child(frame);
+                    self.frame_contexts
+                        .write()
+                        .insert(frame_id.to_string(), context_id);
+                    worklist.push((frame_id, context_id, depth + 1, scripts_allowed));
+                }
             }
-
-            // Locate the child frame by id so the right frame is built —
-            // includes deeply-nested frames added by `populate_iframes`.
-            let html = self
-                .active_page
-                .as_ref()
-                .and_then(|p| p.root_frame().find_by_frame_id_str(&frame_id_str))
-                .map(|f| f.html().to_string())
-                .unwrap_or_default();
-            if html.is_empty() {
-                tracing::warn!(
-                    frame_id = %frame_id_str,
-                    url = %url_str,
-                    "child frame html missing — skipping context build"
-                );
-                continue;
-            }
-
-            let context_id = self
-                .next_context_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            if let Err(e) = self
-                .js_runtime
-                .set_frame_document(context_id, &html, &url_str, viewport, scripts)
-                .await
-            {
-                tracing::warn!(frame_id = %frame_id_str, url = %url_str, error = %e, "failed to build child frame context");
-                continue;
-            }
-            tracing::debug!(frame_id = %frame_id_str, context_id, url = %url_str, "child frame context built");
-            self.frame_contexts.write().insert(frame_id_str, context_id);
         }
     }
 
@@ -2355,11 +2389,40 @@ impl Session {
             .await
     }
 
+    /// Create a separate JS realm sharing its frame's live document.
+    pub async fn create_isolated_world(&mut self, frame_id: &str, world_name: &str) -> Result<u32> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::SessionClosed);
+        }
+        let key = (frame_id.to_string(), world_name.to_string());
+        if let Some(id) = self.isolated_worlds.get(&key) {
+            return Ok(*id);
+        }
+        let owner = if frame_id == "main" {
+            1
+        } else {
+            *self
+                .frame_contexts
+                .read()
+                .get(frame_id)
+                .ok_or_else(|| CoreError::SessionError("Unknown frame".into()))?
+        };
+        let id = self.next_context_id.fetch_add(1, Ordering::Relaxed);
+        self.js_runtime.create_isolated_world(id, owner).await?;
+        self.isolated_worlds.insert(key, id);
+        Ok(id)
+    }
+
     /// Return the frame-id → context-id map for CDP execution-context routing
     /// (Phase 8). Includes only child frames; the main frame is always
     /// context_id=1.
     pub fn frame_context_map(&self) -> &parking_lot::RwLock<HashMap<String, u32>> {
         &self.frame_contexts
+    }
+
+    /// Existing non-default realms, keyed by frame ID and world name.
+    pub fn isolated_worlds(&self) -> &HashMap<(String, String), u32> {
+        &self.isolated_worlds
     }
 
     /// Serialize the live (post-JS) document to a [`DomSnapshot`].
@@ -2519,6 +2582,113 @@ impl Session {
     /// straddle a request start/complete.
     pub fn in_flight_requests(&self) -> u64 {
         self.in_flight.load(Ordering::Relaxed)
+    }
+
+    /// Read and reconcile the engine-owned History/Location state.
+    async fn sync_native_navigation(&mut self) -> Result<serde_json::Value> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(CoreError::SessionClosed);
+        }
+        let snapshot = self
+            .js_runtime
+            .remote_command(
+                1,
+                serde_json::json!({"method":"historySnapshot","params":{}}),
+            )
+            .await?;
+        let entries = snapshot
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| CoreError::JsError("invalid native history snapshot".into()))?;
+        let index = snapshot
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        if entries.is_empty() || self.active_page.is_none() {
+            self.native_navigation = Some(snapshot.clone());
+            return Ok(snapshot);
+        }
+        if index >= entries.len() {
+            return Err(CoreError::JsError(
+                "native history index is out of range".into(),
+            ));
+        }
+        let urls = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| CoreError::JsError("native history entry has no URL".into()))
+                    .and_then(|url| Url::parse(url).map_err(CoreError::from))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let current = urls[index].clone();
+        let document = snapshot
+            .get("documentId")
+            .and_then(serde_json::Value::as_u64);
+        let revision = snapshot.get("revision").and_then(serde_json::Value::as_u64);
+        let same_document = self.native_navigation.as_ref().is_some_and(|previous| {
+            previous
+                .get("documentId")
+                .and_then(serde_json::Value::as_u64)
+                == document
+        });
+        let changed = self.native_navigation.as_ref().is_some_and(|previous| {
+            previous.get("revision").and_then(serde_json::Value::as_u64) != revision
+        });
+        if let Some(page) = self.active_page.as_mut()
+            && page.url() != &current
+        {
+            let mut old_base = page.url().clone();
+            old_base.set_fragment(None);
+            let mut next_base = current.clone();
+            next_base.set_fragment(None);
+            if old_base != next_base && page.url().origin() != current.origin() {
+                return Err(CoreError::JsError(
+                    "SecurityError: native same-document history changed origin".into(),
+                ));
+            }
+            page.set_same_document_url(current.clone());
+        }
+        self.history = urls;
+        self.history_index = index;
+        self.native_navigation = Some(snapshot.clone());
+        if same_document && changed {
+            self.emit_core_event(crate::js::CoreEvent::SameDocumentNavigation {
+                url: current.to_string(),
+            });
+        }
+        Ok(snapshot)
+    }
+
+    /// Read canonical history after reconciling pending native navigation effects.
+    pub async fn navigation_history_snapshot(&mut self) -> Result<serde_json::Value> {
+        self.reconcile_native_mutations(true).await?;
+        self.native_navigation
+            .clone()
+            .ok_or_else(|| CoreError::JsError("native history is unavailable".into()))
+    }
+
+    /// Traverse a stable native history entry. Returns whether the document survived.
+    pub async fn navigate_history_entry(&mut self, entry_id: u64) -> Result<bool> {
+        let snapshot = self.navigation_history_snapshot().await?;
+        if !snapshot["entries"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry["id"].as_u64() == Some(entry_id))
+        }) {
+            return Err(CoreError::NavigationFailed("unknown history entry".into()));
+        }
+        let before = self.active_page.as_ref().map(Page::id);
+        self.js_runtime
+            .remote_command(
+                1,
+                serde_json::json!({"method":"navigateHistory","params":{"entryId":entry_id}}),
+            )
+            .await?;
+        self.reconcile_native_mutations(true).await?;
+        Ok(self.active_page.as_ref().map(Page::id) == before)
     }
 
     /// Get navigation history.
@@ -3145,7 +3315,7 @@ fn filename_from_disposition(disposition: &str) -> Option<String> {
 }
 
 // External stylesheet plumbing lives in [`crate::dom_link`].
-use crate::dom_link::{external_stylesheet_links, inject_inline_style, strip_stylesheet_links};
+use crate::dom_link::external_stylesheet_links_for_document;
 
 #[cfg(test)]
 mod tests {
@@ -3322,8 +3492,8 @@ mod tests {
             "init script must run before the page script"
         );
 
-        // Init scripts persist across navigations and re-run every time. The
-        // JS context itself persists, so the accumulated string grows.
+        // Init script registrations persist across navigations and run in
+        // each fresh document realm; page globals do not cross that boundary.
         session
             .navigate("about:blank")
             .await
@@ -3334,8 +3504,8 @@ mod tests {
             .expect("evaluate");
         assert_eq!(
             r.value,
-            Some(serde_json::json!("IPI")),
-            "init script re-ran on the next page (before its scripts — about:blank has none)"
+            Some(serde_json::json!("I")),
+            "init script re-ran in a fresh realm (about:blank has no page script)"
         );
     }
 
@@ -3888,6 +4058,50 @@ mod tests {
     static DOWNLOAD_DIR_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
+    async fn cdp_download_policy_is_context_scoped_and_uses_guid_names() {
+        let mut allowed = make_session().await;
+        let denied = make_session().await;
+        let dir = std::env::temp_dir().join(format!("oxi-dl-policy-{}", uuid::Uuid::new_v4()));
+        let denied_dir = dir.join("denied");
+        allowed
+            .set_cdp_download_behavior("allowAndName", Some(dir.clone()), true)
+            .unwrap();
+        denied
+            .set_cdp_download_behavior("deny", Some(denied_dir.clone()), false)
+            .unwrap();
+        assert!(
+            allowed
+                .set_cdp_download_behavior("allow", None, true)
+                .is_err()
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        allowed.set_event_sink(tx);
+        let url = Url::parse("https://example.com/report.bin").unwrap();
+        denied
+            .handle_download(&url, "attachment; filename=report.bin", b"blocked")
+            .unwrap();
+        assert!(!denied_dir.exists());
+        allowed
+            .handle_download(&url, "attachment; filename=report.bin", b"saved")
+            .unwrap();
+        match rx.try_recv().unwrap() {
+            crate::js::CoreEvent::Download {
+                guid,
+                filename,
+                save_path,
+                ..
+            } => {
+                assert_eq!(filename, "report.bin");
+                assert_eq!(std::path::Path::new(&save_path), dir.join(&guid));
+                assert_eq!(std::fs::read(save_path).unwrap(), b"saved");
+                assert!(!dir.join("report.bin").exists());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn test_download_save_failure_emits_download_failed() {
         let mut session = make_session().await;
         let _guard = DOWNLOAD_DIR_GUARD.lock().await;
@@ -4227,12 +4441,8 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
-        // NOTE: the <img> uses an ABSOLUTE url on purpose. blitz-html eagerly
-        // resolves relative sub-resource URLs during parsing against its
-        // placeholder `data:` base URL (RenderDocument::from_html sets the
-        // real base URL only after parsing), so a relative <img src> panics
-        // inside Page::from_html — a pre-existing render-layer bug, unrelated
-        // to the network log. Absolute URLs resolve against any base.
+        // Resource URLs resolve against the document URL during parsing.
+        // Keep this fixture absolute so the request-log assertions are clear.
         let img_url = format!("{}/img.png", server.uri());
         Mock::given(method("GET"))
             .and(path("/"))

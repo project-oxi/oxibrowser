@@ -46,6 +46,8 @@ pub struct Frame {
     snapshot: DomSnapshot,
     /// Child frames (iframes).
     children: Vec<Frame>,
+    /// Native owner in the live parent document, never a positional match.
+    owner: Option<crate::js::runtime::frames::FrameOwner>,
     /// DOM version counter (for cache invalidation).
     dom_version: u64,
 }
@@ -76,6 +78,7 @@ impl Frame {
             html: html.to_string(),
             snapshot,
             children: Vec::new(),
+            owner: None,
             dom_version: 0,
         })
     }
@@ -90,6 +93,11 @@ impl Frame {
         &self.url
     }
 
+    pub(crate) fn set_same_document_url(&mut self, url: Url) {
+        self.snapshot.url = url.to_string();
+        self.url = url;
+    }
+
     /// Get the raw HTML.
     pub fn html(&self) -> &str {
         &self.html
@@ -98,6 +106,14 @@ impl Frame {
     /// Get the parsed DOM snapshot.
     pub fn document(&self) -> &DomSnapshot {
         &self.snapshot
+    }
+
+    pub fn owner(&self) -> Option<&crate::js::runtime::frames::FrameOwner> {
+        self.owner.as_ref()
+    }
+
+    pub(crate) fn set_owner(&mut self, owner: crate::js::runtime::frames::FrameOwner) {
+        self.owner = Some(owner);
     }
 
     /// Get child frames.

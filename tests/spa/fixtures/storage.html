@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>storage-spa</title>
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <h1>Storage</h1>
+  <input id="persist" autocomplete="off">
+  <div id="mirror"></div>
+  <script>
+    (function () {
+      'use strict';
+      var el = document.getElementById('persist');
+      var mirror = document.getElementById('mirror');
+      el.value = localStorage.getItem('oxi-spa-persist') || '';
+      mirror.textContent = el.value;
+      el.addEventListener('input', function () {
+        localStorage.setItem('oxi-spa-persist', el.value);
+        mirror.textContent = el.value;
+      });
+    })();
+  </script>
+</body>
+</html>

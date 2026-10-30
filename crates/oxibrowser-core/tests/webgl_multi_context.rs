@@ -75,3 +75,54 @@ async fn webgl_contexts_on_separate_canvases_keep_independent_pixels() {
     assert_eq!(&first.0[..3], &[0, 255, 0], "first context pixel");
     assert_eq!(&second.0[..3], &[255, 255, 0], "second context pixel");
 }
+
+#[tokio::test]
+async fn creating_and_resizing_another_canvas_keeps_current_context_pixels() {
+    let html = r#"<!doctype html><html><body><canvas id="first" width="32" height="32"></canvas><canvas id="second" width="32" height="32"></canvas>
+    <script>
+      const a=document.getElementById('first').getContext('webgl',{alpha:false,preserveDrawingBuffer:true});
+      a.clearColor(1,0,0,1);a.clear(a.COLOR_BUFFER_BIT);
+      const second=document.getElementById('second');
+      const b=second.getContext('webgl',{alpha:false,preserveDrawingBuffer:true});
+      a.clearColor(0,1,0,1);a.clear(a.COLOR_BUFFER_BIT);
+      b.clearColor(0,0,1,1);b.clear(b.COLOR_BUFFER_BIT);
+      function pixel(gl){const p=new Uint8Array(4);gl.readPixels(0,0,1,1,gl.RGBA,gl.UNSIGNED_BYTE,p);return [...p,gl.getError()];}
+      const afterCreate=pixel(a);
+      second.width=48;
+      a.clearColor(1,1,0,1);a.clear(a.COLOR_BUFFER_BIT);
+      b.clearColor(0,0,1,1);b.clear(b.COLOR_BUFFER_BIT);
+      globalThis.currentContextProbe={afterCreate,afterResize:pixel(a),second:pixel(b)};
+    </script></body></html>"#;
+    let mut config = BrowserConfig::headless();
+    config.enable_ssrf_filter = false;
+    let browser = Browser::new(config.clone()).await.unwrap();
+    let mut session = Session::new(browser.id(), config, browser.default_context())
+        .await
+        .unwrap();
+    session
+        .navigate(&format!(
+            "data:text/html;charset=utf-8,{}",
+            percent_encode_html(html)
+        ))
+        .await
+        .unwrap();
+    let result = session
+        .evaluate_js("JSON.stringify(currentContextProbe)")
+        .await
+        .unwrap();
+    assert!(result.exception.is_none(), "{result:?}");
+    let value: serde_json::Value = serde_json::from_str(
+        result
+            .value
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "afterCreate":[0,255,0,255,0],"afterResize":[255,255,0,255,0],"second":[0,0,255,255,0]
+        })
+    );
+}

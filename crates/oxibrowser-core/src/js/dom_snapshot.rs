@@ -211,12 +211,12 @@ pub enum ScriptKind {
 
 /// When a `<script>` executes relative to document parsing.
 ///
-/// `Defer` = execute in document order after the DOM is built (covers inline,
-/// classic `<script src>`, `defer`, and `module`). `Async` = execute as soon as
-/// it is available (unordered). Phase 1 treats both as ordered-after-parse;
-/// the distinction is recorded for Phase 3+.
+/// Blocking classic scripts run before the ordered module/defer queue. The
+/// DOM is already built in both cases. Async timing is recorded but still
+/// approximated with document order among the blocking scripts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecuteTiming {
+    Blocking,
     Defer,
     Async,
 }
@@ -1331,8 +1331,12 @@ impl DomSnapshot {
             let src_url = node.attributes.get("src").cloned();
             let execute = if node.attributes.contains_key("async") {
                 ExecuteTiming::Async
-            } else {
+            } else if kind == ScriptKind::Module
+                || (src_url.is_some() && node.attributes.contains_key("defer"))
+            {
                 ExecuteTiming::Defer
+            } else {
+                ExecuteTiming::Blocking
             };
             let source = match &src_url {
                 Some(_) => String::new(),
@@ -2537,11 +2541,13 @@ mod tests {
         assert_eq!(scripts[0].source.trim(), "window.__first = 1;");
         assert!(scripts[0].src_url.is_none());
         assert_eq!(scripts[0].kind, ScriptKind::Classic);
+        assert_eq!(scripts[0].execute, ExecuteTiming::Blocking);
 
         // [1] external classic
         assert_eq!(scripts[1].src_url.as_deref(), Some("/ext-a.js"));
         assert_eq!(scripts[1].source, "", "external source filled by caller");
         assert_eq!(scripts[1].kind, ScriptKind::Classic);
+        assert_eq!(scripts[1].execute, ExecuteTiming::Blocking);
 
         // [2] inline module
         assert_eq!(scripts[2].kind, ScriptKind::Module);

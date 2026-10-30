@@ -383,7 +383,7 @@ pub fn emit_navigation_events(
             "wallTime": timestamp / 1000.0,
             "initiator": { "type": "other" },
             "type": "Document",
-            "frameId": "main",
+            "frameId": events.main_frame_id(),
             "hasUserGesture": false,
         }),
     );
@@ -424,7 +424,7 @@ pub fn emit_response_events(
                 "encodedDataLength": 0.0,
                 "securityState": "secure",
             },
-            "frameId": "main",
+            "frameId": events.main_frame_id(),
         }),
     );
 

@@ -405,20 +405,75 @@ Powered by [`boa_engine`](https://boajs.dev/) — pure Rust, no V8 dependency:
 | `element.cloneNode` / `remove()` | ✅ Full |
 | `element.style` (CSSStyleDeclaration) | ✅ Property accessor |
 | `element.classList` (DOMTokenList) | ✅ Property accessor |
+| `element.dataset` / `getAttributeNames` | ✅ Live attribute reads, writes, deletion and enumeration |
 | `element.textContent` / `innerHTML` | ✅ Read/Write |
 | `element.addEventListener` / `dispatchEvent` | ✅ Full |
 | `element.click()` | ✅ With event handlers |
-| `fetch()` | ✅ Full (channel bridge) |
+| `fetch()` | ✅ Channel bridge with UTF-8 text/JSON and byte-preserving `arrayBuffer()` |
 | `XMLHttpRequest` | ✅ Full with callbacks |
 | `localStorage` | ✅ Persistent |
 | `MutationObserver` | ✅ observe/disconnect/takeRecords |
 | `setTimeout` / `setInterval` | ✅ TokioJobQueue |
 | `console.log/warn/error` | ✅ With formatting |
-| `URL` / `URLSearchParams` | ✅ Full |
-| `crypto.getRandomValues` | ✅ Pseudo-random |
+| `URL` / `URLSearchParams` | ✅ Base URLs, component setters and live query parameters |
+| `crypto.subtle.digest` | ✅ SHA-256 / SHA-384 / SHA-512 over ArrayBuffer and views |
+| `crypto.getRandomValues` | ✅ System random source |
 | `TextEncoder` / `TextDecoder` | ✅ UTF-8 |
+| `Blob` / `Response` byte bodies | ✅ ArrayBuffers, views, UTF-8 text and Blob slices |
+| Byte streams / `DecompressionStream` | ✅ Buffered gzip, deflate and deflate-raw with integrity checks |
 | `atob` / `btoa` | ✅ Base64 |
 | `requestAnimationFrame` | ✅ Polyfill |
+| ES modules | ✅ HTTP(S) imports, dynamic `import()`, `import.meta.url` / `resolve`, top-level await |
+
+Module graphs use a cache per document and the existing network policy. The
+current loader fetches synchronously on the JS thread within navigation or
+evaluation deadlines. Import maps, import attributes and non-HTTP module URLs
+are unsupported. Cross-origin modules require explicit credentialed CORS
+approval; anonymous CDN imports with wildcard approval are not yet supported.
+Async script scheduling remains approximate.
+
+JS fetch rejects responses exceeding the configured body limit. The CDP server
+defaults to 10 MiB per resource; use `serve --max-response-body-bytes 67108864`
+for larger game assets.
+Blob, constructed Response bodies and decompression are buffered with a 128 MiB
+limit. The byte stream subset supports reader/writer locks, cancellation,
+errors and piping; BYOB, tee, stream strategies and incremental decompression
+are unsupported. Network fetch responses still use the existing response
+wrapper rather than these constructed Response streams.
+
+CDP `serve` and stdio `serve --mcp` progress timers, fetch/WebSocket callbacks
+and animation callbacks between commands by default. CDP clients can select
+command-driven execution with `serve --no-background-event-loop`;
+`--background-event-loop` remains accepted for compatibility. The loop uses
+cooperative task budgets and Boa VM limits; synchronous native calls and module
+network waits can exceed the 16 ms scheduling target, so this is not a real-time
+frame guarantee.
+
+The [local SPA acceptance suite](tests/spa/README.md) checks pinned React and Vue
+applications through actual Playwright input, screenshots, fresh processes and
+repeated navigation. It runs against the `browser` build profile.
+The [implementation report](docs/quality/2026-10-30-spa-implementation.md)
+records measured results and the remaining compatibility limits.
+
+The WebGL2 API is partial. Applications that require a consistent WebGL1
+fallback can use `serve --disable-webgl2`: WebGL2 context requests return null,
+and the same canvas can create a real WebGL1 context. WebGL2 stays enabled by
+default; this setting does not add the missing WebGL2 APIs.
+
+The WebGL2 subset includes native uniform-buffer binding and occlusion queries.
+KHR_parallel_shader_compile uses actual ANGLE worker compilation and completion
+status in WebGL1 and WebGL2. Query availability uses native timing; browser task
+snapshots and the remaining unimplemented WebGL2 groups are not provided.
+
+See [Cheonggye runtime compatibility](docs/quality/cheonggye-runtime.md) for the
+retained game's integration results, limits and manual scene/input inspector.
+
+Image loading decodes real raster bytes from data/Blob URLs and same-origin
+HTTP, with a 128 MiB decoded limit and 16k dimension limit. Blob URLs retain
+actual branded Blob bytes until revoked or the document is replaced.
+WebGL image uploads support RGB/RGBA UNSIGNED_BYTE with intrinsic dimensions
+and unpack transforms. Cross-origin images, ImageBitmap and canvas image
+sources are not implemented.
 
 ### CDP Protocol (Chrome DevTools Protocol)
 

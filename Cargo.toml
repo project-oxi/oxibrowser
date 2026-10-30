@@ -32,7 +32,7 @@ tracing = { version = "0.1", features = ["attributes"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 wreq = { version = "=6.0.0-rc.29", features = ["json", "form", "stream", "cookies", "gzip", "brotli", "deflate", "zstd"] }
-wreq-util = "3.0.0-rc"
+wreq-util = "=3.0.0-rc.13"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
@@ -73,3 +73,15 @@ version = "0.28.0"
 
 [profile.release]
 strip = true
+
+[patch.crates-io]
+# Published boa_string 0.22.0, with the single Windows::nth performance fix.
+# Archive checksum and upstream commit are retained in vendor/boa_string/PROVENANCE.md.
+boa_string = { path = "vendor/boa_string", version = "=0.22.0" }
+# Published Blitz with document-order stylesheet cascade and safe lifecycle updates.
+# Source checksum, licenses and patch scope: vendor/blitz-dom/PROVENANCE.md.
+blitz-dom = { path = "vendor/blitz-dom", version = "=0.3.0-beta.1" }
+
+# Published wreq-util rc.13 with its zstd dependency updated for RustSec fixes.
+# Archive checksum, unchanged source, and manifest diff: vendor/wreq-util/PROVENANCE.md.
+wreq-util = { path = "vendor/wreq-util", version = "=3.0.0-rc.13" }
