@@ -64,12 +64,7 @@ impl StaticJsStrings {
     #[inline]
     #[must_use]
     pub fn get_string(string: &JsStr<'_>) -> Option<JsString> {
-        if string.len() > MAX_STATIC_LENGTH {
-            return None;
-        }
-
-        let static_str = *RAW_STATICS_CACHE.get(string)?;
-        Some(JsString::from_static(static_str))
+        Self::find(string).map(JsString::from_static)
     }
 
     /// Gets the `JsStr` corresponding to `string`, or `None` if the string
@@ -77,11 +72,22 @@ impl StaticJsStrings {
     #[inline]
     #[must_use]
     pub fn get_js_str(string: &JsStr<'_>) -> Option<JsStr<'static>> {
+        Self::find(string).map(|entry| entry.str)
+    }
+
+    #[inline]
+    fn find(string: &JsStr<'_>) -> Option<&'static StaticString> {
+        // Indexed JS string reads materialize one UTF-16 code unit at a time.
+        // The Latin-1 units need neither a hash lookup nor a heap allocation.
+        if string.len() == 1
+            && let Ok(byte) = u8::try_from(string.get_expect(0))
+        {
+            return Some(&LATIN1_STATICS[usize::from(byte)]);
+        }
         if string.len() > MAX_STATIC_LENGTH {
             return None;
         }
-
-        Some(RAW_STATICS_CACHE.get(string)?.str)
+        RAW_STATICS_CACHE.get(string).copied()
     }
 
     // Some consts are only used on certain features, which triggers the unused lint.
@@ -213,6 +219,26 @@ impl StaticJsStrings {
         (ZONED_DT_NAME, "ZonedDateTime"),
     }
 }
+
+static LATIN1_BYTES: [u8; 256] = {
+    let mut bytes = [0; 256];
+    let mut index = 0;
+    while index < bytes.len() {
+        bytes[index] = index as u8;
+        index += 1;
+    }
+    bytes
+};
+
+static LATIN1_STATICS: [StaticString; 256] = {
+    let mut strings = [StaticString::new(JsStr::EMPTY); 256];
+    let mut index = 0;
+    while index < strings.len() {
+        strings[index] = StaticString::new(JsStr::latin1(std::slice::from_ref(&LATIN1_BYTES[index])));
+        index += 1;
+    }
+    strings
+};
 
 const MAX_STATIC_LENGTH: usize = {
     let mut max = 0;

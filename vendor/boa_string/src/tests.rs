@@ -178,6 +178,26 @@ fn conversion_to_known_static_js_string() {
 }
 
 #[test]
+fn single_latin1_code_units_share_static_storage() {
+    for byte in 0..=u8::MAX {
+        let unit = u16::from(byte);
+        let latin1 = JsString::from(JsStr::latin1(&[byte]));
+        let utf16 = JsString::from(&[unit][..]);
+        assert_eq!(latin1, utf16);
+        assert_eq!(latin1.code_unit_at(0), Some(unit));
+        assert_eq!(latin1.refcount(), None);
+        assert_eq!(utf16.refcount(), None);
+        assert_eq!(hash_value(&latin1), hash_value(&utf16));
+    }
+
+    for unit in [0x0100, 0xd800, 0xdc00] {
+        let utf16 = JsString::from(&[unit][..]);
+        assert_eq!(utf16.code_unit_at(0), Some(unit));
+        assert!(!utf16.as_str().is_latin1());
+    }
+}
+
+#[test]
 fn to_std_string_escaped() {
     assert_eq!(
         JsString::from("Hello, \u{1D49E} world!").to_std_string_escaped(),

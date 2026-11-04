@@ -26,6 +26,11 @@ JavaScript `String.prototype.split`. Search/string semantics are unchanged.
 The same file adds unit cases for consumption, exhaustion, Latin1 bytes, UTF-16
 surrogates, mixed-encoding searches, and empty/out-of-range inputs.
 
+`src/common.rs` uses a fixed table for single Latin-1 code units. Indexed string
+reads can create these strings without hashing or allocating. UTF-16 values
+outside Latin-1 retain the existing lookup and allocation path. The tests
+cover all 256 byte values, plus non-Latin-1 units and unpaired surrogates.
+
 Run the full crate tests with `cargo test -p boa_string`. The manual benchmark
 `benchmarks/string_split.py` runs actual JavaScript `String.split` in an
 optimized OxiBrowser binary against a supplied UTF-8 source file and a forced
