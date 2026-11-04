@@ -231,11 +231,47 @@ fn buffer_source_bytes(v: &JsValue, cx: &mut Context) -> Result<Option<Vec<u8>>,
     Ok(Some(bytes))
 }
 
+/// Decode a regular buffer's typed view in bulk. Shared storage still uses
+/// Boa's element reads, which account for concurrent writes.
+fn typed_32_values<T>(
+    array: &JsTypedArray,
+    cx: &mut Context,
+    decode: impl Fn([u8; 4]) -> T,
+) -> JsResult<Option<Vec<T>>> {
+    let len = array.byte_length(cx)?;
+    if len == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let offset = array.byte_offset(cx)?;
+    let buffer = array.buffer(cx)?;
+    let Some(buffer) = buffer
+        .as_object()
+        .and_then(|buffer| JsArrayBuffer::from_object(buffer).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(data) = buffer.data() else {
+        return Ok(None);
+    };
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| type_err("typed array view exceeds its buffer"))?;
+    let bytes = data
+        .get(offset..end)
+        .ok_or_else(|| type_err("typed array view exceeds its buffer"))?;
+    let (values, remainder) = bytes.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    Ok(Some(values.iter().copied().map(decode).collect()))
+}
+
 /// `Float32Array` or a JS sequence of numbers → `Vec<f32>` (WebGL spec allows
 /// both for `*fv` methods). `TypeError` otherwise.
 fn f32_sequence(v: &JsValue, cx: &mut Context) -> Result<Vec<f32>, JsError> {
     if let Some(obj) = v.as_object() {
         if let Ok(ta) = JsFloat32Array::from_object(obj.clone()) {
+            if let Some(values) = typed_32_values(&ta, cx, f32::from_ne_bytes)? {
+                return Ok(values);
+            }
             let n = ta.length(cx)?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
@@ -258,6 +294,9 @@ fn f32_sequence(v: &JsValue, cx: &mut Context) -> Result<Vec<f32>, JsError> {
 fn i32_sequence(v: &JsValue, cx: &mut Context) -> Result<Vec<i32>, JsError> {
     if let Some(obj) = v.as_object() {
         if let Ok(ta) = JsInt32Array::from_object(obj.clone()) {
+            if let Some(values) = typed_32_values(&ta, cx, i32::from_ne_bytes)? {
+                return Ok(values);
+            }
             let n = ta.length(cx)?;
             let mut out = Vec::with_capacity(n);
             for i in 0..n {
