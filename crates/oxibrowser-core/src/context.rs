@@ -90,6 +90,13 @@ pub struct ContextConfig {
 /// context holds its own cookie jar, origin-keyed localStorage, and egress
 /// (HTTP client). Sessions created "in" a context reference these shared
 /// handles — closing a session never disposes context state.
+#[derive(Clone, Debug)]
+pub(crate) struct DownloadPolicy {
+    pub behavior: String,
+    pub path: Option<std::path::PathBuf>,
+    pub events_enabled: bool,
+}
+
 pub struct BrowserContext {
     /// Unique ID (`ctx-<n>`).
     id: ContextId,
@@ -110,6 +117,7 @@ pub struct BrowserContext {
     /// surface (`Network.*Cookies`, `OXI.exportStorageState`) is denied for
     /// sessions of this context — credentials flow only through the broker.
     credential_mode: AtomicBool,
+    download_policy: RwLock<Option<DownloadPolicy>>,
 }
 
 impl BrowserContext {
@@ -128,12 +136,44 @@ impl BrowserContext {
             indexed_db: Arc::new(RwLock::new(HashMap::new())),
             http_client,
             credential_mode: AtomicBool::new(false),
+            download_policy: RwLock::new(None),
         }
     }
 
     /// Get the context ID.
     pub fn id(&self) -> &ContextId {
         &self.id
+    }
+
+    /// Configure CDP download policy for every session in this isolated context.
+    pub fn set_cdp_download_behavior(
+        &self,
+        behavior: &str,
+        path: Option<std::path::PathBuf>,
+        events_enabled: bool,
+    ) -> crate::error::Result<()> {
+        if !matches!(behavior, "default" | "deny" | "allow" | "allowAndName") {
+            return Err(crate::error::CoreError::SessionError(
+                "Invalid download behavior".into(),
+            ));
+        }
+        if matches!(behavior, "allow" | "allowAndName")
+            && path.as_ref().is_none_or(|p| p.as_os_str().is_empty())
+        {
+            return Err(crate::error::CoreError::SessionError(
+                "downloadPath is required".into(),
+            ));
+        }
+        *self.download_policy.write() = Some(DownloadPolicy {
+            behavior: behavior.into(),
+            path,
+            events_enabled,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn download_policy(&self) -> Option<DownloadPolicy> {
+        self.download_policy.read().clone()
     }
 
     /// Get the debugging label, if any.

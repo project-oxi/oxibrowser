@@ -1,0 +1,54 @@
+{
+  "kind": "empty-vanilla-diagnostic",
+  "cycles": 100,
+  "rss": [
+    {
+      "cycle": 0,
+      "rssKb": 56768
+    },
+    {
+      "cycle": 10,
+      "rssKb": 182832
+    },
+    {
+      "cycle": 20,
+      "rssKb": 284848
+    },
+    {
+      "cycle": 30,
+      "rssKb": 379152
+    },
+    {
+      "cycle": 40,
+      "rssKb": 481008
+    },
+    {
+      "cycle": 50,
+      "rssKb": 578720
+    },
+    {
+      "cycle": 60,
+      "rssKb": 689408
+    },
+    {
+      "cycle": 70,
+      "rssKb": 777040
+    },
+    {
+      "cycle": 80,
+      "rssKb": 891360
+    },
+    {
+      "cycle": 90,
+      "rssKb": 985104
+    },
+    {
+      "cycle": 100,
+      "rssKb": 1097504
+    },
+    {
+      "cycle": 102,
+      "rssKb": 1097504
+    }
+  ]
+}

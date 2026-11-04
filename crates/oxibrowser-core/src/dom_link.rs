@@ -1,10 +1,8 @@
-//! External `<link rel=stylesheet>` plumbing — fetch, inline, strip.
+//! External stylesheet link discovery and legacy HTML transform helpers.
 //!
-//! Used by both [`crate::frame::Frame::from_html`] (panics guard) and
-//! [`crate::session::Session::inject_dom_snapshot`] (full fetch + inline
-//! path). Implementation favors simple regex over hand-rolled tag parsing —
-//! the doc strings here are minimal HTML, and regex tooling is already in the
-//! dependency graph via the `regex` crate (used elsewhere in the core).
+//! Live Session documents preserve link nodes. Discovery delegates to the
+//! renderer's HTML parser; the legacy string transform helpers remain for
+//! callers that explicitly request transformed HTML.
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -29,39 +27,33 @@ static COMPILED: LazyLock<Compiled> = LazyLock::new(|| Compiled {
 /// `<link rel=stylesheet href=/x.css>` are recognized; quoted values are
 /// unquoted.
 pub fn external_stylesheet_links(html: &str) -> Vec<String> {
-    let c = &*COMPILED;
-    let mut out = Vec::new();
-    for cap in c.link_tag.captures_iter(html) {
-        let Some(attrs) = cap.get(1) else { continue };
-        let attrs_str = attrs.as_str();
-        let mut rel_is_stylesheet = false;
-        let mut href: Option<String> = None;
-        // Try both quoted and bare forms for every attribute; a real-world
-        // link tag may use either style for `rel` and `href`.
-        for dq in c.dq_attr.captures_iter(attrs_str) {
-            let name = dq.get(1).unwrap().as_str();
-            let value = dq.get(2).unwrap().as_str();
-            if name.eq_ignore_ascii_case("rel") && value.eq_ignore_ascii_case("stylesheet") {
-                rel_is_stylesheet = true;
-            } else if name.eq_ignore_ascii_case("href") && !value.is_empty() {
-                href = Some(value.to_string());
+    external_stylesheet_links_for_document(html, "about:blank")
+}
+
+pub fn external_stylesheet_links_for_document(html: &str, base_url: &str) -> Vec<String> {
+    // Use the same HTML parser as the document, including quoted attributes,
+    // entities and raw script/style text. This transient document has no
+    // resource map and performs no fetches.
+    let Ok(doc) = oxibrowser_render::RenderDocument::from_html(
+        html,
+        Some(base_url),
+        oxibrowser_render::Viewport::default(),
+    ) else {
+        return Vec::new();
+    };
+    doc.query_selector_all("link")
+        .into_iter()
+        .filter_map(|id| {
+            let rel = doc.node_attr(id, "rel")?;
+            if !rel
+                .split_ascii_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("stylesheet"))
+            {
+                return None;
             }
-        }
-        for bare in c.bare_attr.captures_iter(attrs_str) {
-            let name = bare.get(1).unwrap().as_str();
-            let value = bare.get(2).unwrap().as_str();
-            if name.eq_ignore_ascii_case("rel") && value.eq_ignore_ascii_case("stylesheet") {
-                rel_is_stylesheet = true;
-            } else if name.eq_ignore_ascii_case("href") && !value.is_empty() && href.is_none() {
-                // Bare match (unquoted); prefer the quoted value if already seen.
-                href = Some(value.to_string());
-            }
-        }
-        if rel_is_stylesheet && let Some(h) = href {
-            out.push(h);
-        }
-    }
-    out
+            doc.node_attr(id, "href").filter(|href| !href.is_empty())
+        })
+        .collect()
 }
 
 /// Drop every `<link rel=stylesheet …>` tag from `html`. A `<link rel=…>` that

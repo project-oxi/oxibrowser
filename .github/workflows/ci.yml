@@ -28,7 +28,7 @@ jobs:
             libexpat1-dev
       - uses: dtolnay/rust-toolchain@1.96
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets --features oxibrowser/browser
 
   test:
     name: Test
@@ -64,7 +64,41 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features oxibrowser/browser -- -D warnings
+
+  spa:
+    name: SPA acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libfreetype-dev libexpat1-dev
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tests/spa/package-lock.json
+      - run: npm ci --prefix tests/spa
+      - name: Install pinned reference browser
+        working-directory: tests/spa
+        run: npx playwright install --with-deps chromium
+      - run: cargo build --release --features browser --bin oxibrowser
+      - name: Compare local SPA tasks in fresh browser processes
+        run: |
+          SPA_REFERENCE_CHROME="$(node -e 'console.log(require("./tests/spa/node_modules/playwright").chromium.executablePath())')"
+          python3 tests/spa/run_processes.py --binary target/release/oxibrowser --chrome "$SPA_REFERENCE_CHROME" --runs 10 --out tests/spa/results/ci
+      - name: Repeated navigation and isolated contexts
+        run: node tests/spa/stability.mjs --binary target/release/oxibrowser --cycles 100 --out tests/spa/results/ci/stability
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spa-acceptance-evidence
+          path: tests/spa/results/ci
 
   fmt:
     name: Format
@@ -89,7 +123,7 @@ jobs:
   build-release:
     name: Release Build
     runs-on: ubuntu-latest
-    needs: [check, test, clippy, fmt, audit]
+    needs: [check, test, clippy, spa, fmt, audit]
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies

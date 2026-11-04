@@ -155,30 +155,25 @@ pub(super) fn pump(
             .run_bounded_jobs(ctx, budget)
             .map_err(|_| failed("NATIVE_JOB_FAILED_OR_LIMIT", true))?;
         budget -= jobs;
-        let due = queue.pop_due_timers();
-        if due.is_empty() {
-            return Ok(());
-        }
-        for timer in due {
-            if budget == 0 || start.elapsed() > Duration::from_millis(500) {
+        if budget == 0 || start.elapsed() > Duration::from_millis(500) {
+            if queue
+                .next_timer_deadline()
+                .is_some_and(|deadline| deadline <= Instant::now())
+            {
                 return Err(failed("NATIVE_JOB_FAILED_OR_LIMIT", true));
             }
-            budget -= 1;
-            timer
-                .callback
-                .call(&JsValue::undefined(), &timer.args, ctx)
-                .map_err(|_| failed("NATIVE_JOB_FAILED_OR_LIMIT", true))?;
-            if timer.is_interval {
-                let ms = timer.interval_ms.unwrap_or(1).max(1);
-                queue.schedule_timer(
-                    Instant::now() + Duration::from_millis(ms),
-                    timer.callback,
-                    timer.args,
-                    true,
-                    Some(ms),
-                );
-            }
+            return Ok(());
         }
+        let Some(timer) = queue.pop_due_timers_bounded(1).pop() else {
+            return Ok(());
+        };
+        if !queue.timer_is_active(timer.id) {
+            continue;
+        }
+        budget -= 1;
+        let result = timer.callback.call(&JsValue::undefined(), &timer.args, ctx);
+        queue.complete_timer(timer, result.is_ok());
+        result.map_err(|_| failed("NATIVE_JOB_FAILED_OR_LIMIT", true))?;
     }
 }
 
@@ -202,29 +197,56 @@ fn function(ctx: &mut Context, obj: &JsObject, key: &'static str, native: Native
     readonly(ctx, obj, key, function.into());
 }
 
+fn event_current(
+    ctx: &mut Context,
+    render_doc: &Rc<RefCell<Option<RenderDocument>>>,
+    dirty: &Arc<AtomicBool>,
+    node: u32,
+) -> JsValue {
+    match node {
+        u32::MAX => ctx
+            .global_object()
+            .get(js_string!("window"), ctx)
+            .unwrap_or_default(),
+        n if n == u32::MAX - 1 => ctx
+            .global_object()
+            .get(js_string!("document"), ctx)
+            .unwrap_or_default(),
+        n if n == u32::MAX - 2 => JsValue::null(),
+        n => create_render_element_object(ctx, render_doc.clone(), n as usize, dirty.clone()),
+    }
+}
 #[allow(clippy::too_many_arguments)]
 fn event(
     ctx: &mut Context,
     render_doc: &Rc<RefCell<Option<RenderDocument>>>,
     dirty: &Arc<AtomicBool>,
     target: usize,
-    current: usize,
+    current: &Rc<Cell<u32>>,
+    phase: &Rc<Cell<u32>>,
+    passive: &Rc<Cell<bool>>,
     kind: &'static str,
     stopped: &Rc<Cell<bool>>,
     immediate: &Rc<Cell<bool>>,
     prevented: &Rc<Cell<bool>>,
-) -> (JsObject, JsValue) {
+) -> JsObject {
     let target_object =
         create_render_element_object(ctx, render_doc.clone(), target, dirty.clone());
-    let current_object =
-        create_render_element_object(ctx, render_doc.clone(), current, dirty.clone());
     let obj = JsObject::with_null_proto();
     readonly(ctx, &obj, "type", JsString::from(kind).into());
     readonly(ctx, &obj, "target", target_object);
-    readonly(ctx, &obj, "currentTarget", current_object.clone());
-    readonly(ctx, &obj, "bubbles", true.into());
-    readonly(ctx, &obj, "cancelable", (kind == "click").into());
-    // Automation is never presented as trusted human input.
+    readonly(
+        ctx,
+        &obj,
+        "bubbles",
+        (!matches!(kind, "focus" | "blur" | "invalid")).into(),
+    );
+    readonly(
+        ctx,
+        &obj,
+        "cancelable",
+        matches!(kind, "click" | "submit" | "invalid").into(),
+    );
     readonly(ctx, &obj, "isTrusted", false.into());
     let state = prevented.clone();
     let getter = FunctionObjectBuilder::new(ctx.realm(), unsafe {
@@ -233,6 +255,38 @@ fn event(
     .build();
     obj.define_property_or_throw(
         js_string!("defaultPrevented"),
+        boa_engine::property::PropertyDescriptor::builder()
+            .get(getter)
+            .enumerable(true)
+            .configurable(false),
+        ctx,
+    )
+    .expect("fresh host event accessor");
+    let current = current.clone();
+    let rd = render_doc.clone();
+    let dirty = dirty.clone();
+    let getter = FunctionObjectBuilder::new(ctx.realm(), unsafe {
+        NativeFunction::from_closure(move |_, _, ctx| {
+            Ok(event_current(ctx, &rd, &dirty, current.get()))
+        })
+    })
+    .build();
+    obj.define_property_or_throw(
+        js_string!("currentTarget"),
+        boa_engine::property::PropertyDescriptor::builder()
+            .get(getter)
+            .enumerable(true)
+            .configurable(false),
+        ctx,
+    )
+    .expect("fresh host event accessor");
+    let phase = phase.clone();
+    let getter = FunctionObjectBuilder::new(ctx.realm(), unsafe {
+        NativeFunction::from_closure(move |_, _, _| Ok(phase.get().into()))
+    })
+    .build();
+    obj.define_property_or_throw(
+        js_string!("eventPhase"),
         boa_engine::property::PropertyDescriptor::builder()
             .get(getter)
             .enumerable(true)
@@ -257,15 +311,16 @@ fn event(
         })
     });
     let cancel = prevented.clone();
+    let passive = passive.clone();
     function(ctx, &obj, "preventDefault", unsafe {
         NativeFunction::from_closure(move |_, _, _| {
-            if kind == "click" || kind == "submit" {
+            if matches!(kind, "click" | "submit" | "invalid") && !passive.get() {
                 cancel.set(true);
             }
             Ok(JsValue::undefined())
         })
     });
-    (obj, current_object)
+    obj
 }
 
 fn still_same(doc: &mut RenderDocument, node: usize, token: u64, attachment: u64) -> bool {
@@ -308,29 +363,59 @@ fn deliver(
     };
     let stopped = Rc::new(Cell::new(false));
     let immediate = Rc::new(Cell::new(false));
-    for (node, token, attachment) in route {
-        if stopped.get() || pending_navigation(mutations) {
+    let current = Rc::new(Cell::new(u32::MAX - 2));
+    let phase = Rc::new(Cell::new(0));
+    let passive = Rc::new(Cell::new(false));
+    let event = event(
+        ctx,
+        render_doc,
+        dirty,
+        target.node_id as usize,
+        &current,
+        &phase,
+        &passive,
+        kind,
+        &stopped,
+        &immediate,
+        prevented,
+    );
+    let mut route = route;
+    route.push(((u32::MAX - 1) as usize, 0, 0));
+    route.push((u32::MAX as usize, 0, 0));
+    let mut visits = (1..route.len())
+        .rev()
+        .map(|i| (i, true, 1))
+        .collect::<Vec<_>>();
+    visits.push((0, true, 2));
+    visits.push((0, false, 2));
+    if !matches!(kind, "focus" | "blur" | "invalid") {
+        visits.extend((1..route.len()).map(|i| (i, false, 3)));
+    }
+    let mut previous = None;
+    for (index, capture, event_phase) in visits {
+        if immediate.get()
+            || pending_navigation(mutations)
+            || (previous != Some(index) && stopped.get())
+        {
             break;
         }
-        let handlers = registry_get_native(node as u32, token, kind);
-        if handlers.is_empty() {
-            continue;
-        }
-        let (event, this) = event(
-            ctx,
-            render_doc,
-            dirty,
-            target.node_id as usize,
-            node,
-            kind,
-            &stopped,
-            &immediate,
-            prevented,
-        );
-        for callback in handlers {
+        previous = Some(index);
+        let (node, token, attachment) = route[index];
+        current.set(node as u32);
+        phase.set(event_phase);
+        let this = event_current(ctx, render_doc, dirty, node as u32);
+        for listener in
+            registry_get_native(node as u32, token, kind, Rc::as_ptr(render_doc) as usize)
+        {
             if immediate.get() || pending_navigation(mutations) {
                 break;
             }
+            if listener.removed.get() || listener.capture != capture {
+                continue;
+            }
+            let Some(callback) = listener.callback(ctx) else {
+                continue;
+            };
             {
                 let mut cell = render_doc.borrow_mut();
                 let doc = cell
@@ -341,7 +426,8 @@ fn deliver(
                     target.node_id as usize,
                     target.incarnation,
                     target.attachment_revision,
-                ) || !still_same(doc, node, token, attachment)
+                ) || (node < (u32::MAX - 1) as usize
+                    && !still_same(doc, node, token, attachment))
                 {
                     return Err(failed("NATIVE_TARGET_DETACHED_DURING_ACTION", true));
                 }
@@ -349,13 +435,91 @@ fn deliver(
             if *callbacks >= 256 {
                 return Err(failed("NATIVE_LISTENER_LIMIT", true));
             }
+            if listener.once {
+                listener.removed.set(true);
+                if let Some(record) = listener.record(ctx) {
+                    let _ = record.set(js_string!("removed"), true, true, ctx);
+                }
+            }
             *callbacks += 1;
-            // Call the stored function directly. Never inspect/serialize its return value.
-            callback
-                .call(&this, &[event.clone().into()], ctx)
-                .map_err(|_| failed("NATIVE_LISTENER_ERROR", true))?;
+            passive.set(listener.passive);
+            let result = if callback.is_callable() {
+                callback.call(&this, &[event.clone().into()], ctx)
+            } else {
+                callback
+                    .get(js_string!("handleEvent"), ctx)
+                    .and_then(|value| {
+                        let callback = value.as_callable().ok_or_else(|| {
+                            JsNativeError::typ()
+                                .with_message("listener.handleEvent is not callable")
+                        })?;
+                        callback.call(&callback.clone().into(), &[event.clone().into()], ctx)
+                    })
+            };
+            passive.set(false);
+            result.map_err(|_| failed("NATIVE_LISTENER_ERROR", true))?;
         }
     }
+    current.set(u32::MAX - 2);
+    phase.set(0);
+
+    Ok(())
+}
+
+fn focus_target(
+    ctx: &mut Context,
+    render_doc: &Rc<RefCell<Option<RenderDocument>>>,
+    dirty: &Arc<AtomicBool>,
+    mutations: &Arc<RwLock<Vec<DomMutation>>>,
+    target: &NativeTarget,
+    callbacks: &mut usize,
+) -> std::result::Result<(), Failure> {
+    let focusable = render_doc.borrow().as_ref().is_some_and(|doc| {
+        matches!(
+            doc.tag_name(target.node_id as usize).as_deref(),
+            Some("input" | "textarea" | "button" | "select")
+        ) || doc.node_attr(target.node_id as usize, "tabindex").is_some()
+            || (doc.tag_name(target.node_id as usize).as_deref() == Some("a")
+                && doc.node_attr(target.node_id as usize, "href").is_some())
+    });
+    if !focusable {
+        return Ok(());
+    }
+    let previous = dom_realm::focused_node(render_doc);
+    if previous == Some(target.node_id as usize) {
+        return Ok(());
+    }
+    dom_realm::set_focused(ctx, render_doc, Some(target.node_id as usize));
+    let prevented = Rc::new(Cell::new(false));
+    if let Some(node) = previous {
+        let identity = render_doc.borrow_mut().as_mut().and_then(|doc| {
+            if !connected(doc, node) {
+                return None;
+            }
+            Some((
+                doc.node_incarnation(node)?,
+                doc.node_attachment_revision(node),
+            ))
+        });
+        if let Some((token, attachment)) = identity {
+            let mut previous = target.clone();
+            previous.node_id = node as u32;
+            previous.incarnation = token;
+            previous.attachment_revision = attachment;
+            deliver(
+                ctx, render_doc, dirty, mutations, &previous, "blur", callbacks, &prevented,
+            )?;
+            deliver(
+                ctx, render_doc, dirty, mutations, &previous, "focusout", callbacks, &prevented,
+            )?;
+        }
+    }
+    deliver(
+        ctx, render_doc, dirty, mutations, target, "focus", callbacks, &prevented,
+    )?;
+    deliver(
+        ctx, render_doc, dirty, mutations, target, "focusin", callbacks, &prevented,
+    )?;
     Ok(())
 }
 
@@ -440,9 +604,12 @@ pub(super) fn act(
     }
     dirty.store(true, Ordering::Relaxed);
     let mut callbacks = 0;
+    focus_target(ctx, render_doc, dirty, mutations, target, &mut callbacks)?;
     let prevented = Rc::new(Cell::new(false));
     match input {
         NativeInput::Click => {
+            let check_activation = checkable::activate(render_doc, target.node_id as usize);
+
             deliver(
                 ctx,
                 render_doc,
@@ -453,6 +620,32 @@ pub(super) fn act(
                 &mut callbacks,
                 &prevented,
             )?;
+            if let Some(activation) = check_activation {
+                if prevented.get() {
+                    checkable::rollback(render_doc, activation);
+                } else {
+                    deliver(
+                        ctx,
+                        render_doc,
+                        dirty,
+                        mutations,
+                        target,
+                        "input",
+                        &mut callbacks,
+                        &prevented,
+                    )?;
+                    deliver(
+                        ctx,
+                        render_doc,
+                        dirty,
+                        mutations,
+                        target,
+                        "change",
+                        &mut callbacks,
+                        &prevented,
+                    )?;
+                }
+            }
             // Click default action: a submit control activates its owner form
             // unless a listener called preventDefault (on click or on the
             // synthetic submit event).
@@ -488,31 +681,63 @@ pub(super) fn act(
                     }
                 };
                 if let Some((form_id, form_token, _form_attachment)) = form_info {
-                    let submit_prevented = Rc::new(Cell::new(false));
-                    let handlers = registry_get_native(form_id, form_token, "submit");
-                    if !handlers.is_empty() {
-                        let stopped = Rc::new(Cell::new(false));
-                        let immediate = Rc::new(Cell::new(false));
-                        let (event, this) = event(
-                            ctx,
-                            render_doc,
-                            dirty,
-                            form_id as usize,
-                            form_id as usize,
-                            "submit",
-                            &stopped,
-                            &immediate,
-                            &submit_prevented,
-                        );
-                        for callback in handlers {
-                            if immediate.get() {
-                                break;
-                            }
-                            if callback.call(&this, &[event.clone().into()], ctx).is_err() {
-                                return Err(failed("NATIVE_LISTENER_ERROR", true));
-                            }
+                    let invalid = if validation::should_validate(
+                        render_doc,
+                        form_id as usize,
+                        target.node_id as usize,
+                    ) {
+                        validation::invalid_controls(ctx, render_doc, form_id as usize)
+                    } else {
+                        vec![]
+                    };
+                    if !invalid.is_empty() {
+                        for node in invalid {
+                            let identity = render_doc
+                                .borrow_mut()
+                                .as_mut()
+                                .and_then(|doc| {
+                                    Some((
+                                        doc.node_incarnation(node)?,
+                                        doc.node_attachment_revision(node),
+                                    ))
+                                })
+                                .ok_or_else(stale)?;
+                            let mut control = target.clone();
+                            control.node_id = node as u32;
+                            control.incarnation = identity.0;
+                            control.attachment_revision = identity.1;
+                            deliver(
+                                ctx,
+                                render_doc,
+                                dirty,
+                                mutations,
+                                &control,
+                                "invalid",
+                                &mut callbacks,
+                                &Rc::new(Cell::new(false)),
+                            )?;
                         }
+                        return Ok(NativeReceipt {
+                            callbacks,
+                            navigation_requested: pending_navigation(mutations),
+                        });
                     }
+
+                    let submit_prevented = Rc::new(Cell::new(false));
+                    let mut form_target = target.clone();
+                    form_target.node_id = form_id;
+                    form_target.incarnation = form_token;
+                    form_target.attachment_revision = _form_attachment;
+                    deliver(
+                        ctx,
+                        render_doc,
+                        dirty,
+                        mutations,
+                        &form_target,
+                        "submit",
+                        &mut callbacks,
+                        &submit_prevented,
+                    )?;
                     if !submit_prevented.get() {
                         let mutation = {
                             let mut cell = render_doc.borrow_mut();
@@ -532,38 +757,8 @@ pub(super) fn act(
                         }
                     }
                 }
-                // Click default action on an anchor: `target="_blank"` links
-                // spawn a new tab (page-driven popup). Journals
-                // `DomMutation::OpenTab`; `Session::reconcile_native_mutations`
-                // emits `CoreEvent::TabSpawned` and the observer creates the
-                // session. Plain (no-target) link navigation is not yet a
-                // default action on this path.
-                let anchor_url = {
-                    let cell = render_doc.borrow();
-                    match cell.as_ref() {
-                        Some(doc) => {
-                            let snapshot = DomSnapshot::from_render_document(doc, "", "");
-                            snapshot.nodes.get(&target.node_id).and_then(|n| {
-                                let is_blank_anchor = n.tag == "a"
-                                    && n.attributes
-                                        .get("target")
-                                        .map(|t| t.eq_ignore_ascii_case("_blank"))
-                                        .unwrap_or(false);
-                                if is_blank_anchor && let Some(href) = n.attributes.get("href") {
-                                    return page.join(href).ok().map(|u| u.to_string());
-                                }
-                                None
-                            })
-                        }
-                        None => None,
-                    }
-                };
-                if let Some(url) = anchor_url {
-                    mutations.write().push(DomMutation::OpenTab {
-                        url,
-                        target: "_blank".to_string(),
-                    });
-                }
+                navigation::anchor(ctx, render_doc, mutations, target.node_id as usize)
+                    .map_err(|_| failed("NATIVE_NAVIGATION_FAILED", true))?;
             }
         }
         NativeInput::Fill(_) | NativeInput::FillCredential(_) => {

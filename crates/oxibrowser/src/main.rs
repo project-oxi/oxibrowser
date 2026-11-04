@@ -241,6 +241,19 @@ enum Commands {
         /// Cookie persistence file.
         #[arg(long)]
         cookie_file: Option<String>,
+        /// Maximum HTTP response bytes per resource (default 10 MiB).
+        /// Increase for large assets. Applies to CDP mode only.
+        #[arg(long, conflicts_with = "mcp")]
+        max_response_body_bytes: Option<std::num::NonZeroUsize>,
+        /// Kept for compatibility; serve progresses application tasks by default.
+        #[arg(long, conflicts_with = "no_background_event_loop")]
+        background_event_loop: bool,
+        /// Progress application tasks only while handling browser commands (CDP).
+        #[arg(long, conflicts_with = "mcp")]
+        no_background_event_loop: bool,
+        /// Decline WebGL2 contexts so applications select a real WebGL1 context.
+        #[arg(long, conflicts_with = "mcp")]
+        disable_webgl2: bool,
         /// Allow navigation to private/internal IP ranges (disables SSRF filter).
         /// Use for local development only.
         #[arg(long)]
@@ -517,6 +530,10 @@ async fn main() {
             host,
             port,
             cookie_file,
+            max_response_body_bytes,
+            background_event_loop,
+            no_background_event_loop,
+            disable_webgl2,
             allow_private_ips,
             proxy,
             auth_token,
@@ -554,6 +571,9 @@ async fn main() {
                     allow_private_ips,
                     proxy,
                     auth_token,
+                    max_response_body_bytes.map(std::num::NonZeroUsize::get),
+                    background_event_loop || !no_background_event_loop,
+                    disable_webgl2,
                     account.as_deref(),
                     ref_tag.as_deref(),
                     audit_ctx.lock.clone(),
@@ -1653,6 +1673,9 @@ async fn run_serve(
     allow_private_ips: bool,
     proxy: Option<String>,
     auth_token: Option<String>,
+    max_response_body_bytes: Option<usize>,
+    background_event_loop: bool,
+    disable_webgl2: bool,
     accounts: Option<&str>,
     ref_tag: Option<&str>,
     lock_policy: oxibrowser_core::account::LockPolicy,
@@ -1675,6 +1698,11 @@ async fn run_serve(
     info!(addr = %addr, "starting CDP server");
 
     let mut config = oxibrowser_core::BrowserConfig::headless();
+    config.background_event_loop = background_event_loop;
+    config.webgl2_enabled = !disable_webgl2;
+    if let Some(max) = max_response_body_bytes {
+        config.max_response_body_bytes = max;
+    }
     if let Some(path) = cookie_file {
         config.cookie_file = Some(std::path::PathBuf::from(path));
     }

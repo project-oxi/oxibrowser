@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>child</title>
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <button id="inc">Inc</button>
+  <div id="ccount">clicks:0</div>
+  <input id="cinput" placeholder="child input" autocomplete="off">
+  <div id="cmirror"></div>
+  <script>
+    (function () {
+      'use strict';
+      var n = 0;
+      document.getElementById('inc').addEventListener('click', function () {
+        n += 1;
+        document.getElementById('ccount').textContent = 'clicks:' + n;
+      });
+      document.getElementById('cinput').addEventListener('input', function () {
+        document.getElementById('cmirror').textContent = this.value;
+      });
+    })();
+  </script>
+</body>
+</html>

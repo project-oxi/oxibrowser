@@ -187,12 +187,19 @@ async fn plain_anchor_click_does_not_spawn() {
         .respond_with(link_page())
         .mount(&server)
         .await;
+    for route in ["/same.html", "/popup.html"] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(link_page())
+            .mount(&server)
+            .await;
+    }
     session
         .navigate(&format!("{}/", server.uri()))
         .await
         .expect("navigate");
 
-    for sel in ["#same", "#noref"] {
+    for (sel, destination) in [("#same", "/same.html"), ("#noref", "/popup.html")] {
         let observation = session.native_observe().await.expect("observe");
         let node_id = observation.snapshot.query_selector(sel).expect("anchor");
         let target = observation.target(node_id).expect("target");
@@ -200,11 +207,15 @@ async fn plain_anchor_click_does_not_spawn() {
             .native_act(target, NativeInput::Click)
             .await
             .expect("native click");
+        assert_eq!(session.current_url().unwrap().path(), destination);
     }
 
-    let none = rx.recv_timeout(Duration::from_millis(300));
+    let events: Vec<_> = rx.try_iter().collect();
     assert!(
-        matches!(none, Err(mpsc::RecvTimeoutError::Timeout)),
-        "no TabSpawned expected, got {none:?}"
+        events
+            .iter()
+            .all(|event| !matches!(event, CoreEvent::TabSpawned { .. })),
+        "no TabSpawned expected, got {events:?}"
     );
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
 }

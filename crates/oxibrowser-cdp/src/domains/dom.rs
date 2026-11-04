@@ -9,7 +9,6 @@
 
 use crate::domains::{DispatchContext, DomainResult};
 use crate::protocol::CdpError;
-use oxibrowser_core::css::{LayoutEngine, LayoutRect};
 use oxibrowser_core::js::dom_snapshot::DomSnapshot;
 use serde_json::{Value, json};
 
@@ -17,28 +16,54 @@ use serde_json::{Value, json};
 pub async fn handle(method: &str, params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
     match method {
         "getDocument" => get_document(ctx).await,
+        "getFrameOwner" => get_frame_owner(params, ctx).await,
         "querySelector" => query_selector(params, ctx).await,
         "querySelectorAll" => query_selector_all(params, ctx).await,
         "getOuterHTML" => get_outer_html(ctx).await,
-        "describeNode" => describe_node(params, ctx).await,
-        "resolveNode" => resolve_node(params),
-        "requestNode" => request_node(params),
+        "describeNode" => super::runtime::remote("describeNode", params, ctx).await,
+        "resolveNode" => super::runtime::remote("resolveNode", params, ctx).await,
+        "requestNode" => super::runtime::remote("requestNode", params, ctx).await,
         "setAttributeValue" => set_attribute_value(params, ctx).await,
         "removeAttribute" => remove_attribute(params, ctx).await,
         "removeNode" => remove_node(params, ctx).await,
         "getProperty" => get_property(params, ctx).await,
         "setNodeValue" => set_node_value(params, ctx).await,
         "focus" => focus(params, ctx).await,
-        "scrollIntoViewIfNeeded" => scroll_into_view_if_needed(params, ctx).await,
+        "scrollIntoViewIfNeeded" => {
+            super::runtime::remote("scrollIntoViewIfNeeded", params, ctx).await
+        }
         "setFileInputFiles" => set_file_input_files(params, ctx).await,
-        "getBoxModel" => get_box_model(params, ctx).await,
-        "getContentQuads" => get_content_quads(params, ctx).await,
+        "getBoxModel" => super::runtime::remote("getBoxModel", params, ctx).await,
+        "getContentQuads" => super::runtime::remote("getContentQuads", params, ctx).await,
         "getNodeForLocation" => get_node_for_location(params, ctx).await,
         _ => Err(CdpError {
             code: -32601,
             message: format!("Method not found: DOM.{method}"),
         }),
     }
+}
+
+async fn get_frame_owner(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
+    let params = params.unwrap_or_else(|| json!({}));
+    let frame_id = params
+        .get("frameId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CdpError {
+            code: -32602,
+            message: "Missing frameId".into(),
+        })?;
+    let session = ctx.session.read().await;
+    let owner = session
+        .page()
+        .and_then(|page| page.root_frame().find_by_frame_id_str(frame_id))
+        .and_then(|frame| frame.owner())
+        .ok_or_else(|| CdpError {
+            code: -32000,
+            message: "Frame owner was not found".into(),
+        })?;
+    Ok(Some(
+        json!({"nodeId":owner.node_id,"backendNodeId":owner.node_id}),
+    ))
 }
 
 /// DOM.getDocument — returns the root DOM node from the live document.
@@ -110,92 +135,6 @@ async fn get_outer_html(ctx: &DispatchContext) -> DomainResult {
     Ok(Some(json!({ "outerHTML": html })))
 }
 
-/// DOM.describeNode — describes a DOM node with real data from the live tree.
-async fn describe_node(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let node_id = params
-        .get("nodeId")
-        .and_then(|v| v.as_u64())
-        .or_else(|| params.get("backendNodeId").and_then(|v| v.as_u64()))
-        .unwrap_or(0) as u32;
-
-    let mut guard = ctx.session.write().await;
-    let snap = guard.dom_snapshot().await?;
-    let Some(snap) = snap else {
-        return Err(CdpError {
-            code: -32000,
-            message: "No active page".to_string(),
-        });
-    };
-    let Some(node) = snap.nodes.get(&node_id) else {
-        return Err(CdpError {
-            code: -32000,
-            message: format!("Node not found: {node_id}"),
-        });
-    };
-
-    let (node_type_num, node_name, local_name, node_value) = match node.node_type {
-        9 => (9, "#document".to_string(), String::new(), String::new()),
-        1 => (1, node.tag.to_uppercase(), node.tag.clone(), String::new()),
-        3 => (
-            3,
-            "#text".to_string(),
-            String::new(),
-            node.text_content.clone(),
-        ),
-        8 => (
-            8,
-            "#comment".to_string(),
-            String::new(),
-            node.text_content.clone(),
-        ),
-        _ => (1, node.tag.to_uppercase(), node.tag.clone(), String::new()),
-    };
-
-    let child_count = node.children.len();
-    let attributes: Vec<Value> = if node.node_type == 1 {
-        node.attributes
-            .iter()
-            .flat_map(|(k, v)| [json!(k), json!(v)])
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    Ok(Some(json!({
-        "node": {
-            "nodeId": node_id,
-            "backendNodeId": node_id,
-            "nodeType": node_type_num,
-            "nodeName": node_name,
-            "localName": local_name,
-            "nodeValue": node_value,
-            "childNodeCount": child_count,
-            "attributes": attributes,
-        }
-    })))
-}
-
-/// DOM.resolveNode — resolves a DOM node to a JS remote object.
-///
-/// Uses deterministic objectId format "oxi-node-{nodeId}" so that
-/// Runtime.callFunctionOn can look up the node by its objectId.
-fn resolve_node(params: Option<Value>) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let node_id = params.get("nodeId").and_then(|v| v.as_u64()).unwrap_or(0);
-    let object_id = format!("oxi-node-{node_id}");
-
-    Ok(Some(json!({
-        "object": {
-            "type": "object",
-            "subtype": "node",
-            "className": "HTMLElement",
-            "description": format!("node#{node_id}"),
-            "objectId": object_id
-        }
-    })))
-}
-
 // ---------------------------------------------------------------------------
 // DOM.* element mutators
 //
@@ -222,25 +161,6 @@ fn node_js_expr(id: u32, body: &str) -> String {
     format!(
         "(function() {{ var __all = document.querySelectorAll('*'); for (var __i = 0; __i < __all.length; __i++) {{ if (__all[__i].__nodeId === {id}) {{ var __el = __all[__i]; return ({body}); }} }} return null; }})()",
     )
-}
-
-/// DOM.requestNode — reverse of `resolveNode`.
-///
-/// `{ objectId: "oxi-node-{N}" }` → `{ nodeId: N }`. We accept any
-/// `oxi-node-` prefix and parse the trailing integer; non-matching
-/// objectIds yield `nodeId: 0` (Playwright only ever calls this with the
-/// canonical prefix).
-fn request_node(params: Option<Value>) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let object_id = params
-        .get("objectId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let node_id = object_id
-        .strip_prefix("oxi-node-")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    Ok(Some(json!({ "nodeId": node_id })))
 }
 
 /// DOM.setAttributeValue — writes `name=value` on the element.
@@ -352,22 +272,6 @@ async fn focus(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
 
 /// DOM.scrollIntoViewIfNeeded — best-effort `.scrollIntoView()`. The render
 /// document's element object also exposes a no-op `scrollIntoView` binding.
-async fn scroll_into_view_if_needed(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    let node_id = match params
-        .as_ref()
-        .and_then(|p| p.get("nodeId"))
-        .and_then(|v| v.as_u64())
-    {
-        Some(id) => id as u32,
-        None => return Ok(Some(json!({}))),
-    };
-    let expr = node_js_expr(
-        node_id,
-        "(__el.scrollIntoView({block:'nearest', inline:'nearest'}), null)",
-    );
-    run_js_void(&expr, ctx).await
-}
-
 /// DOM.setFileInputFiles — best-effort stub.
 ///
 /// Real Playwright `setInputFiles` requires a Chromium file-chooser round-trip
@@ -527,100 +431,13 @@ fn build_cdp_node(snapshot: &DomSnapshot, node_id: u32, depth: usize) -> Value {
 // Layout geometry (LayoutEngine-backed)
 // ---------------------------------------------------------------------------
 
-/// Flatten a [`LayoutRect`] into a CDP quad: 4 (x, y) points clockwise from
-/// the top-left. CDP represents a quad as `[x1,y1, x2,y2, x3,y3, x4,y4]`.
-fn quad_from_rect(r: &LayoutRect) -> Vec<f64> {
-    let (x, y, w, h) = (r.x, r.y, r.width, r.height);
-    vec![x, y, x + w, y, x + w, y + h, x, y + h]
-}
-
-/// DOM.getBoxModel — returns the box model for a node.
-///
-/// LayoutEngine produces a single bounding rect (no separate
-/// content/padding/border/margin boxes), so all four quads share it.
-async fn get_box_model(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let node_id = params.get("nodeId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let mut guard = ctx.session.write().await;
-    let snap = guard.dom_snapshot().await?;
-    let Some(s) = snap else {
-        return Err(CdpError {
-            code: -32000,
-            message: "Could not find document root".into(),
-        });
-    };
-    let rect = LayoutEngine::compute_rect(&s, node_id);
-    let quad = quad_from_rect(&rect);
-    Ok(Some(json!({
-        "model": {
-            "content": quad.clone(),
-            "padding": quad.clone(),
-            "border": quad.clone(),
-            "margin": quad,
-            "width": rect.width,
-            "height": rect.height,
-        }
-    })))
-}
-
-/// DOM.getContentQuads — returns the content quads for a node.
-async fn get_content_quads(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let node_id = params.get("nodeId").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let mut guard = ctx.session.write().await;
-    let snap = guard.dom_snapshot().await?;
-    let Some(s) = snap else {
-        return Ok(Some(json!({ "quads": [] })));
-    };
-    let rect = LayoutEngine::compute_rect(&s, node_id);
-    Ok(Some(json!({ "quads": [quad_from_rect(&rect)] })))
-}
-
-/// DOM.getNodeForLocation — returns the node at the given viewport coordinate.
-///
-/// Picks the smallest-area element whose rect contains the point (the most
-/// specific / topmost-painted element under the cursor).
+/// Hit-test against the renderer's painted tree in viewport CSS coordinates.
 async fn get_node_for_location(params: Option<Value>, ctx: &DispatchContext) -> DomainResult {
-    let params = params.unwrap_or_default();
-    let x = params.get("x").and_then(|v| v.as_f64()).unwrap_or(-1.0);
-    let y = params.get("y").and_then(|v| v.as_f64()).unwrap_or(-1.0);
-    let mut guard = ctx.session.write().await;
-    let snap = guard.dom_snapshot().await?;
-    let Some(s) = snap else {
-        return Err(CdpError {
-            code: -32000,
-            message: "Could not find document root".into(),
-        });
-    };
-    let mut best: Option<(f64, u32, String)> = None;
-    for (&id, node) in &s.nodes {
-        // Only elements are hit-testable.
-        if node.node_type != 1 {
-            continue;
-        }
-        let rect = LayoutEngine::compute_rect(&s, id);
-        if rect.width <= 0.0 || rect.height <= 0.0 {
-            continue;
-        }
-        if x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height {
-            let area = rect.width * rect.height;
-            if best.as_ref().is_none_or(|(a, _, _)| area < *a) {
-                best = Some((area, id, node.tag.clone()));
-            }
-        }
+    let mut result = super::runtime::remote("getNodeForLocation", params, ctx).await?;
+    if let Some(result) = result.as_mut() {
+        result["frameId"] = json!(ctx.events.main_frame_id());
     }
-    match best {
-        Some((_, id, tag)) => Ok(Some(json!({
-            "nodeId": id,
-            "backendNodeId": id,
-            "frameId": "main",
-            "nodeName": tag.to_uppercase(),
-        }))),
-        None => Err(CdpError {
-            code: -32000,
-            message: format!("No node found at given location ({x}, {y})"),
-        }),
-    }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -697,18 +514,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_node_parses_object_id_into_node_id() {
+    async fn request_node_resolves_live_native_object_and_rejects_forged_ids() {
         let (ctx, _sess) = make_ctx().await;
-        let resp = handle(
-            "requestNode",
-            Some(json!({ "objectId": "oxi-node-42" })),
-            &ctx,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(resp.get("nodeId").and_then(|v| v.as_u64()), Some(42));
-        let _ = _sess;
+        let node_id = node_id_of(&ctx, "#t").await;
+        let resolved = handle("resolveNode", Some(json!({"nodeId":node_id})), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let object_id = resolved["object"]["objectId"].as_str().unwrap();
+        assert!(object_id.starts_with("oxi-remote-"));
+        let response = handle("requestNode", Some(json!({"objectId":object_id})), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["nodeId"], node_id);
+        assert!(
+            handle("requestNode", Some(json!({"objectId":"oxi-node-42"})), &ctx)
+                .await
+                .is_err()
+        );
+        let result = super::super::runtime::handle("callFunctionOn", Some(json!({"objectId":object_id, "functionDeclaration":"function() { return this.id; }", "returnByValue":true})), &ctx).await.unwrap().unwrap();
+        assert_eq!(result["result"]["value"], "t");
     }
 
     // no debug tests retained in committed code

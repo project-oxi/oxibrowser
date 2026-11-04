@@ -244,7 +244,8 @@ Promise.resolve(globalThis.__replP).then(
 
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        ctx.run_jobs();
+        ctx.run_jobs()
+            .map_err(|e| format!("promise job failed: {e}"))?;
         let settled = ctx
             .eval(Source::from_bytes("globalThis.__replSettled"))
             .map_err(|e| format!("settle read failed: {e}"))?;

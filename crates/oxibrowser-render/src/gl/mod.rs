@@ -20,7 +20,7 @@
 pub mod egl;
 
 use std::ffi::{CStr, CString};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use glow::HasContext;
 
@@ -122,6 +122,13 @@ impl GlDisplayInner {
 }
 
 static DISPLAY: LazyLock<Result<GlDisplayInner, GlError>> = LazyLock::new(init_display);
+
+// Pinned ANGLE Metal publishes mCapsInitialized before filling shared caps
+// (DisplayMtl::ensureCapsInitialized). Parallel first makeCurrent calls can
+// otherwise copy zero capabilities. Construction includes that first binding;
+// normal commands and drawing remain independent across contexts.
+static CONTEXT_CREATION: LazyLock<Arc<parking_lot::RwLock<()>>> =
+    LazyLock::new(|| Arc::new(parking_lot::RwLock::new(())));
 
 /// Process-wide ANGLE display + GL loader. Safe to call repeatedly; only the
 /// first call initializes. Must be called from the thread that will use the
@@ -273,6 +280,7 @@ impl GlContext {
         if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
             return Err(GlError::BadSize { width, height });
         }
+        let _creation = CONTEXT_CREATION.write();
         let display = display()?;
         if !display.info.webgl_compatible() {
             return Err(GlError::Unsupported(
@@ -388,17 +396,73 @@ impl GlContext {
             return Ok(());
         }
         unsafe {
-            if egl::eglMakeCurrent(
-                self.dpy,
-                egl::EGL_NO_SURFACE,
-                egl::EGL_NO_SURFACE,
-                egl::EGL_NO_CONTEXT,
-            ) == egl::EGL_FALSE
+            if egl::eglGetCurrentContext() == self.ctx
+                && egl::eglMakeCurrent(
+                    self.dpy,
+                    egl::EGL_NO_SURFACE,
+                    egl::EGL_NO_SURFACE,
+                    egl::EGL_NO_CONTEXT,
+                ) == egl::EGL_FALSE
             {
                 return Err(GlError::MakeCurrent(egl::error_name(egl::last_error())));
             }
         }
         Ok(())
+    }
+
+    /// Enabled and requestable GLES extensions for this current context.
+    /// ANGLE's WebGL-compatible contexts initially disable optional features.
+    /// The caller must make this context current, as for read_pixels_rgba.
+    pub fn available_extensions(&self, gl: &glow::Context) -> Vec<String> {
+        let enabled = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
+        let mut names: Vec<String> = enabled.split_whitespace().map(str::to_owned).collect();
+        if names
+            .iter()
+            .any(|name| name == "GL_ANGLE_request_extension")
+        {
+            // ANGLE_request_extension, pinned chromium/8118 specification:
+            // https://chromium.googlesource.com/angle/angle/+/refs/heads/chromium/8118/extensions/ANGLE_request_extension.txt
+            let requestable = unsafe { gl.get_parameter_string(0x93A8) };
+            names.extend(requestable.split_whitespace().map(str::to_owned));
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Enable an actually requestable extension, then verify ANGLE enabled it.
+    /// Contexts are created without sharing, so this operation cannot race
+    /// another thread accessing the same GL share group.
+    pub fn enable_extension(&self, gl: &glow::Context, name: &str) -> bool {
+        let enabled = unsafe { gl.get_parameter_string(glow::EXTENSIONS) };
+        if enabled.split_whitespace().any(|token| token == name) {
+            return true;
+        }
+        if !enabled
+            .split_whitespace()
+            .any(|token| token == "GL_ANGLE_request_extension")
+            || !self
+                .available_extensions(gl)
+                .iter()
+                .any(|token| token == name)
+        {
+            return false;
+        }
+        let Ok(name) = CString::new(name) else {
+            return false;
+        };
+        let pointer = unsafe { egl::eglGetProcAddress(c"glRequestExtensionANGLE".as_ptr()) };
+        if pointer.is_null() {
+            return false;
+        }
+        // The signature comes from ANGLE_request_extension. eglGetProcAddress
+        // supplies the entry point from the same pinned ANGLE as this context.
+        let request: unsafe extern "C" fn(*const std::ffi::c_char) =
+            unsafe { std::mem::transmute(pointer) };
+        unsafe { request(name.as_ptr()) };
+        unsafe { gl.get_parameter_string(glow::EXTENSIONS) }
+            .split_whitespace()
+            .any(|token| token.as_bytes() == name.as_bytes())
     }
 
     /// Recreates the drawing surface at a new size. GL object state survives
@@ -483,12 +547,14 @@ impl GlContext {
     /// releasing current first so a later context can bind cleanly.
     pub fn destroy(mut self) {
         unsafe {
-            egl::eglMakeCurrent(
-                self.dpy,
-                egl::EGL_NO_SURFACE,
-                egl::EGL_NO_SURFACE,
-                egl::EGL_NO_CONTEXT,
-            );
+            if egl::eglGetCurrentContext() == self.ctx {
+                egl::eglMakeCurrent(
+                    self.dpy,
+                    egl::EGL_NO_SURFACE,
+                    egl::EGL_NO_SURFACE,
+                    egl::EGL_NO_CONTEXT,
+                );
+            }
             if self.surface != egl::EGL_NO_SURFACE {
                 egl::eglDestroySurface(self.dpy, self.surface);
                 self.surface = egl::EGL_NO_SURFACE;
@@ -506,7 +572,7 @@ impl Drop for GlContext {
         // Safety net for paths that never call `destroy` explicitly; still on
         // the owning thread because the value lives in the JS-thread registry.
         unsafe {
-            if self.ctx != egl::EGL_NO_CONTEXT || self.surface != egl::EGL_NO_SURFACE {
+            if self.ctx != egl::EGL_NO_CONTEXT && egl::eglGetCurrentContext() == self.ctx {
                 egl::eglMakeCurrent(
                     self.dpy,
                     egl::EGL_NO_SURFACE,
@@ -566,5 +632,36 @@ fn choose_config(
             return Err(GlError::ContextInit(egl::error_name(egl::last_error())));
         }
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn destroying_noncurrent_context_preserves_current_binding() {
+        let attrs = ContextAttrs {
+            preserve_drawing_buffer: true,
+            ..Default::default()
+        };
+        let first = GlContext::new(2, 8, 8, attrs.clone()).unwrap();
+        let second = GlContext::new(2, 8, 8, attrs.clone()).unwrap();
+        first.make_current().unwrap();
+        second.make_not_current().unwrap();
+        assert_eq!(unsafe { egl::eglGetCurrentContext() }, first.ctx);
+        second.destroy();
+        assert_eq!(unsafe { egl::eglGetCurrentContext() }, first.ctx);
+
+        let third = GlContext::new(2, 8, 8, attrs).unwrap();
+        first.make_current().unwrap();
+        drop(third);
+        assert_eq!(unsafe { egl::eglGetCurrentContext() }, first.ctx);
+        let gl = loader().unwrap();
+        unsafe {
+            gl.clear_color(0.0, 1.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+        }
+        assert_eq!(&first.read_pixels_rgba(gl, false)[..4], &[0, 255, 0, 255]);
     }
 }

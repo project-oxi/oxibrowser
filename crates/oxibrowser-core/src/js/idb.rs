@@ -49,7 +49,7 @@ type SharedTx = Rc<RefCell<Option<std::sync::mpsc::Sender<IndexedDbMsg>>>>;
 thread_local! {
     /// Deferred `(request, event)` pairs — fired on the next pump so the
     /// canonical "assign handler after the call returns" pattern works.
-    static PENDING_IDB: RefCell<Vec<(JsObject, &'static str)>> = const { RefCell::new(Vec::new()) };
+    static PENDING_IDB: RefCell<Vec<(u32, JsObject, &'static str)>> = const { RefCell::new(Vec::new()) };
     /// The live database map for the current page origin (unused by the
     /// closures — they capture the per-registration `Rc` — but kept for
     /// future cross-frame introspection).
@@ -58,15 +58,39 @@ thread_local! {
 
 /// Queue an event for the next pump.
 fn queue_event(req: JsObject, event: &'static str) {
-    PENDING_IDB.with(|q| q.borrow_mut().push((req, event)));
+    PENDING_IDB.with(|q| {
+        q.borrow_mut()
+            .push((super::runtime::active_context_id(), req, event))
+    });
+}
+
+pub(crate) fn clear_context(context_id: u32) {
+    PENDING_IDB.with(|q| q.borrow_mut().retain(|(owner, _, _)| *owner != context_id));
 }
 
 /// Drain pending IDB events: fire `on{event}` callbacks (handler set after
 /// the call returned) with `{ target: request, type: event }`. Mirrors
 /// `drain_ws_events`; called from `drain_timers`.
 pub(crate) fn drain_idb_events(ctx: &mut Context) {
-    let pending: Vec<(JsObject, &'static str)> =
-        PENDING_IDB.with(|q| q.borrow_mut().drain(..).collect());
+    drain_idb_events_bounded(ctx, usize::MAX);
+}
+
+pub(crate) fn drain_idb_events_bounded(ctx: &mut Context, limit: usize) {
+    let active = super::runtime::active_context_id();
+    let pending: Vec<(JsObject, &'static str)> = PENDING_IDB.with(|q| {
+        let mut count = 0;
+        q.borrow_mut()
+            .extract_if(.., |(owner, _, _)| {
+                if *owner == active && count < limit {
+                    count += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+            .map(|(_, req, event)| (req, event))
+            .collect()
+    });
     for (req, event) in pending {
         let handler = req.get(js_string!(format!("on{event}").as_str()), ctx);
         if let Ok(cb) = handler

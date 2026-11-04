@@ -95,6 +95,12 @@ impl Page {
         &self.url
     }
 
+    /// Update metadata after a validated same-document History/Location change.
+    pub(crate) fn set_same_document_url(&mut self, url: Url) {
+        self.root_frame.set_same_document_url(url.clone());
+        self.url = url;
+    }
+
     /// Get the page title.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()

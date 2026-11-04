@@ -64,6 +64,10 @@ pub struct ChatResponse {
 }
 
 /// What the loop needs from a model.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait adds must_use to its boxed Future"
+)]
 #[async_trait::async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, req: &ChatRequest) -> Result<ChatResponse, String>;

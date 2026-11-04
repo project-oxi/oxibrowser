@@ -13,7 +13,8 @@ use crate::network::intercept::{InterceptAction, InterceptedBody, InterceptedRes
 use crate::network::ip_filter::IpFilter;
 use crate::session::RequestOverrides;
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use url::Url;
 use wreq::{Client, Response};
 use wreq_util::Emulation;
@@ -141,6 +142,8 @@ pub struct HttpClient {
     config: BrowserConfig,
     cookie_jar: Arc<RwLock<CookieJar>>,
     ip_filter: Arc<IpFilter>,
+    module_http1: OnceLock<Box<HttpClient>>,
+    module_retry_slots: tokio::sync::Semaphore,
 }
 
 /// Outcome of [`HttpClient::fetch_with_challenge_retry`].
@@ -166,6 +169,14 @@ impl HttpClient {
         response: Response,
         max_bytes: usize,
     ) -> Result<(Vec<u8>, bool)> {
+        Self::read_body_with_idle_timeout(response, max_bytes, None).await
+    }
+
+    async fn read_body_with_idle_timeout(
+        response: Response,
+        max_bytes: usize,
+        idle_timeout: Option<Duration>,
+    ) -> Result<(Vec<u8>, bool)> {
         // Stream the body chunk-by-chunk, stopping as soon as `max_bytes` is
         // reached. This avoids buffering an oversized body in memory even when
         // the server omits or falsifies `Content-Length` (true incremental
@@ -176,7 +187,17 @@ impl HttpClient {
         let mut buf: Vec<u8> = Vec::new();
         let mut truncated = false;
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let next = if let Some(timeout) = idle_timeout {
+                tokio::time::timeout(timeout, stream.next())
+                    .await
+                    .map_err(|_| {
+                        CoreError::ConnectionTimeout("module response body stalled".into())
+                    })?
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|e| CoreError::NetworkError(e.to_string()))?;
             let remaining = max_bytes.saturating_sub(buf.len());
             if remaining == 0 {
@@ -211,6 +232,14 @@ impl HttpClient {
     /// policy mitigates the most common SSRF-via-redirect attack vector. For
     /// full TOCTOU protection, a custom hyper connector would be needed.
     pub fn new(config: &BrowserConfig, cookie_jar: Arc<RwLock<CookieJar>>) -> Result<Self> {
+        Self::with_transport(config, cookie_jar, false)
+    }
+
+    fn with_transport(
+        config: &BrowserConfig,
+        cookie_jar: Arc<RwLock<CookieJar>>,
+        http1_only: bool,
+    ) -> Result<Self> {
         let ip_filter = if config.enable_ssrf_filter {
             Arc::new(IpFilter::block_private())
         } else {
@@ -250,6 +279,10 @@ impl HttpClient {
                 attempt.follow()
             }));
 
+        if http1_only {
+            builder = builder.http1_only();
+        }
+
         if config.accept_invalid_certs {
             builder = builder.tls_cert_verification(false);
         }
@@ -272,6 +305,8 @@ impl HttpClient {
             config: config.clone(),
             cookie_jar,
             ip_filter,
+            module_http1: OnceLock::new(),
+            module_retry_slots: tokio::sync::Semaphore::new(8),
         })
     }
 
@@ -298,6 +333,119 @@ impl HttpClient {
             }
         }
         tracing::trace!(url = %url, set_cookie_count, "response cookies stored");
+    }
+
+    /// Download an idempotent module GET, including the body, within its JS
+    /// deadline. If the first transfer stalls, retry once on a separate HTTP/1
+    /// pool so a blocked multiplexed connection cannot consume the full budget.
+    pub(crate) async fn fetch_module(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        origin: Option<&str>,
+        overrides: &RequestOverrides,
+        max_body_bytes: usize,
+        deadline: Instant,
+    ) -> Result<FetchedResource> {
+        const MODULE_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+        let idle_timeout = (deadline.saturating_duration_since(Instant::now())
+            > 2 * MODULE_IDLE_TIMEOUT)
+            .then_some(MODULE_IDLE_TIMEOUT);
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let initial = self.fetch_module_once(
+            url,
+            headers,
+            origin,
+            overrides,
+            max_body_bytes,
+            idle_timeout,
+        );
+        let timed_out = || CoreError::Timeout("module transfer exceeded its deadline".into());
+        match tokio::time::timeout_at(deadline, initial)
+            .await
+            .map_err(|_| timed_out())?
+        {
+            Err(CoreError::ConnectionTimeout(_)) if idle_timeout.is_some() => {}
+            result => return result,
+        }
+
+        // A stalled HTTP/2 connection may affect many imports at once.
+        // Bound the number of HTTP/1 connections opened for their retries.
+        let _slot = tokio::time::timeout_at(deadline, self.module_retry_slots.acquire())
+            .await
+            .map_err(|_| CoreError::Timeout("module retry exceeded its deadline".into()))?
+            .map_err(|_| CoreError::NetworkError("module retry pool is closed".into()))?;
+        tracing::debug!(%url, "stalled module transfer; retrying with HTTP/1");
+        // Concurrent sessions may initialize the pool at the same time.
+        // Only the installed client is used for retries.
+        if self.module_http1.get().is_none() {
+            let fallback = Self::with_transport(&self.config, self.cookie_jar.clone(), true)?;
+            let _ = self.module_http1.set(Box::new(fallback));
+        }
+        let fallback = self
+            .module_http1
+            .get()
+            .expect("module fallback pool initialized");
+        let retry =
+            fallback.fetch_module_once(url, headers, origin, overrides, max_body_bytes, None);
+        tokio::time::timeout_at(deadline, retry)
+            .await
+            .map_err(|_| timed_out())?
+    }
+
+    async fn fetch_module_once(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        origin: Option<&str>,
+        overrides: &RequestOverrides,
+        max_body_bytes: usize,
+        idle_timeout: Option<Duration>,
+    ) -> Result<FetchedResource> {
+        let request = self.request_with_context_with_overrides(
+            url,
+            "GET",
+            headers,
+            None,
+            origin,
+            Some(overrides),
+        );
+        let response = if let Some(timeout) = idle_timeout {
+            tokio::time::timeout(timeout, request).await.map_err(|_| {
+                CoreError::ConnectionTimeout("module response headers stalled".into())
+            })??
+        } else {
+            request.await?
+        };
+        let status = response.status();
+        let headers = Self::response_headers(&response);
+        let mime_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(Self::mime_without_params)
+            .unwrap_or_default();
+        let final_url = response.uri().to_string();
+        let body = if status.is_success() {
+            let (body, truncated) =
+                Self::read_body_with_idle_timeout(response, max_body_bytes, idle_timeout).await?;
+            if truncated {
+                return Err(CoreError::NetworkError(format!(
+                    "response body exceeds limit of {max_body_bytes} bytes"
+                )));
+            }
+            body
+        } else {
+            Vec::new()
+        };
+        tracing::debug!(%url, %status, bytes = body.len(), "module transfer completed");
+        Ok(FetchedResource {
+            status: status.as_u16(),
+            headers,
+            mime_type,
+            body,
+            final_url,
+        })
     }
 
     /// Fetch a URL and return the response.
@@ -394,6 +542,7 @@ impl HttpClient {
             url = %url,
             method = %method,
             status = response.status().as_u16(),
+            version = ?response.version(),
             "HTTP response received"
         );
         self.store_response_cookies(url, &response);

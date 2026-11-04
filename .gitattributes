@@ -1,0 +1,2 @@
+# Preserve the exact published dependency snapshot, including upstream whitespace.
+vendor/wreq-util/** -whitespace

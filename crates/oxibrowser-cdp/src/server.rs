@@ -315,14 +315,14 @@ impl CdpServer {
                     .header("Content-Type", "application/json")
                     .body(Full::new(Bytes::from(body.to_string())))?)
             }
-            "/json/version" => {
+            "/json/version" | "/json/version/" => {
                 let version = JsonVersion::new(ws_url.to_string());
                 let body = serde_json::to_string(&version)?;
                 Ok(Response::builder()
                     .header("Content-Type", "application/json")
                     .body(Full::new(Bytes::from(body)))?)
             }
-            "/json" | "/json/list" => {
+            "/json" | "/json/" | "/json/list" | "/json/list/" => {
                 let targets = vec![JsonTarget {
                     id: "default".to_string(),
                     title: "OxiBrowser".to_string(),

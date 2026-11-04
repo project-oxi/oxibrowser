@@ -27,6 +27,28 @@ pub fn emit_core_event_with_session(events: &EventSender, ev: CoreEvent, session
 
 fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str>) {
     match ev {
+        CoreEvent::SameDocumentNavigation { url } => {
+            send_page(
+                events,
+                session,
+                "Page.navigatedWithinDocument",
+                json!({"frameId":events.main_frame_id(),"url":url,"navigationType":"other"}),
+            );
+        }
+        CoreEvent::BindingCalled {
+            name,
+            payload,
+            execution_context_id,
+            timestamp: _,
+        } => {
+            let params =
+                json!({"name":name, "payload":payload, "executionContextId":execution_context_id});
+            if let Some(session) = session {
+                events.send_runtime_event_with_session("Runtime.bindingCalled", params, session);
+            } else {
+                events.send_runtime_event("Runtime.bindingCalled", params);
+            }
+        }
         CoreEvent::Console {
             level,
             args,
@@ -204,7 +226,7 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
                 session,
                 "Page.downloadWillBegin",
                 json!({
-                    "frameId": "",
+                    "frameId": events.main_frame_id(),
                     "guid": guid,
                     "url": url,
                     "suggestedFilename": filename,
@@ -229,7 +251,7 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
             events.send_browser_event(
                 "Browser.downloadWillBegin",
                 json!({
-                    "frameId": "",
+                    "frameId": events.main_frame_id(),
                     "guid": guid,
                     "url": url,
                     "suggestedFilename": filename,
@@ -317,7 +339,7 @@ fn emit_core_event_opt(events: &EventSender, ev: CoreEvent, session: Option<&str
                     "postData": serde_json::Value::Null,
                 },
                 "resourceType": resource_type,
-                "frameId": "main",
+                "frameId": events.main_frame_id(),
                 "networkIntercepted": true,
             });
             match session {
@@ -510,7 +532,7 @@ fn emit_request_will_be_sent(
             "wallTime": timestamp / 1000.0,
             "initiator": { "type": "script" },
             "type": resource_type,
-            "frameId": "main",
+            "frameId": events.main_frame_id(),
             "hasUserGesture": false,
         }),
     );
@@ -552,7 +574,7 @@ fn emit_response_received(
                 "encodedDataLength": 0.0,
                 "securityState": "secure",
             },
-            "frameId": "main",
+            "frameId": events.main_frame_id(),
         }),
     );
 }

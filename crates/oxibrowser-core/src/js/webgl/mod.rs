@@ -27,7 +27,7 @@ pub mod types;
 #[cfg(all(test, feature = "webgl"))]
 mod session_tests;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use boa_engine::JsValue;
@@ -36,6 +36,14 @@ use oxibrowser_render::gl::{GlContext, GlError};
 
 use crate::js::runtime::active_context_id;
 pub use types::{CtxKind, JsContextAttrs, Resource, ResourceKind};
+
+thread_local! {
+    static WEBGL2_ENABLED: Cell<bool> = const { Cell::new(true) };
+}
+
+pub(crate) fn set_webgl2_enabled(enabled: bool) {
+    WEBGL2_ENABLED.set(enabled);
+}
 
 /// Unique frontend-context handle (per JS thread).
 static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -77,6 +85,9 @@ pub struct FrontContext {
     /// resource ids (`FrontContext.resources` keys), not GL names.
     pub bound_array_buffer: Option<u32>,
     pub bound_element_array_buffer: Option<u32>,
+    pub bound_uniform_buffer: Option<u32>,
+    /// KHR completion pnames become valid only after getExtension succeeds.
+    pub parallel_shader_compile_enabled: bool,
     pub bound_framebuffer: Option<u32>,
     pub bound_renderbuffer: Option<u32>,
     pub bound_texture_2d: Option<u32>,
@@ -99,6 +110,8 @@ impl FrontContext {
             unpack_premultiply: false,
             bound_array_buffer: None,
             bound_element_array_buffer: None,
+            bound_uniform_buffer: None,
+            parallel_shader_compile_enabled: false,
             bound_framebuffer: None,
             bound_renderbuffer: None,
             bound_texture_2d: None,
@@ -231,6 +244,9 @@ pub fn get_context(
     let Some(kind) = CtxKind::from_type_str(kind_str) else {
         return JsValue::null();
     };
+    if kind == CtxKind::WebGl2 && !WEBGL2_ENABLED.get() {
+        return JsValue::null();
+    }
     let key = key_for(node_id);
 
     if let Some(existing) = with_entry(key, |e| (e.handle, e.kind)) {
@@ -249,6 +265,8 @@ pub fn get_context(
         width.clamp(1, types::MAX_DIM),
         height.clamp(1, types::MAX_DIM),
     );
+    // Construction can bind a different EGL context, including on failure.
+    CURRENT_GL.set(0);
     match GlContext::new(
         kind.client_version(),
         cw,
@@ -256,6 +274,7 @@ pub fn get_context(
         types::to_render_attrs(&attrs),
     ) {
         Ok(backend) => {
+            CURRENT_GL.set(handle);
             let js = js_obj_builder(handle, canvas);
             let entry = RegistryEntry {
                 handle,
@@ -278,6 +297,9 @@ pub fn get_context(
 /// No-op when the canvas has no context or the size is unchanged.
 pub fn resize(node_id: usize, width: u32, height: u32) {
     let key = (active_context_id(), node_id);
+    // A surface replacement binds that canvas outside with_gl. Invalidate
+    // even when it fails, so the next operation re-establishes its binding.
+    CURRENT_GL.set(0);
     let _ = with_entry_mut(key, |e| e.ctx.resize(width, height));
 }
 

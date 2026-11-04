@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>vue-spa</title>
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <div id="root"></div>
+  <script src="/vendor/vue.js"></script>
+  <script>
+    (function () {
+      'use strict';
+      var app = Vue.createApp({
+        setup: function () {
+          var count = Vue.ref(0);
+          var text = Vue.ref('');
+          var draft = Vue.ref('');
+          var items = Vue.ref([]);
+          var show = Vue.ref(false);
+          function inc() { count.value++; }
+          function add() {
+            if (!draft.value) return;
+            items.value = items.value.concat([draft.value]);
+            draft.value = '';
+          }
+          function toggle() { show.value = !show.value; }
+          return { count: count, text: text, draft: draft, items: items, show: show, inc: inc, add: add, toggle: toggle };
+        },
+        template:
+          '<div>' +
+            '<h1>Vue</h1>' +
+            '<button id="inc" @click="inc">Increment</button>' +
+            '<div id="count">count={{ count }}</div>' +
+            '<input id="ctl" v-model="text"><div id="mirror">{{ text }}</div>' +
+            '<input id="item" v-model="draft"><button id="add" @click="add">Add</button>' +
+            '<ul id="list"><li v-for="it in items" :key="it" class="li">{{ it }}</li></ul>' +
+            '<button id="toggle" @click="toggle">Toggle</button>' +
+            '<div id="cond" v-if="show">visible</div>' +
+          '</div>'
+      });
+      app.mount('#root');
+    })();
+  </script>
+</body>
+</html>

@@ -15,6 +15,7 @@
 
 mod document;
 mod paint;
+mod resources;
 
 #[cfg(feature = "webgl")]
 pub mod gl;
@@ -32,3 +33,4 @@ pub use paint::blank_png;
 pub use paint::encode_png;
 pub use paint::png_to_pdf;
 pub use paint::{PdfOrientation, PdfPageOptions, PdfPageSize, png_to_pdf_paged};
+pub use resources::{PreloadedStylesheet, PreloadedStylesheets};

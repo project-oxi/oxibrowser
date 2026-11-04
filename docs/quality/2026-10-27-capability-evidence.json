@@ -1,0 +1,787 @@
+{
+  "audit_date": "2026-10-27",
+  "timezone": "Asia/Seoul",
+  "audited_engine_revision": "edee0cfee8bd95f2144b63f34be2b22e4ac2c69e",
+  "binary": {
+    "path": "target/release/oxibrowser",
+    "sha256": "76b8ca78c690c61c0106742058666729d04ec0312e41d1ccdd987f6631399085",
+    "bytes": 67089664,
+    "build_command": "cargo build -p oxibrowser --release --features webgl"
+  },
+  "platform": {
+    "model": "Mac16,9",
+    "memory_bytes": 68719476736,
+    "logical_cpus": 16,
+    "macos": "27.0.1",
+    "chrome": "156.0.8078.48",
+    "node": "24.20.0"
+  },
+  "scope": "Two repeated local differential runs; one layout/timer supplement; three fresh-process samples per CLI case. No full standards, real-account, live-site, sustained GPU or cross-platform certification.",
+  "commands": {
+    "http": "python3 /tmp/oxi-browser-audit-20261027/server.py",
+    "oxi_background": "target/release/oxibrowser --no-audit serve --allow-private-ips --port 19236 --background-event-loop",
+    "oxi_default": "target/release/oxibrowser --no-audit serve --allow-private-ips --port 19239",
+    "chrome": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --user-data-dir=/tmp/oxi-browser-audit-20261027/chrome-profile --remote-debugging-port=19238 --remote-debugging-address=127.0.0.1 --window-size=1280,720 --disable-background-networking --disable-component-update --no-first-run --no-default-browser-check about:blank",
+    "main_probe": "TASK_AUDIT_RUN=2 node /tmp/oxi-browser-audit-20261027/probe.mjs",
+    "supplement": "node /tmp/oxi-browser-audit-20261027/supplement.mjs"
+  },
+  "fixtures": {
+    "index.html": {
+      "sha256": "f3616b9fc4f72f86689ab67db0323a9b98a939a9e2382d3d254706f49666eb5b",
+      "text": "<!doctype html><html><head><title>Browser audit fixture</title><style>#box{width:123px;color:rgb(12,34,56)}#late{color:rgb(1,2,3)}#anim{width:20px;animation:widen .2s linear forwards}@keyframes widen{from{width:20px}to{width:80px}}</style></head><body><div id=\"box\">box</div><div id=\"parent\"><button id=\"target\">target</button></div><input id=\"focus\"><input id=\"required\" required><input id=\"upload\" type=\"file\"><div id=\"late\">late</div><div id=\"anim\">animate</div><iframe id=\"frame\" srcdoc=\"<p id='child'>child</p>\"></iframe></body></html>"
+    },
+    "layout.html": {
+      "sha256": "1bfdaf1ce960d4b931497fa47199c208b389a6776eb621d9c038d9dfdac5a61d",
+      "text": "<!doctype html><html><head><style>body{margin:8px}#box{width:123px;height:45px;background:rgb(10,20,30);color:rgb(12,34,56)}</style></head><body><div id=\"box\">box</div></body></html>"
+    },
+    "plain.html": {
+      "sha256": "9edc1ba137ea4b6107d470526de3655f66194dbe4e9f3adedd34b792238ff238",
+      "text": "<!doctype html><html><head><title>plain</title></head><body><p>hello</p></body></html>"
+    },
+    "react.html": {
+      "sha256": "31e3090f20e49a0c789032cf031e7cef86346f294a97509d9174a63280ddb52a",
+      "text": "<!doctype html><html><head><script src=\"/react.js\"></script><script src=\"/react-dom.js\"></script></head><body><div id=\"root\"></div><script>globalThis.bootError=null;try{function Counter(){var a=React.useState(0);return React.createElement('button',{id:'counter',onClick:function(){a[1](a[0]+1);}},'count:'+a[0]);}(globalThis.reactRoot=ReactDOM.createRoot(document.getElementById('root'))).render(React.createElement(Counter));}catch(e){globalThis.bootError=String(e);}</script></body></html>"
+    },
+    "late.css": {
+      "sha256": "6b743433405e60123cff54d1c1567a4d0518f5ae4ea58cbd6db9eae5406ce936",
+      "text": "#late { color: rgb(90,80,70) }"
+    },
+    "sample.txt": {
+      "sha256": "1e7310af02ee1cf4decd279ca1bbd65c71bcec55dfe8bda30fcfd9c18b56c46f",
+      "text": "owned local audit fixture\n"
+    }
+  },
+  "binary_fixture": [
+    0,
+    128,
+    255,
+    65
+  ],
+  "third_party_assets": {
+    "react": {
+      "url": "https://registry.npmjs.org/react/-/react-18.2.0.tgz",
+      "member": "package/umd/react.development.js",
+      "sha256": "857364e2b982318417025fb9b4b8355c09f75fa46ba0be93f520f769f6757a78",
+      "bytes": 109910
+    },
+    "react-dom": {
+      "url": "https://registry.npmjs.org/react-dom/-/react-dom-18.2.0.tgz",
+      "member": "package/umd/react-dom.development.js",
+      "sha256": "6d11da926dde155c0d8773ae0e05bb64683f1f40d4e1eb628717dd8499172282",
+      "bytes": 1077022
+    }
+  },
+  "diagnostic_scripts": {
+    "server.py": "from http.server import SimpleHTTPRequestHandler,ThreadingHTTPServer\nfrom functools import partial\nThreadingHTTPServer((\"127.0.0.1\",19237),partial(SimpleHTTPRequestHandler,directory=\"/tmp/oxi-browser-audit-20261027\")).serve_forever()\n",
+    "probe.mjs": "import fs from 'node:fs/promises';\nconst root = '/tmp/oxi-browser-audit-20261027';\nconst runId = process.env.TASK_AUDIT_RUN ?? 'repeat';\nconst sleep = ms => new Promise(resolve => setTimeout(resolve, ms));\nasync function run(name, endpoint) {\n  const ws = new WebSocket(endpoint);\n  let id = 0;\n  const pending = new Map();\n  const report = { name, endpoint, cases: {}, events: [] };\n  ws.onmessage = ({data}) => {\n    const m = JSON.parse(data);\n    if (m.id) {\n      const p = pending.get(m.id);\n      if (!p) return;\n      clearTimeout(p.timer); pending.delete(m.id);\n      if (m.error) p.reject(new Error(JSON.stringify(m.error))); else p.resolve(m.result);\n    } else if (['Runtime.exceptionThrown','Runtime.consoleAPICalled'].includes(m.method)) report.events.push(m);\n  };\n  const send = (method, params = {}) => new Promise((resolve,reject) => {\n    const n = ++id;\n    const timer = setTimeout(() => { pending.delete(n); reject(new Error(method + ' timeout')); }, 20000);\n    pending.set(n,{resolve,reject,timer}); ws.send(JSON.stringify({id:n,method,params}));\n  });\n  const evaluate = async (expression, awaitPromise = false) => {\n    const r = await send('Runtime.evaluate',{expression,awaitPromise,returnByValue:true});\n    if (r.exceptionDetails) throw new Error(JSON.stringify(r.exceptionDetails));\n    return r.result?.value;\n  };\n  const check = async (key, expression, awaitPromise = false) => {\n    try { report.cases[key] = JSON.parse(await evaluate(expression,awaitPromise)); }\n    catch (error) { report.cases[key] = {error:String(error)}; }\n  };\n  try {\n    await new Promise((resolve,reject) => { ws.onopen=resolve; ws.onerror=reject; });\n    await send('Page.enable'); await send('Runtime.enable');\n    await send('Page.navigate',{url:'http://127.0.0.1:19237/index.html'});\n    await sleep(500);\n    await check('globals', `JSON.stringify(Object.fromEntries(['Worker','SharedWorker','AudioContext','OfflineAudioContext','MediaSource','MediaRecorder','RTCPeerConnection','OffscreenCanvas','MessageChannel','FileReader','CSSStyleSheet','Range','Selection'].map(n=>[n,typeof globalThis[n]])))`);\n    await check('window_and_dom', `JSON.stringify((()=>{const n=document.getElementById('box');n.auditExpando=42;return {windowGlobal:window===globalThis,windowSelf:window===self,windowComputedStyle:typeof window.getComputedStyle,nodeIdentity:n===document.getElementById('box'),expando:document.getElementById('box').auditExpando,computedColor:getComputedStyle(n).color,computedWidth:getComputedStyle(n).width}})())`);\n    await check('canvas2d', `JSON.stringify((()=>{const c=document.createElement('canvas');c.width=c.height=2;const x=c.getContext('2d');x.fillStyle='#ff0000';x.fillRect(0,0,1,1);return {context:!!x,pixel:Array.from(x.getImageData(0,0,1,1).data)}})())`);\n    await check('focus_validation', `JSON.stringify((()=>{const a=document.getElementById('focus');a.focus();const required=document.getElementById('required');return {activeId:document.activeElement?.id,checkValidity:typeof required.checkValidity,valid:typeof required.checkValidity==='function'?required.checkValidity():null}})())`);\n    await check('event_options', `JSON.stringify((()=>{const order=[];let once=0;const p=document.getElementById('parent'),t=document.getElementById('target');document.addEventListener('audit-event',()=>order.push('capture'),true);t.addEventListener('audit-event',()=>order.push('target'));p.addEventListener('audit-event',()=>order.push('parent'));document.addEventListener('audit-event',()=>order.push('bubble'));t.addEventListener('audit-once',()=>once++,{once:true});t.dispatchEvent(new Event('audit-event',{bubbles:true}));t.dispatchEvent(new Event('audit-once'));t.dispatchEvent(new Event('audit-once'));return {order,once}})())`);\n    await check('webgl2', `JSON.stringify((()=>{const c=document.createElement('canvas'),g=c.getContext('webgl2');const names=['createQuery','bindBufferBase','texImage3D','drawBuffers','renderbufferStorageMultisample','createTransformFeedback','fenceSync','texStorage2D'];return {context:!!g,methods:Object.fromEntries(names.map(n=>[n,typeof g?.[n]]))}})())`);\n    await check('crypto_wasm', `JSON.stringify({crypto:Object.fromEntries(['digest','encrypt','decrypt','sign','verify','deriveKey','generateKey'].map(n=>[n,typeof crypto.subtle?.[n]])),wasm:Object.fromEntries(['Module','Instance','Global','compileStreaming','instantiateStreaming'].map(n=>[n,typeof WebAssembly[n]]))})`);\n    await check('iframe', `JSON.stringify((()=>{const f=document.getElementById('frame');return {contentWindow:typeof f.contentWindow,contentDocument:typeof f.contentDocument,text:f.contentDocument?.getElementById('child')?.textContent}})())`);\n    await check('idb', `new Promise(resolve=>{try{const q=indexedDB.open('audit-'+Date.now(),1);q.onerror=()=>resolve(JSON.stringify({error:String(q.error)}));q.onupgradeneeded=()=>{const s=q.result.createObjectStore('items');resolve(JSON.stringify({createIndex:typeof s.createIndex,openCursor:typeof s.openCursor,abort:typeof q.transaction?.abort}));};}catch(e){resolve(JSON.stringify({error:String(e)}));}})`,true);\n    await check('binary_fetch', `fetch('/binary').then(async r=>JSON.stringify({bytes:Array.from(new Uint8Array(await r.arrayBuffer())),bodyType:typeof r.body,reader:typeof r.body?.getReader}))`,true);\n    await evaluate(`globalThis.auditStyleLoaded=false;const link=document.createElement('link');link.rel='stylesheet';link.href='/late.css';link.onload=()=>auditStyleLoaded=true;document.head.appendChild(link);globalThis.auditTicks=0;globalThis.auditTimer=setInterval(()=>auditTicks++,50);`);\n    await sleep(1000);\n    await check('styles_and_timers', `JSON.stringify({loaded:auditStyleLoaded,color:getComputedStyle(document.getElementById('late')).color,animationWidth:getComputedStyle(document.getElementById('anim')).width,ticks:auditTicks})`);\n    await evaluate('clearInterval(auditTimer)');\n    report.cases.object_reference = await send('Runtime.evaluate',{expression:'({audit:42})',returnByValue:false});\n    try { report.cases.debugger = await send('Debugger.enable'); } catch(e) { report.cases.debugger={error:String(e)}; }\n    const doc = await send('DOM.getDocument',{depth:-1});\n    const selected = await send('DOM.querySelector',{nodeId:doc.root.nodeId,selector:'#upload'});\n    try { await send('DOM.setFileInputFiles',{nodeId:selected.nodeId,files:[root+'/sample.txt']});\n      await check('file_upload', `JSON.stringify((()=>{const i=document.getElementById('upload');return {value:i.value,length:i.files?.length??null,name:i.files?.[0]?.name??null}})())`);\n    } catch(e) { report.cases.file_upload={error:String(e)}; }\n    await send('Page.navigate',{url:'http://127.0.0.1:19237/react.html'});\n    const hasCounter = node => (node.attributes??[]).some((v,i,a)=>v==='id'&&a[i+1]==='counter') || (node.children??[]).some(hasCounter);\n    let mounted = false;\n    for (let i=0;i<30;i++) {\n      const tree = await send('DOM.getDocument',{depth:-1});\n      if (hasCounter(tree.root)) { mounted=true; break; }\n      await sleep(200);\n    }\n    report.cases.react18 = {mounted};\n    if (mounted) {\n      report.cases.react18.before = await evaluate(\"document.getElementById('counter').textContent\");\n      await evaluate(\"document.getElementById('counter').click()\"); await sleep(300);\n      report.cases.react18.after = await evaluate(\"document.getElementById('counter').textContent\");\n    }\n  } catch (error) { report.error=String(error); }\n  finally { for(const p of pending.values())clearTimeout(p.timer);ws.close();await fs.writeFile(root+'/'+name+'-'+runId+'.json',JSON.stringify(report,null,2)); }\n  console.log(JSON.stringify({name,cases:report.cases,error:report.error}));\n}\nawait run('oxibrowser','ws://127.0.0.1:19236/ws');\nconst tabs=await (await fetch('http://127.0.0.1:19238/json/list')).json();\nawait run('chrome',tabs.find(t=>t.type==='page').webSocketDebuggerUrl);\n",
+    "supplement.mjs": "import fs from 'node:fs/promises';\nconst root='/tmp/oxi-browser-audit-20261027';\nconst sleep=ms=>new Promise(r=>setTimeout(r,ms));\nasync function inspect(name,url) {\n const ws=new WebSocket(url);let id=0;const pending=new Map();\n ws.onmessage=({data})=>{const m=JSON.parse(data);const p=pending.get(m.id);if(p){clearTimeout(p.t);pending.delete(m.id);m.error?p.reject(m.error):p.resolve(m.result);}};\n await new Promise((r,j)=>{ws.onopen=r;ws.onerror=j});\n const send=(method,params={})=>new Promise((resolve,reject)=>{const n=++id,t=setTimeout(()=>reject(new Error(method+' timeout')),20000);pending.set(n,{resolve,reject,t});ws.send(JSON.stringify({id:n,method,params}));});\n const evaluate=async expression=>{const r=await send('Runtime.evaluate',{expression,returnByValue:true});if(r.exceptionDetails)throw r.exceptionDetails;return r.result.value;};\n const result={name};\n try{\n  await send('Page.enable');await send('Page.navigate',{url:'http://127.0.0.1:19237/layout.html'});await sleep(300);\n  result.layout=JSON.parse(await evaluate(`JSON.stringify((()=>{const b=document.getElementById('box'),r=b.getBoundingClientRect();return {computedWidth:getComputedStyle(b).width,computedColor:getComputedStyle(b).color,rect:{x:r.x,y:r.y,width:r.width,height:r.height},HTMLIFrameElementGlobal:typeof globalThis.HTMLIFrameElement,HTMLIFrameElementWindow:typeof window.HTMLIFrameElement,windowDocument:window.document===document}})())`));\n  if(name!=='oxibrowser-default'){const shot=await send('Page.captureScreenshot',{format:'png'});await fs.writeFile(root+'/'+name+'-layout.png',Buffer.from(shot.data,'base64'));}\n  await evaluate('globalThis.freeTicks=0;globalThis.freeTimer=setInterval(()=>freeTicks++,20)');\n  const start=Date.now();await sleep(500);result.idle={hostWaitMs:Date.now()-start,ticks:await evaluate('freeTicks')};await evaluate('clearInterval(freeTimer)');\n }catch(error){result.error=String(error)}finally{for(const p of pending.values())clearTimeout(p.t);ws.close();}\n await fs.writeFile(root+'/'+name+'-supplement.json',JSON.stringify(result,null,2));console.log(JSON.stringify(result));\n}\nawait inspect('oxibrowser','ws://127.0.0.1:19236/ws');\nawait inspect('oxibrowser-default','ws://127.0.0.1:19239/ws');\nconst tabs=await (await fetch('http://127.0.0.1:19238/json/list')).json();await inspect('chrome',tabs.find(t=>t.type==='page').webSocketDebuggerUrl);\n"
+  },
+  "differential_runs": {
+    "oxibrowser": [
+      {
+        "name": "oxibrowser",
+        "cases": {
+          "globals": {
+            "Worker": "undefined",
+            "SharedWorker": "undefined",
+            "AudioContext": "undefined",
+            "OfflineAudioContext": "undefined",
+            "MediaSource": "undefined",
+            "MediaRecorder": "undefined",
+            "RTCPeerConnection": "undefined",
+            "OffscreenCanvas": "undefined",
+            "MessageChannel": "undefined",
+            "FileReader": "undefined",
+            "CSSStyleSheet": "undefined",
+            "Range": "function",
+            "Selection": "function"
+          },
+          "window_and_dom": {
+            "windowGlobal": false,
+            "windowSelf": true,
+            "windowComputedStyle": "function",
+            "nodeIdentity": false,
+            "computedColor": "#000000",
+            "computedWidth": "auto"
+          },
+          "canvas2d": {
+            "context": true,
+            "pixel": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "focus_validation": {
+            "activeId": "",
+            "checkValidity": "undefined",
+            "valid": null
+          },
+          "event_options": {
+            "order": [
+              "target",
+              "parent",
+              "capture",
+              "bubble"
+            ],
+            "once": 2
+          },
+          "webgl2": {
+            "context": true,
+            "methods": {
+              "createQuery": "function",
+              "bindBufferBase": "function",
+              "texImage3D": "undefined",
+              "drawBuffers": "undefined",
+              "renderbufferStorageMultisample": "undefined",
+              "createTransformFeedback": "undefined",
+              "fenceSync": "undefined",
+              "texStorage2D": "undefined"
+            }
+          },
+          "crypto_wasm": {
+            "crypto": {
+              "digest": "function",
+              "encrypt": "undefined",
+              "decrypt": "undefined",
+              "sign": "undefined",
+              "verify": "undefined",
+              "deriveKey": "undefined",
+              "generateKey": "undefined"
+            },
+            "wasm": {
+              "Module": "function",
+              "Instance": "function",
+              "Global": "undefined",
+              "compileStreaming": "undefined",
+              "instantiateStreaming": "undefined"
+            }
+          },
+          "iframe": {
+            "contentWindow": "undefined",
+            "contentDocument": "undefined"
+          },
+          "idb": {
+            "createIndex": "undefined",
+            "openCursor": "undefined",
+            "abort": "undefined"
+          },
+          "binary_fetch": {
+            "bytes": [
+              0,
+              128,
+              255,
+              65
+            ],
+            "bodyType": "undefined",
+            "reader": "undefined"
+          },
+          "styles_and_timers": {
+            "loaded": false,
+            "color": "#000000",
+            "animationWidth": "auto",
+            "ticks": 14
+          },
+          "object_reference": {
+            "exceptionDetails": null,
+            "result": {
+              "type": "object",
+              "value": {
+                "audit": 42
+              }
+            }
+          },
+          "debugger": {
+            "error": "Error: {\"code\":-32601,\"message\":\"unknown domain: Debugger\"}"
+          },
+          "file_upload": {
+            "value": "/tmp/oxi-browser-audit-20261027/sample.txt",
+            "length": null,
+            "name": null
+          },
+          "react18": {
+            "mounted": false
+          }
+        }
+      },
+      {
+        "name": "oxibrowser",
+        "cases": {
+          "globals": {
+            "Worker": "undefined",
+            "SharedWorker": "undefined",
+            "AudioContext": "undefined",
+            "OfflineAudioContext": "undefined",
+            "MediaSource": "undefined",
+            "MediaRecorder": "undefined",
+            "RTCPeerConnection": "undefined",
+            "OffscreenCanvas": "undefined",
+            "MessageChannel": "undefined",
+            "FileReader": "undefined",
+            "CSSStyleSheet": "undefined",
+            "Range": "function",
+            "Selection": "function"
+          },
+          "window_and_dom": {
+            "windowGlobal": false,
+            "windowSelf": true,
+            "windowComputedStyle": "function",
+            "nodeIdentity": false,
+            "computedColor": "#000000",
+            "computedWidth": "auto"
+          },
+          "canvas2d": {
+            "context": true,
+            "pixel": [
+              0,
+              0,
+              0,
+              0
+            ]
+          },
+          "focus_validation": {
+            "activeId": "",
+            "checkValidity": "undefined",
+            "valid": null
+          },
+          "event_options": {
+            "order": [
+              "target",
+              "parent",
+              "capture",
+              "bubble"
+            ],
+            "once": 2
+          },
+          "webgl2": {
+            "context": true,
+            "methods": {
+              "createQuery": "function",
+              "bindBufferBase": "function",
+              "texImage3D": "undefined",
+              "drawBuffers": "undefined",
+              "renderbufferStorageMultisample": "undefined",
+              "createTransformFeedback": "undefined",
+              "fenceSync": "undefined",
+              "texStorage2D": "undefined"
+            }
+          },
+          "crypto_wasm": {
+            "crypto": {
+              "digest": "function",
+              "encrypt": "undefined",
+              "decrypt": "undefined",
+              "sign": "undefined",
+              "verify": "undefined",
+              "deriveKey": "undefined",
+              "generateKey": "undefined"
+            },
+            "wasm": {
+              "Module": "function",
+              "Instance": "function",
+              "Global": "undefined",
+              "compileStreaming": "undefined",
+              "instantiateStreaming": "undefined"
+            }
+          },
+          "iframe": {
+            "contentWindow": "undefined",
+            "contentDocument": "undefined"
+          },
+          "idb": {
+            "createIndex": "undefined",
+            "openCursor": "undefined",
+            "abort": "undefined"
+          },
+          "binary_fetch": {
+            "bytes": [
+              0,
+              128,
+              255,
+              65
+            ],
+            "bodyType": "undefined",
+            "reader": "undefined"
+          },
+          "styles_and_timers": {
+            "loaded": false,
+            "color": "#000000",
+            "animationWidth": "auto",
+            "ticks": 15
+          },
+          "object_reference": {
+            "exceptionDetails": null,
+            "result": {
+              "type": "object",
+              "value": {
+                "audit": 42
+              }
+            }
+          },
+          "debugger": {
+            "error": "Error: {\"code\":-32601,\"message\":\"unknown domain: Debugger\"}"
+          },
+          "file_upload": {
+            "value": "/tmp/oxi-browser-audit-20261027/sample.txt",
+            "length": null,
+            "name": null
+          },
+          "react18": {
+            "mounted": false
+          }
+        }
+      }
+    ],
+    "chrome": [
+      {
+        "name": "chrome",
+        "cases": {
+          "globals": {
+            "Worker": "function",
+            "SharedWorker": "function",
+            "AudioContext": "function",
+            "OfflineAudioContext": "function",
+            "MediaSource": "function",
+            "MediaRecorder": "function",
+            "RTCPeerConnection": "function",
+            "OffscreenCanvas": "function",
+            "MessageChannel": "function",
+            "FileReader": "function",
+            "CSSStyleSheet": "function",
+            "Range": "function",
+            "Selection": "function"
+          },
+          "window_and_dom": {
+            "windowGlobal": true,
+            "windowSelf": true,
+            "windowComputedStyle": "function",
+            "nodeIdentity": true,
+            "expando": 42,
+            "computedColor": "rgb(12, 34, 56)",
+            "computedWidth": "123px"
+          },
+          "canvas2d": {
+            "context": true,
+            "pixel": [
+              255,
+              0,
+              0,
+              255
+            ]
+          },
+          "focus_validation": {
+            "activeId": "focus",
+            "checkValidity": "function",
+            "valid": false
+          },
+          "event_options": {
+            "order": [
+              "capture",
+              "target",
+              "parent",
+              "bubble"
+            ],
+            "once": 1
+          },
+          "webgl2": {
+            "context": true,
+            "methods": {
+              "createQuery": "function",
+              "bindBufferBase": "function",
+              "texImage3D": "function",
+              "drawBuffers": "function",
+              "renderbufferStorageMultisample": "function",
+              "createTransformFeedback": "function",
+              "fenceSync": "function",
+              "texStorage2D": "function"
+            }
+          },
+          "crypto_wasm": {
+            "crypto": {
+              "digest": "function",
+              "encrypt": "function",
+              "decrypt": "function",
+              "sign": "function",
+              "verify": "function",
+              "deriveKey": "function",
+              "generateKey": "function"
+            },
+            "wasm": {
+              "Module": "function",
+              "Instance": "function",
+              "Global": "function",
+              "compileStreaming": "function",
+              "instantiateStreaming": "function"
+            }
+          },
+          "iframe": {
+            "contentWindow": "object",
+            "contentDocument": "object",
+            "text": "child"
+          },
+          "idb": {
+            "createIndex": "function",
+            "openCursor": "function",
+            "abort": "function"
+          },
+          "binary_fetch": {
+            "bytes": [
+              0,
+              128,
+              255,
+              65
+            ],
+            "bodyType": "object",
+            "reader": "function"
+          },
+          "styles_and_timers": {
+            "loaded": true,
+            "color": "rgb(90, 80, 70)",
+            "animationWidth": "80px",
+            "ticks": 20
+          },
+          "object_reference": {
+            "result": {
+              "type": "object",
+              "className": "Object",
+              "description": "Object",
+              "objectId": "<present>"
+            }
+          },
+          "debugger": {
+            "debuggerId": "<present>"
+          },
+          "file_upload": {
+            "value": "C:\\fakepath\\sample.txt",
+            "length": 1,
+            "name": "sample.txt"
+          },
+          "react18": {
+            "mounted": true,
+            "before": "count:0",
+            "after": "count:1"
+          }
+        }
+      },
+      {
+        "name": "chrome",
+        "cases": {
+          "globals": {
+            "Worker": "function",
+            "SharedWorker": "function",
+            "AudioContext": "function",
+            "OfflineAudioContext": "function",
+            "MediaSource": "function",
+            "MediaRecorder": "function",
+            "RTCPeerConnection": "function",
+            "OffscreenCanvas": "function",
+            "MessageChannel": "function",
+            "FileReader": "function",
+            "CSSStyleSheet": "function",
+            "Range": "function",
+            "Selection": "function"
+          },
+          "window_and_dom": {
+            "windowGlobal": true,
+            "windowSelf": true,
+            "windowComputedStyle": "function",
+            "nodeIdentity": true,
+            "expando": 42,
+            "computedColor": "rgb(12, 34, 56)",
+            "computedWidth": "123px"
+          },
+          "canvas2d": {
+            "context": true,
+            "pixel": [
+              255,
+              0,
+              0,
+              255
+            ]
+          },
+          "focus_validation": {
+            "activeId": "focus",
+            "checkValidity": "function",
+            "valid": false
+          },
+          "event_options": {
+            "order": [
+              "capture",
+              "target",
+              "parent",
+              "bubble"
+            ],
+            "once": 1
+          },
+          "webgl2": {
+            "context": true,
+            "methods": {
+              "createQuery": "function",
+              "bindBufferBase": "function",
+              "texImage3D": "function",
+              "drawBuffers": "function",
+              "renderbufferStorageMultisample": "function",
+              "createTransformFeedback": "function",
+              "fenceSync": "function",
+              "texStorage2D": "function"
+            }
+          },
+          "crypto_wasm": {
+            "crypto": {
+              "digest": "function",
+              "encrypt": "function",
+              "decrypt": "function",
+              "sign": "function",
+              "verify": "function",
+              "deriveKey": "function",
+              "generateKey": "function"
+            },
+            "wasm": {
+              "Module": "function",
+              "Instance": "function",
+              "Global": "function",
+              "compileStreaming": "function",
+              "instantiateStreaming": "function"
+            }
+          },
+          "iframe": {
+            "contentWindow": "object",
+            "contentDocument": "object",
+            "text": "child"
+          },
+          "idb": {
+            "createIndex": "function",
+            "openCursor": "function",
+            "abort": "function"
+          },
+          "binary_fetch": {
+            "bytes": [
+              0,
+              128,
+              255,
+              65
+            ],
+            "bodyType": "object",
+            "reader": "function"
+          },
+          "styles_and_timers": {
+            "loaded": true,
+            "color": "rgb(90, 80, 70)",
+            "animationWidth": "80px",
+            "ticks": 20
+          },
+          "object_reference": {
+            "result": {
+              "type": "object",
+              "className": "Object",
+              "description": "Object",
+              "objectId": "<present>"
+            }
+          },
+          "debugger": {
+            "debuggerId": "<present>"
+          },
+          "file_upload": {
+            "value": "C:\\fakepath\\sample.txt",
+            "length": 1,
+            "name": "sample.txt"
+          },
+          "react18": {
+            "mounted": true,
+            "before": "count:0",
+            "after": "count:1"
+          }
+        }
+      }
+    ]
+  },
+  "layout_and_idle_supplement": {
+    "oxibrowser": {
+      "name": "oxibrowser",
+      "layout": {
+        "computedWidth": "auto",
+        "computedColor": "#000000",
+        "rect": {
+          "x": 0,
+          "y": 0,
+          "width": 123,
+          "height": 45
+        },
+        "HTMLIFrameElementGlobal": "undefined",
+        "HTMLIFrameElementWindow": "undefined",
+        "windowDocument": true
+      },
+      "idle": {
+        "hostWaitMs": 501,
+        "ticks": 20
+      }
+    },
+    "oxibrowser-default": {
+      "name": "oxibrowser-default",
+      "layout": {
+        "computedWidth": "auto",
+        "computedColor": "#000000",
+        "rect": {
+          "x": 0,
+          "y": 0,
+          "width": 123,
+          "height": 45
+        },
+        "HTMLIFrameElementGlobal": "undefined",
+        "HTMLIFrameElementWindow": "undefined",
+        "windowDocument": true
+      },
+      "idle": {
+        "hostWaitMs": 503,
+        "ticks": 0
+      }
+    },
+    "chrome": {
+      "name": "chrome",
+      "layout": {
+        "computedWidth": "123px",
+        "computedColor": "rgb(12, 34, 56)",
+        "rect": {
+          "x": 8,
+          "y": 8,
+          "width": 123,
+          "height": 45
+        },
+        "HTMLIFrameElementGlobal": "function",
+        "HTMLIFrameElementWindow": "function",
+        "windowDocument": true
+      },
+      "idle": {
+        "hostWaitMs": 501,
+        "ticks": 25
+      }
+    }
+  },
+  "react_first_failure": {
+    "type": "TypeError",
+    "message": "right-hand side of 'instanceof' should be an object, got undefined",
+    "function": "getActiveElementDeep",
+    "source": "react-dom.js",
+    "line": 8451,
+    "expression": "element instanceof win.HTMLIFrameElement",
+    "constructor_probe": "undefined on both globalThis and window in OxiBrowser; function in Chrome",
+    "limitation": "First observed commit failure, not proof that adding a constructor would fix all React behavior."
+  },
+  "fresh_process_samples": {
+    "process_version": {
+      "command": [
+        "target/release/oxibrowser",
+        "--version"
+      ],
+      "runs": [
+        {
+          "elapsed_ms": 12.549040999999997,
+          "maximum_rss_bytes": 12746752,
+          "exit_code": 0,
+          "stdout_bytes": 18
+        },
+        {
+          "elapsed_ms": 11.229958999999997,
+          "maximum_rss_bytes": 12746752,
+          "exit_code": 0,
+          "stdout_bytes": 18
+        },
+        {
+          "elapsed_ms": 11.303,
+          "maximum_rss_bytes": 12763136,
+          "exit_code": 0,
+          "stdout_bytes": 18
+        }
+      ],
+      "median_elapsed_ms": 11.303,
+      "max_rss_mib": 12.171875
+    },
+    "blank_tab": {
+      "command": [
+        "target/release/oxibrowser",
+        "session",
+        "--no-audit"
+      ],
+      "runs": [
+        {
+          "elapsed_ms": 27.695374999999995,
+          "maximum_rss_bytes": 29130752,
+          "exit_code": 0,
+          "stdout_bytes": 131
+        },
+        {
+          "elapsed_ms": 27.75920899999999,
+          "maximum_rss_bytes": 29081600,
+          "exit_code": 0,
+          "stdout_bytes": 131
+        },
+        {
+          "elapsed_ms": 27.70787500000001,
+          "maximum_rss_bytes": 29343744,
+          "exit_code": 0,
+          "stdout_bytes": 131
+        }
+      ],
+      "median_elapsed_ms": 27.70787500000001,
+      "max_rss_mib": 27.984375
+    },
+    "plain_local_document": {
+      "command": [
+        "target/release/oxibrowser",
+        "fetch",
+        "--no-audit",
+        "--allow-private-ips",
+        "--format",
+        "text",
+        "http://127.0.0.1:19237/plain.html"
+      ],
+      "runs": [
+        {
+          "elapsed_ms": 141.16249999999997,
+          "maximum_rss_bytes": 50413568,
+          "exit_code": 0,
+          "stdout_bytes": 5
+        },
+        {
+          "elapsed_ms": 145.52075000000002,
+          "maximum_rss_bytes": 50167808,
+          "exit_code": 0,
+          "stdout_bytes": 5
+        },
+        {
+          "elapsed_ms": 139.880167,
+          "maximum_rss_bytes": 50528256,
+          "exit_code": 0,
+          "stdout_bytes": 5
+        }
+      ],
+      "median_elapsed_ms": 141.16249999999997,
+      "max_rss_mib": 48.1875
+    }
+  },
+  "process_sample_method": "/usr/bin/time -l on three independent CLI processes per case, warm OS caches; Python subprocess wall clock includes launcher overhead; macOS maximum RSS bytes. No Chrome performance ratio or steady-state memory claim.",
+  "sanitization": "Per-connection objectId/debuggerId values replaced with <present>. No credentials or actual browser account state used.",
+  "prior_game_result": {
+    "document": "docs/quality/cheonggye-runtime.md",
+    "ready_observed_seconds": 160.4,
+    "short_sample_fps": 2.9,
+    "limitation": "Earlier same-engine-revision local result, not rerun in this audit and not a general browser performance number."
+  },
+  "captures": {
+    "oxibrowser": {
+      "path": "docs/quality/assets/2026-10-27-oxibrowser-layout.png",
+      "sha256": "4b62c917c2539b1cd7a077eb6cd154a30bcbf36b003619374d963dfd23ccc36c",
+      "bytes": 1019,
+      "width": 1280,
+      "height": 61
+    },
+    "chrome": {
+      "path": "docs/quality/assets/2026-10-27-chrome-layout.png",
+      "sha256": "d6c6d59cea4a4924b6431a2d7376f9707e317d26d453981225f66bf7d20ee136",
+      "bytes": 4351,
+      "width": 1280,
+      "height": 633
+    }
+  }
+}

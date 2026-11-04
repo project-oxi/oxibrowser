@@ -1,0 +1,16 @@
+{
+  "name": "oxibrowser-spa-acceptance",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deterministic local SPA fixtures and Playwright actual-input acceptance runner (OxiBrowser vs reference Chrome).",
+  "scripts": {
+    "runner": "node runner.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.48.2",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "vue": "3.5.13"
+  }
+}

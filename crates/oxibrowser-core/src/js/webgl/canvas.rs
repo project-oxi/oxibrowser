@@ -65,8 +65,13 @@ pub fn attach(
                 .unwrap_or_default();
 
             let Some(kind_enum) = CtxKind::from_type_str(&kind) else {
-                // 2d and unknown kinds stay on the JS bootstrap shim.
-                return call_js_2d_fallback(this, args, ctx);
+                // Unknown identifiers must not masquerade as successful 2D
+                // contexts: engines probe legacy aliases before falling back.
+                return if kind == "2d" {
+                    call_js_2d_fallback(this, args, ctx)
+                } else {
+                    Ok(JsValue::null())
+                };
             };
 
             // Parse the optional context-attributes dictionary.
@@ -310,8 +315,8 @@ pub fn attach(
 }
 
 fn call_js_2d_fallback(this: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    // The canvas bootstrap's `__oxi_canvas_context_2d` handles 2d and unknown
-    // kinds; absent → null (no 2d implementation in this build).
+    // The canvas bootstrap's `__oxi_canvas_context_2d` handles 2d only;
+    // absent → null (no 2d implementation in this build).
     let f = ctx
         .global_object()
         .get(js_string!("__oxi_canvas_context_2d"), ctx)

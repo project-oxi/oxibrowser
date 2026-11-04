@@ -552,6 +552,7 @@ pub async fn run_mcp_stdio(
     ref_tag: Option<&str>,
 ) -> i32 {
     let mut config = oxibrowser_core::BrowserConfig::headless();
+    config.background_event_loop = true;
     if let Some(path) = cookie_file {
         config.cookie_file = Some(std::path::PathBuf::from(path));
     }
