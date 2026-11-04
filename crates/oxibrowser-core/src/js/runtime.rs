@@ -1008,6 +1008,8 @@ pub struct FetchRequestMsg {
     /// The originating page's origin (`scheme://host[:port]`), used for CORS
     /// `Origin`/`Referer` headers. `None` when no page is loaded.
     pub origin: Option<String>,
+    /// Absolute deadline for an ESM request, including any transport retry.
+    pub module_deadline: Option<Instant>,
 }
 
 /// HTTP response sent back to the JS thread via the shared response channel.
@@ -6154,6 +6156,7 @@ fn create_context(
                 headers,
                 body,
                 origin: current_origin(),
+                module_deadline: None,
             };
 
             let tx = {

@@ -62,6 +62,114 @@ fn assert_no_exceptions(events: &std::sync::mpsc::Receiver<CoreEvent>) {
 }
 
 #[tokio::test]
+async fn module_retries_once_when_response_body_stalls_after_headers() {
+    assert_module_transfer(ModuleTransfer::StalledBody, 2).await;
+}
+
+#[tokio::test]
+async fn module_keeps_the_original_request_while_response_body_progresses() {
+    assert_module_transfer(ModuleTransfer::ProgressingBody, 1).await;
+}
+
+#[tokio::test]
+async fn module_retry_allows_slow_response_headers_within_the_deadline() {
+    assert_module_transfer(ModuleTransfer::SlowHeaders, 2).await;
+}
+
+#[derive(Clone, Copy)]
+enum ModuleTransfer {
+    StalledBody,
+    ProgressingBody,
+    SlowHeaders,
+}
+
+async fn assert_module_transfer(transfer: ModuleTransfer, expected_attempts: usize) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let server_attempts = attempts.clone();
+    let server = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            let attempts = server_attempts.clone();
+            connections.spawn(async move {
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                socket.read_line(&mut request).await.unwrap();
+                let is_module = request.starts_with("GET /stalled.js ");
+                loop {
+                    let mut line = String::new();
+                    if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let (mime, body) = if is_module {
+                    ("text/javascript", "globalThis.moduleRecovered = 42;")
+                } else {
+                    ("text/html", "<script type=module src=/stalled.js></script>")
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let initial_module_request =
+                    is_module && attempts.fetch_add(1, Ordering::Relaxed) == 0;
+                if is_module && matches!(transfer, ModuleTransfer::SlowHeaders) {
+                    tokio::time::sleep(Duration::from_millis(3_300)).await;
+                }
+                if socket.get_mut().write_all(headers.as_bytes()).await.is_err() {
+                    return;
+                }
+                if initial_module_request {
+                    match transfer {
+                        ModuleTransfer::StalledBody => {
+                            socket.get_mut().write_all(&body.as_bytes()[..4]).await.unwrap();
+                            std::future::pending::<()>().await;
+                        }
+                        ModuleTransfer::ProgressingBody => {
+                            // Over 3 s overall, but less than 3 s between parts.
+                            for chunk in body.as_bytes().chunks(7) {
+                                socket.get_mut().write_all(chunk).await.unwrap();
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                            return;
+                        }
+                        ModuleTransfer::SlowHeaders => {}
+                    }
+                }
+                let _ = socket.get_mut().write_all(body.as_bytes()).await;
+            });
+        }
+    });
+
+    let mut session = session().await;
+    let events = observe_errors(&mut session);
+    let navigation = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.navigate(&format!("http://{address}/page")),
+    )
+    .await;
+    server.abort();
+    navigation
+        .expect("module retry should finish before navigation deadline")
+        .unwrap();
+    assert_eq!(
+        value(&mut session, "globalThis.moduleRecovered").await,
+        json!(42)
+    );
+    assert_eq!(attempts.load(Ordering::Relaxed), expected_attempts);
+    assert_no_exceptions(&events);
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn module_graph_live_bindings_cycles_and_document_cache() {
     let server = MockServer::start().await;
     serve(

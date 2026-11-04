@@ -181,6 +181,7 @@ impl WebModuleLoader {
             headers,
             body: None,
             origin: origin.clone(),
+            module_deadline: Some(deadline),
         })
         .map_err(|_| module_error("module network bridge is closed"))?;
 

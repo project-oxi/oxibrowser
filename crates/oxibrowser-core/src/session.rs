@@ -674,6 +674,61 @@ fn handle_fetch_requests(
                                 method,
                                 headers,
                             } => {
+                                if let Some(deadline) = request.module_deadline
+                                    && method.eq_ignore_ascii_case("GET")
+                                    && body.is_none()
+                                {
+                                    let result = http_client
+                                        .fetch_module(
+                                            &url,
+                                            &headers,
+                                            origin.as_deref(),
+                                            &ov,
+                                            max_body_bytes,
+                                            deadline,
+                                        )
+                                        .await;
+                                    let msg = match result {
+                                        Ok(resource) => {
+                                            record_request_finish(
+                                                &network_log,
+                                                &record_id,
+                                                Some(resource.status),
+                                                resource.headers.clone(),
+                                                resource.mime_type,
+                                                Some(resource.body.len() as u64),
+                                            );
+                                            FetchResponseMsg {
+                                                id,
+                                                status: resource.status,
+                                                status_text: String::new(),
+                                                url: resource.final_url,
+                                                headers: resource.headers,
+                                                body: String::from_utf8_lossy(&resource.body)
+                                                    .into_owned(),
+                                                body_bytes: Some(resource.body),
+                                                error: None,
+                                            }
+                                        }
+                                        Err(error) => {
+                                            fail_record(&network_log, None);
+                                            FetchResponseMsg {
+                                                id,
+                                                status: 0,
+                                                status_text: "Network Error".into(),
+                                                url: url_str,
+                                                headers: Vec::new(),
+                                                body: String::new(),
+                                                body_bytes: None,
+                                                error: Some(error.to_string()),
+                                            }
+                                        }
+                                    };
+                                    let _ = response_tx.send(msg);
+                                    in_flight.fetch_sub(1, Ordering::Relaxed);
+                                    return;
+                                }
+
                                 http_client
                                     .request_with_context_with_overrides(
                                         &url,

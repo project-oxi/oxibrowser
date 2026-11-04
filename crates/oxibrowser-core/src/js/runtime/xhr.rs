@@ -97,6 +97,7 @@ pub(super) fn register(
                 headers,
                 body,
                 origin: current_origin(),
+                module_deadline: None,
             };
             let channel = fetch_tx.read().clone();
             let sent = channel.is_some_and(|channel| channel.send(request).is_ok());

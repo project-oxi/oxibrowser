@@ -219,6 +219,7 @@ pub(super) fn poll(
             headers,
             body: None,
             origin: current_origin(),
+            module_deadline: None,
         };
         let sent = fetch_tx
             .read()
